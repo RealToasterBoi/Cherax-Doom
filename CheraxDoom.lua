@@ -7137,11 +7137,17 @@ function W.drawBootProgress(st)
 end
 
 -- Host mode: unload this script (stop music first). Both the hidden shutdown
--- feature (host OnClick) and DOOM's own in-game Quit route here; SetShouldUnload
--- marks THIS script done, so it unloads itself and returns the player to GTA.
+-- feature (host OnClick) and DOOM's own in-game Quit route here. The unload is
+-- DEFERRED a few frames: MCI only answers on the present thread (stop/close sent
+-- from the OnClick or unload threads return false per the in-game log), and an
+-- immediate SetShouldUnload would kill the present-thread retry window before it
+-- ever delivered the stop. So request the stop, mark shutdown pending, and let
+-- onPresent service the stop first; it calls SetShouldUnload when the countdown
+-- runs out, which marks THIS script done and returns the player to GTA.
 function W.hostShutdown()
     pcall(W.requestStop, "shutdown")
-    if SetShouldUnload then pcall(SetShouldUnload) end
+    if not SetShouldUnload then return end
+    W.unloadIn = W.unloadIn or 10        -- frames of present-thread stop retries
 end
 
 function W.init()
@@ -7230,6 +7236,16 @@ function W.onPresent()
     -- a toggle-off/unload stop that did not take is retried (mirrors the working
     -- per-frame manual-disable path).
     W.serviceStop()
+    -- Deferred hostShutdown: keep only the stop retries running for a few frames
+    -- so the music stop lands on this thread, then actually unload.
+    if W.unloadIn then
+        W.unloadIn = W.unloadIn - 1
+        if W.unloadIn <= 0 then
+            W.unloadIn = nil
+            if SetShouldUnload then pcall(SetShouldUnload) end
+        end
+        return
+    end
     -- Host mode runs unconditionally (no toggle to find); standalone honors the
     -- DOOM WAD feature toggle as before.
     local enabled = BLAD_MODE
