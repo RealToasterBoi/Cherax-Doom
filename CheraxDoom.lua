@@ -4206,7 +4206,8 @@ function W.drawFrontend(sw, sh)
     elseif scr == "readthis" then
         W.drawPatchFS("HELP1", sw, sh)
     elseif scr == "quit" then
-        ImGui.AddText(floor(sw * 0.5 - 110), floor(sh * 0.48), "Quit to the title screen?  (Y / N)", 235, 210, 120, 255)
+        ImGui.AddText(floor(sw * 0.5 - 110), floor(sh * 0.48),
+            BLAD_MODE and "Quit DOOM?  (Y / N)" or "Quit to the title screen?  (Y / N)", 235, 210, 120, 255)
     end
 end
 
@@ -4314,7 +4315,11 @@ function W.updateFrontend(dt)
         return
     end
     if scr == "quit" then
-        if kpressed(W.VK.Y) then m.screen = "title"; m.fromPlay = false; W.attractOn = false; pcall(W.requestStop, "quit"); pcall(W.playSfx, "DSSWTCHX")
+        if kpressed(W.VK.Y) then
+            -- Host mode: Quit fully unloads CheraxDoom back to GTA (same path the
+            -- host's Stop button drives). Standalone keeps returning to the title.
+            if BLAD_MODE then W.hostShutdown()
+            else m.screen = "title"; m.fromPlay = false; W.attractOn = false; pcall(W.requestStop, "quit"); pcall(W.playSfx, "DSSWTCHX") end
         elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; pcall(W.playSfx, "DSSWTCHX") end
         return
     end
@@ -4593,6 +4598,14 @@ function W.drawBootProgress(st)
     ImGui.End()
 end
 
+-- Host mode: unload this script (stop music first). Both the hidden shutdown
+-- feature (host OnClick) and DOOM's own in-game Quit route here; SetShouldUnload
+-- marks THIS script done, so it unloads itself and returns the player to GTA.
+function W.hostShutdown()
+    pcall(W.requestStop, "shutdown")
+    if SetShouldUnload then pcall(SetShouldUnload) end
+end
+
 function W.init()
     W.OVERLAY_FLAGS = 0
     pcall(function()
@@ -4828,7 +4841,10 @@ W.init()
 -- Cherax never sets this global, so this is a no-op in production.
 if rawget(_G, "__DOOMWAD_TEST") then _G.__DOOMWAD = W end
 
-if FeatureMgr and FeatureMgr.AddFeature then
+-- Standalone only: the DOOM WAD toggle is the enable switch and lives in the tab.
+-- In host mode we auto-run, so neither the toggle nor the tab are registered; the
+-- only UI is the fullscreen DOOM overlay window (with DOOM's own front-end menu).
+if (not BLAD_MODE) and FeatureMgr and FeatureMgr.AddFeature then
     pcall(FeatureMgr.AddFeature, FEATURE_HASH, "DOOM WAD",
         (eFeatureType and eFeatureType.Toggle) or 1,
         "Load and walk a DOOM/DOOM2 .wad map in the overlay (flat-shaded BSP renderer). Enable, then close the menu to walk.",
@@ -4842,22 +4858,15 @@ if FeatureMgr and FeatureMgr.AddFeature then
         end)
 end
 
--- Host mode: reflect the always-on run state in the toggle so the DOOM WAD tab's
--- checkbox reads correctly, and register a hidden shutdown feature. bladscript
+-- Host mode: register the hidden cross-script shutdown feature. bladscript
 -- resolves SHUTDOWN_HASH from the shared registry and OnClick()s it; that callback
--- runs in THIS script's state, so SetShouldUnload marks this script for unload
--- (never the host). It is never RenderFeature'd and is set invisible besides.
-if BLAD_MODE and FeatureMgr and FeatureMgr.GetFeature then
-    pcall(function() FeatureMgr.GetFeature(FEATURE_HASH):SetBoolValue(true) end)
-end
+-- runs in THIS script's state (via W.hostShutdown), so SetShouldUnload marks this
+-- script for unload, never the host. It is never RenderFeature'd, invisible besides.
 if BLAD_MODE and FeatureMgr and FeatureMgr.AddFeature then
     local sf = FeatureMgr.AddFeature(SHUTDOWN_HASH, "CheraxDoom Shutdown",
         (eFeatureType and eFeatureType.Button) or 0,
         "Internal: unload CheraxDoom. Triggered by the host script, not for direct use.",
-        function()
-            pcall(W.requestStop, "shutdown")
-            if SetShouldUnload then pcall(SetShouldUnload) end
-        end)
+        function() W.hostShutdown() end)
     if sf then
         pcall(function() sf:SetVisible(false) end)
         pcall(function() sf:SetSaveable(false) end)
@@ -4896,7 +4905,7 @@ if EventMgr and EventMgr.RegisterHandler then
     end)
 end
 
-if ClickGUI and ClickGUI.AddTab then
+if (not BLAD_MODE) and ClickGUI and ClickGUI.AddTab then
     pcall(ClickGUI.AddTab, "DOOM WAD", W.renderTab)
 end
 
