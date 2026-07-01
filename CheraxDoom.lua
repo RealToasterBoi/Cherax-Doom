@@ -3693,6 +3693,7 @@ function W.newGame()
     W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
     W.psf = { st = nil, tics = -1 }
     W.attackdown = false; W.refire = 0; W.extralight = 0
+    W.fireArmed = false                     -- require one observed fire-release before autofire
     W.momx = 0; W.momy = 0; W.momz = 0; W.bob = 0
     W.viewheight = 41; W.dvh = 0
     W.reactionTics = 0
@@ -5380,9 +5381,18 @@ function W.update(dt, menuOpen)
     -- World is frozen (no input, no move) while the menu is open or a wipe plays.
     if W.gameState == "play" and not menuOpen and not W.wipe.active then
         -- fire input: held state; the psprite ready/refire actions consume it.
-        -- Check LCTRL/RCTRL specifically (VK_CONTROL is often not reported) + LMB.
+        -- Check LCTRL/RCTRL specifically (LMB via ImGui). NOTE: the generic
+        -- VK_CONTROL (0x11) is deliberately NOT polled - it is held/latched by
+        -- all sorts of other software and was the reason LCTRL/RCTRL were added.
+        -- A real Ctrl press still registers as 0xA2/0xA3, so nothing is lost.
         local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
-        W.fireHeld = kdown(0xA2) or kdown(0xA3) or kdown(W.VK.CTRL) or md
+        local rawFire = kdown(0xA2) or kdown(0xA3) or md
+        -- Arming guard: a fire source that reads "held" from the very first frame
+        -- (a stuck/latched key or a garbage ImGui mouse state on some builds) must
+        -- NOT autofire the pistol at spawn. Require the input to be observed
+        -- RELEASED at least once before it can fire; a real tap arms it instantly.
+        if not rawFire then W.fireArmed = true end
+        W.fireHeld = rawFire and (W.fireArmed == true)
 
         if not W.playerDead then
             -- per-frame turning for latency; vanilla rates (6-tic slow ramp, run doubles)
@@ -5427,8 +5437,11 @@ function W.update(dt, menuOpen)
             W.gameState = "frontend"; pcall(W.playSfx, "DSSWTCHN")
         end
     elseif W.gameState == "intermission" and not menuOpen then
+        -- edge-detected (never held-repeat), and no generic VK_CONTROL, so a
+        -- stuck fire source cannot auto-skip the intermission. W.firePrevWi is
+        -- seeded true on entry to swallow the held shot that flipped the exit.
         local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
-        local fire = kdown(0xA2) or kdown(0xA3) or kdown(W.VK.CTRL) or md
+        local fire = kdown(0xA2) or kdown(0xA3) or md
         if (fire and not W.firePrevWi) or kpressed(W.VK.SPACE) or kpressed(W.VK.E)
             or kpressed(W.VK.ENTER) then
             W.wiAccel = true
@@ -6999,7 +7012,7 @@ function W.init()
     W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
     W.psf = { st = nil, tics = -1 }
     W.attackdown = false; W.refire = 0; W.extralight = 0
-    W.fireHeld = false; W.usePressed = false
+    W.fireHeld = false; W.usePressed = false; W.fireArmed = false
     W.momx = 0; W.momy = 0; W.momz = 0; W.bob = 0
     W.pz = 0; W.viewheight = 41; W.dvh = 0
     W.reactionTics = 0; W.turnHeld = 0
