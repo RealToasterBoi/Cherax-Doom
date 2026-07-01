@@ -4691,8 +4691,10 @@ function W.onPresent()
     -- WAD tab still let the user supply a wad by hand.
     if BLAD_MODE and not W.dlDone and not W.dlFailed then
         local st = W.ensureWadDownload()
-        W.drawBootProgress(st)
-        if st ~= "done" then return end
+        -- Only paint the boot overlay while still waiting/failed; on the frame the
+        -- wad becomes ready, fall straight through to the normal renderer so we
+        -- don't open the shared overlay window twice in one frame.
+        if st ~= "done" then W.drawBootProgress(st); return end
     end
 
     if not W.active then
