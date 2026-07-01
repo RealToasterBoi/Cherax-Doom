@@ -5284,34 +5284,56 @@ function W.ensureWadDownload()
         local cands = W.scanWads()
         if cands and cands[1] then W.dlDone = true; return "done" end
     end
-    if not W.dlHandle and not W.dlKicked then
-        W.dlKicked = true
+    -- Download sources. HTTPS host first; a plain-HTTP mirror is the fallback.
+    -- Cherax's curl exposes NO TLS options (no verify/revoke/CAINFO), so a broken
+    -- Windows schannel ("AcquireCredentialsHandle failed / Local Security Authority
+    -- cannot be contacted") sinks EVERY HTTPS attempt - an HTTP URL skips the TLS
+    -- handshake entirely and works anyway. Both serve the same 4.2 MB shareware
+    -- IWAD; the body is validated by magic + size before it is trusted.
+    W.WAD_URLS = W.WAD_URLS or { WAD_URL, "http://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad" }
+    W.dlIdx = W.dlIdx or 1
+    W.dlTries = W.dlTries or 0
+    W.dlMaxTries = W.dlMaxTries or 6            -- ~3 passes over the source list before giving up
+    -- Kick a fresh attempt (a new handle each time; a reused handle can hold bad state).
+    if not W.dlHandle then
+        if now() < (W.dlNextTry or 0) then return "busy" end     -- honor the retry cooldown
+        local url = W.WAD_URLS[W.dlIdx]
         local ok = pcall(function()
             local h = Curl.Easy()
-            h:Setopt(eCurlOption.CURLOPT_URL, WAD_URL)
+            h:Setopt(eCurlOption.CURLOPT_URL, url)
             h:Setopt(eCurlOption.CURLOPT_USERAGENT, "CheraxDoom-WAD")
             h:Perform()
             W.dlHandle = h
         end)
-        if not ok or not W.dlHandle then W.dlHandle = nil; W.dlFailed = true; return "failed" end
+        if not ok or not W.dlHandle then W.dlHandle = nil; return W.wadRetry() end
         W.dlStart = now()
     end
-    if W.dlHandle then
-        local fin = false
-        pcall(function() fin = W.dlHandle:GetFinished() end)
-        if not fin then
-            if (now() - (W.dlStart or 0)) > 60 then W.dlHandle = nil; W.dlFailed = true; return "failed" end
-            return "busy"
-        end
-        local code, body
-        pcall(function() code, body = W.dlHandle:GetResponse() end)
-        W.dlHandle = nil
-        local magic = (type(body) == "string") and body:sub(1, 4) or ""
-        if code == eCurlCode.CURLE_OK and #body > 100000 and (magic == "IWAD" or magic == "PWAD") then
-            if W.writeBytes(W.dlTarget, body) then W.dlDone = true; return "done" end
-        end
-        W.dlFailed = true; return "failed"
+    -- Poll the in-flight transfer.
+    local fin = false
+    pcall(function() fin = W.dlHandle:GetFinished() end)
+    if not fin then
+        if (now() - (W.dlStart or 0)) > 60 then W.dlHandle = nil; return W.wadRetry() end
+        return "busy"
     end
+    local code, body
+    pcall(function() code, body = W.dlHandle:GetResponse() end)
+    W.dlHandle = nil
+    local magic = (type(body) == "string") and body:sub(1, 4) or ""
+    if code == eCurlCode.CURLE_OK and type(body) == "string" and #body > 100000
+        and (magic == "IWAD" or magic == "PWAD") then
+        if W.writeBytes(W.dlTarget, body) then W.dlDone = true; return "done" end
+    end
+    return W.wadRetry()
+end
+
+-- Record a failed attempt, rotate to the next source, and either schedule a retry
+-- after a short cooldown or give up once the attempt cap is reached.
+function W.wadRetry()
+    W.dlTries = (W.dlTries or 0) + 1
+    W.dlIdx = (W.dlIdx or 1) + 1
+    if W.dlIdx > #W.WAD_URLS then W.dlIdx = 1 end
+    if W.dlTries >= (W.dlMaxTries or 6) then W.dlFailed = true; return "failed" end
+    W.dlNextTry = now() + 2.5
     return "busy"
 end
 
@@ -5329,9 +5351,12 @@ function W.drawBootProgress(st)
         local cx, cy = floor(sw * 0.5 - 150), floor(sh * 0.5 - 8)
         if st == "failed" then
             ImGui.AddText(cx, cy, "DOOM1.WAD download failed.", 235, 80, 70, 255)
-            ImGui.AddText(cx, cy + 18, "Drop a .wad in Cherax/Lua/DoomWad and reopen.", 200, 200, 205, 255)
+            ImGui.AddText(cx, cy + 18, "Check your connection, or drop DOOM1.WAD in", 200, 200, 205, 255)
+            ImGui.AddText(cx, cy + 34, "Cherax/Lua/DoomWad and reopen DOOM.", 200, 200, 205, 255)
         else
-            ImGui.AddText(cx, cy, "Downloading DOOM1.WAD...", 235, 220, 120, 255)
+            local n = W.dlTries or 0
+            ImGui.AddText(cx, cy, "Downloading DOOM1.WAD..." .. ((n > 0) and (" (retry " .. n .. ")") or ""),
+                235, 220, 120, 255)
         end
     end)
     ImGui.End()
