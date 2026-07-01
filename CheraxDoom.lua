@@ -867,7 +867,7 @@ W.BASECOL = { wall = { 170, 150, 120 }, upper = { 150, 155, 175 }, lower = { 185
 
 -- Per-frame projection + occlusion buffer setup. Call once before the walk.
 function W.setupView(sw, sh)
-    W.hudH = floor(sh * 0.10)              -- slim HUD strip at the bottom
+    W.hudH = floor(sh * 0.16)              -- vanilla status bar: 32 of 200 lines
     W.viewW = sw
     W.viewH = sh - W.hudH                  -- world drawn over y=[0, viewH]
     W.centerX = W.viewW * 0.5
@@ -945,17 +945,21 @@ function W.strip(col, y0, y1, r, g, b)
     rectf(x0, y0, x0 + W.colW + 0.8, y1, r, g, b, 255)
 end
 
--- Brightness scalar = sector light x distance diminish, with a side darken so
--- N-S walls read slightly darker than E-W ones (fake directional). Shared by the
--- flat-shaded path (as a color multiplier) and the textured path (as a grey tint).
+-- Brightness scalar = sector light x distance diminish, with vanilla fake
+-- contrast (r_segs.c): exactly-E-W walls one light level (16) darker, exactly-
+-- N-S walls one brighter. Muzzle flashes add W.extralight. Shared by the
+-- flat-shaded path (as a color multiplier) and the textured path (as a tint).
 function W.wallLight(sector, depth, seg)
-    local lf = 0.22 + 0.78 * (sector.light / 255)
-    local fog = clamp(1.0 - depth * W.PLANE_FOG, 0.26, 1.0)
-    local br = clamp(lf * fog, 0.10, 1.15)
+    local light = sector.light + (W.extralight or 0)
     local v1 = W.map.vertexes[seg.v1 + 1]
     local v2 = W.map.vertexes[seg.v2 + 1]
-    if v1 and v2 and abs(v2.x - v1.x) < abs(v2.y - v1.y) then br = br * 0.86 end
-    return br
+    if v1 and v2 then
+        if v1.y == v2.y then light = light - 16
+        elseif v1.x == v2.x then light = light + 16 end
+    end
+    local lf = 0.22 + 0.78 * (clamp(light, 0, 255) / 255)
+    local fog = clamp(1.0 - depth * W.PLANE_FOG, 0.26, 1.0)
+    return clamp(lf * fog, 0.10, 1.15)
 end
 
 -- Flat color = base tint x wallLight (Phase-2 fallback when no texture is ready).
@@ -1401,9 +1405,9 @@ function W.resolvePlaneTex(p)
 end
 
 -- Brightness scalar for a plane row: sector light x distance diminish (mirrors
--- W.wallLight minus the seg side-darken so floors read with the walls).
+-- W.wallLight minus the fake contrast). Muzzle flashes add W.extralight.
 function W.planeLight(light, rowDist)
-    local lf = 0.22 + 0.78 * (light / 255)
+    local lf = 0.22 + 0.78 * (clamp(light + (W.extralight or 0), 0, 255) / 255)
     local fog = clamp(1.0 - rowDist * W.PLANE_FOG, 0.26, 1.0)
     return clamp(lf * fog, 0.10, 1.0)
 end
@@ -1661,12 +1665,12 @@ W.CLIPAMMO = { bul = 10, shl = 4, rck = 1, cel = 20 }   -- one "clip" per ammo t
 W.PICKUP = {
     [2011] = { k = "health", amt = 10,  max = 100, msg = "Picked up a stimpack." },
     [2012] = { k = "health", amt = 25,  max = 100, msg = "Picked up a medikit." },
-    [2014] = { k = "health", amt = 1,   max = 200, always = true, msg = "Picked up a health bonus." },
-    [2013] = { k = "health", amt = 100, max = 200, always = true, msg = "Supercharge!" },
-    [83]   = { k = "mega", msg = "MegaSphere!" },
+    [2014] = { k = "health", amt = 1,   max = 200, always = true, count = true, msg = "Picked up a health bonus." },
+    [2013] = { k = "health", amt = 100, max = 200, always = true, count = true, msg = "Supercharge!" },
+    [83]   = { k = "mega", count = true, msg = "MegaSphere!" },
     [2018] = { k = "armor", pts = 100, atype = 1, msg = "Picked up the armor." },
     [2019] = { k = "armor", pts = 200, atype = 2, msg = "Picked up the MegaArmor!" },
-    [2015] = { k = "armorbonus", amt = 1, max = 200, always = true, msg = "Picked up an armor bonus." },
+    [2015] = { k = "armorbonus", amt = 1, max = 200, always = true, count = true, msg = "Picked up an armor bonus." },
     [2007] = { k = "ammo", at = "bul", clips = 1, msg = "Picked up a clip." },
     [2048] = { k = "ammo", at = "bul", clips = 5, msg = "Picked up a box of bullets." },
     [2008] = { k = "ammo", at = "shl", clips = 1, msg = "Picked up 4 shotgun shells." },
@@ -1689,12 +1693,12 @@ W.PICKUP = {
     [39] = { k = "key", col = "yellow", form = "skull", msg = "Picked up a yellow skull key." },
     [13] = { k = "key", col = "red",    form = "card",  msg = "Picked up a red keycard." },
     [38] = { k = "key", col = "red",    form = "skull", msg = "Picked up a red skull key." },
-    [2022] = { k = "power", pw = "invuln",  msg = "Invulnerability!" },
-    [2023] = { k = "power", pw = "berserk", heal = 100, msg = "Berserk!" },
-    [2024] = { k = "power", pw = "invis",   msg = "Partial Invisibility." },
-    [2025] = { k = "power", pw = "radsuit", msg = "Radiation Shielding Suit." },
-    [2026] = { k = "power", pw = "allmap",  msg = "Computer Area Map." },
-    [2045] = { k = "power", pw = "infrared", msg = "Light Amplification Visor." },
+    [2022] = { k = "power", pw = "invuln",  dur = 30 * 35, count = true, msg = "Invulnerability!" },
+    [2023] = { k = "power", pw = "berserk", dur = -1, heal = 100, count = true, msg = "Berserk!" },
+    [2024] = { k = "power", pw = "invis",   dur = 60 * 35, count = true, msg = "Partial Invisibility." },
+    [2025] = { k = "power", pw = "radsuit", dur = 60 * 35, msg = "Radiation Shielding Suit." },
+    [2026] = { k = "power", pw = "allmap",  dur = -1, count = true, msg = "Computer Area Map." },
+    [2045] = { k = "power", pw = "infrared", dur = 120 * 35, count = true, msg = "Light Amplification Visor." },
 }
 W.KEYCOL = { blue = {80,120,255}, yellow = {255,220,60}, red = {255,70,60} }
 W.WEAPNAME = { [1]="FIST", [2]="PISTOL", [3]="SHOTGUN", [4]="CHAINGUN",
@@ -1703,7 +1707,7 @@ W.WEAPNAME = { [1]="FIST", [2]="PISTOL", [3]="SHOTGUN", [4]="CHAINGUN",
 W.SLOTKEY = { [1]={8,1}, [2]={2}, [3]={9,3}, [4]={4}, [5]={5}, [6]={6}, [7]={7} }
 -- HUD ammo key per weapon slot (stub until W.WEAPONS lands in the combat chunk)
 W.HUDAMMOKEY = { [2]="bul", [3]="shl", [4]="bul", [5]="rck", [6]="cel", [7]="cel", [9]="shl" }
--- monster spawn HP by sprite prefix (full W.MOBJINFO lands with the AI chunk)
+-- fallback spawn HP by sprite prefix (species without a W.MINFO entry = statues)
 W.MONHP = { POSS=20, SPOS=30, TROO=60, SARG=150, HEAD=400, BOSS=1000, SKUL=100,
     CPOS=70, BOS2=1000, BSPI=500, PAIN=400, SKEL=300, FATT=600, VILE=700,
     SPID=3000, CYBR=4000, SSWV=50, KEEN=100, BBRN=250 }
@@ -1730,98 +1734,246 @@ W.rndtable = { 0,8,109,220,222,241,149,107,75,248,254,140,16,66,
  236,249 }
 function W.pRandom() W.rndIdx = (W.rndIdx + 1) & 0xFF; return W.rndtable[W.rndIdx + 1] end
 
--- Monster behaviour by sprite prefix (info.c mobjinfo + a lean per-state frame map).
--- speed is units/SECOND; radius comes from W.THING_SPR[dtype].r. dmg/melee are
--- P_Random damage closures. fireAt = 1-based index in the atk frame string that
--- triggers the hit/shot. eye = attack/sight source height above the actor floor.
-W.MOBJINFO = {
-    POSS = { hp=20, speed=128, pain=200, eye=42, atk="hitscan", shots=1,
-        dmg=function() return (W.pRandom()%5+1)*3 end,
-        frames={ walk="AABBCCDD", pain="G", atk="EF", fireAt=2, death="HIJKL", xdeath="OPQRST" } },
-    SPOS = { hp=30, speed=128, pain=170, eye=42, atk="hitscan", shots=3,
-        dmg=function() return (W.pRandom()%5+1)*3 end,
-        frames={ walk="AABBCCDD", pain="G", atk="EF", fireAt=2, death="HIJKL", xdeath="OPQRSTU" } },
-    TROO = { hp=60, speed=96, pain=200, eye=42, atk="missile", proj="TROOPSHOT", mrange=64,
-        melee=function() return (W.pRandom()%8+1)*3 end,
-        frames={ walk="AABBCCDD", pain="H", atk="EFG", fireAt=3, death="IJKLM", xdeath="NOPQRS" } },
-    SARG = { hp=150, speed=160, pain=180, eye=42, atk="melee", mrange=64,
-        melee=function() return (W.pRandom()%10+1)*4 end,
-        frames={ walk="AABBCCDD", pain="H", atk="EF", fireAt=2, death="IJKLMN" } },
-    HEAD = { hp=400, speed=64, pain=128, eye=48, atk="missile", proj="HEADSHOT", float=true,
-        melee=function() return (W.pRandom()%6+1)*10 end,
-        frames={ walk="A", pain="D", atk="BC", fireAt=2, death="EFGHIJK" } },
-    BOSS = { hp=1000, speed=96, pain=50, eye=48, atk="missile", proj="BRUISERSHOT", mrange=64,
-        melee=function() return (W.pRandom()%8+1)*10 end,
-        frames={ walk="AABBCCDD", pain="H", atk="EFG", fireAt=3, death="IJKLMNO" } },
+-- info.c mobjinfo (exact vanilla numbers). speed = map units per P_Move call;
+-- the state chains set the call cadence, so units/sec is emergent, not stored.
+-- Sound fields are lump BASE names; *N > 1 means pick base1..baseN at random
+-- (A_Look / A_Scream randomize the former-human and imp barks). melee/missile
+-- say which attack branches exist (both true = one shared atk chain decides).
+W.MINFO = {
+    POSS = { hp=20, speed=8, r=20, h=56, mass=100, pain=200, countkill=true,
+        melee=false, missile=true,
+        sight="DSPOSIT", sightN=3, act="DSPOSACT", psfx="DSPOPAIN", dsfx="DSPODTH", dsfxN=3 },
+    SPOS = { hp=30, speed=8, r=20, h=56, mass=100, pain=170, countkill=true,
+        melee=false, missile=true,
+        sight="DSPOSIT", sightN=3, act="DSPOSACT", psfx="DSPOPAIN", dsfx="DSPODTH", dsfxN=3 },
+    TROO = { hp=60, speed=8, r=20, h=56, mass=100, pain=200, countkill=true,
+        melee=true, missile=true,
+        sight="DSBGSIT", sightN=2, act="DSBGACT", psfx="DSPOPAIN", dsfx="DSBGDTH", dsfxN=2 },
+    SARG = { hp=150, speed=10, r=30, h=56, mass=400, pain=180, countkill=true,
+        melee=true, missile=false, atksfx="DSSGTATK",
+        sight="DSSGTSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSSGTDTH" },
+    HEAD = { hp=400, speed=8, r=31, h=56, mass=400, pain=128, countkill=true,
+        melee=true, missile=true, float=true,
+        sight="DSCACSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSCACDTH" },
+    BOSS = { hp=1000, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
+        melee=true, missile=true,
+        sight="DSBRSSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSBRSDTH" },
+    BAR1 = { hp=20, speed=0, r=10, h=42, mass=100, pain=0, noblood=true },
 }
-W.BARREL = { hp=20, boomdmg=128, boomrad=128, frames={ boom="ABCDE" } }  -- BAR1 dtype 2035
+
+-- info.c states[], one chain per (species, phase). Entry = {f=frame letter,
+-- t=tics, a=action key, b=fullbright, s=sprite prefix override}. Actions run on
+-- state ENTRY (P_SetMobjState). Chain-end rules (W.advMState): stnd/run loop;
+-- atk/pain fall through to run; t=-1 freezes (corpse); walking PAST the end of
+-- die removes the thing (the barrel explosion vanishes this way).
+W.SSTATES = {
+POSS = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=4,a="chase"},{f="A",t=4,a="chase"},{f="B",t=4,a="chase"},{f="B",t=4,a="chase"},
+      {f="C",t=4,a="chase"},{f="C",t=4,a="chase"},{f="D",t=4,a="chase"},{f="D",t=4,a="chase"}},
+ atk={{f="E",t=10,a="face"},{f="F",t=8,a="posatk"},{f="E",t=8}},
+ pain={{f="G",t=3},{f="G",t=3,a="pain"}},
+ die={{f="H",t=5},{f="I",t=5,a="scream"},{f="J",t=5,a="fall"},{f="K",t=5},{f="L",t=-1}},
+ xdie={{f="M",t=5},{f="N",t=5,a="xscream"},{f="O",t=5,a="fall"},{f="P",t=5},{f="Q",t=5},
+       {f="R",t=5},{f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+},
+SPOS = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=10,a="face"},{f="F",t=10,a="sposatk",b=true},{f="E",t=10}},
+ pain={{f="G",t=3},{f="G",t=3,a="pain"}},
+ die={{f="H",t=5},{f="I",t=5,a="scream"},{f="J",t=5,a="fall"},{f="K",t=5},{f="L",t=-1}},
+ xdie={{f="M",t=5},{f="N",t=5,a="xscream"},{f="O",t=5,a="fall"},{f="P",t=5},{f="Q",t=5},
+       {f="R",t=5},{f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+},
+TROO = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=8,a="face"},{f="F",t=8,a="face"},{f="G",t=6,a="troopatk"}},
+ pain={{f="H",t=2},{f="H",t=2,a="pain"}},
+ die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=6},{f="L",t=6,a="fall"},{f="M",t=-1}},
+ xdie={{f="N",t=5},{f="O",t=5,a="xscream"},{f="P",t=5},{f="Q",t=5,a="fall"},{f="R",t=5},
+       {f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+},
+SARG = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=2,a="chase"},{f="A",t=2,a="chase"},{f="B",t=2,a="chase"},{f="B",t=2,a="chase"},
+      {f="C",t=2,a="chase"},{f="C",t=2,a="chase"},{f="D",t=2,a="chase"},{f="D",t=2,a="chase"}},
+ atk={{f="E",t=8,a="face"},{f="F",t=8,a="face"},{f="G",t=8,a="sargatk"}},
+ pain={{f="H",t=2},{f="H",t=2,a="pain"}},
+ die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=4},{f="L",t=4,a="fall"},{f="M",t=4},{f="N",t=-1}},
+},
+HEAD = {
+ stnd={{f="A",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"}},
+ atk={{f="B",t=5,a="face"},{f="C",t=5,a="face"},{f="D",t=5,a="headatk",b=true}},
+ pain={{f="E",t=3},{f="E",t=3,a="pain"},{f="F",t=6}},
+ die={{f="G",t=8},{f="H",t=8,a="scream"},{f="I",t=8},{f="J",t=8},{f="K",t=8,a="fall"},{f="L",t=-1}},
+},
+BOSS = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=8,a="face"},{f="F",t=8,a="face"},{f="G",t=8,a="bruisatk"}},
+ pain={{f="H",t=2},{f="H",t=2,a="pain"}},
+ die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=8},{f="L",t=8,a="fall"},{f="M",t=8},
+      {f="N",t=8},{f="O",t=-1,a="bossdeath"}},
+},
+BAR1 = {
+ stnd={{f="A",t=6},{f="B",t=6}},
+ die={{s="BEXP",f="A",t=5,b=true},{s="BEXP",f="B",t=5,b=true,a="scream"},
+      {s="BEXP",f="C",t=5,b=true},{s="BEXP",f="D",t=10,b=true,a="explode"},
+      {s="BEXP",f="E",t=10,b=true}},
+},
+}
 
 -- 8-direction movement tables (p_enemy.c dirtype). movedir 0..7 = E,NE,N,NW,W,SW,S,SE;
--- 8 = DI_NODIR. DIRX/DIRY are unit steps; DIRDEG is the facing angle for sprite rotation.
-W.DIRX = { 1, 0.7071, 0, -0.7071, -1, -0.7071, 0, 0.7071 }
-W.DIRY = { 0, 0.7071, 1, 0.7071, 0, -0.7071, -1, -0.7071 }
+-- 8 = DI_NODIR. Diagonal step = vanilla 47000/65536 (slightly over cos45, a quirk
+-- kept on purpose). DIRDEG is the facing angle for sprite rotation.
+W.DIRX = { 1, 0.7172, 0, -0.7172, -1, -0.7172, 0, 0.7172 }
+W.DIRY = { 0, 0.7172, 1, 0.7172, 0, -0.7172, -1, -0.7172 }
 W.DIRDEG = { 0, 45, 90, 135, 180, 225, 270, 315 }
 W.OPPOSITE = { [0]=4, [1]=5, [2]=6, [3]=7, [4]=0, [5]=1, [6]=2, [7]=3, [8]=8 }
 W.DIAGS = { 3, 1, 5, 7 }        -- NW,NE,SW,SE, indexed ((dy<0)<<1)+(dx>0) + 1
--- Per-species sound lumps (DOOM1.WAD): wake (sight), ranged attack, melee. Stamped
--- onto the matching W.MOBJINFO entry so the AI can play them by species.
-W.MONSND = {
-    POSS = { sight="DSPOSIT1", asfx="DSPISTOL", psfx="DSPOPAIN", dsfx="DSPODTH1" },
-    SPOS = { sight="DSPOSIT2", asfx="DSSHOTGN", psfx="DSPOPAIN", dsfx="DSPODTH2" },
-    TROO = { sight="DSBGSIT1", asfx="DSFIRSHT", msfx="DSCLAW", psfx="DSPOPAIN", dsfx="DSBGDTH1" },
-    SARG = { sight="DSSGTSIT", msfx="DSSGTATK", psfx="DSDMPAIN", dsfx="DSSGTDTH" },
-    HEAD = { sight="DSCACSIT", asfx="DSFIRSHT", msfx="DSCLAW", psfx="DSDMPAIN", dsfx="DSCACDTH" },
-    BOSS = { sight="DSBRSSIT", asfx="DSFIRSHT", msfx="DSCLAW", psfx="DSDMPAIN", dsfx="DSBRSDTH" },
-}
-for k, s in pairs(W.MONSND) do
-    local mi = W.MOBJINFO[k]
-    if mi then mi.sight = s.sight; mi.asfx = s.asfx; mi.msfx = s.msfx; mi.psfx = s.psfx; mi.dsfx = s.dsfx end
+
+-- Pick a possibly-randomized sound lump: base name + 1-based variant suffix when
+-- the species has N variants (posit/bgsit/podth/bgdth), else the base name as-is.
+function W.sndPick(base, n)
+    if not base then return nil end
+    if n and n > 1 then return base .. (1 + W.pRandom() % n) end
+    return base
 end
 
--- Player weapons (p_pspr.c). fireS = summed firing-state tics; dmg = P_Random rolls;
--- pellets + spread; range 2048 (MISSILERANGE); proj weapons defer to chunk 4.
-W.WEAPONS = {
-    [1] = { name="FIST", ammo=nil, cost=0, fireS=13*W.TIC, spr="PUNG", fire="B", melee=true, range=64,
-        dmg=function() return (W.pRandom()%10+1)*2*(W.powers and W.powers.berserk and 10 or 1) end, sfx="DSPUNCH", auto=true },
-    [2] = { name="PISTOL", ammo="bul", cost=1, fireS=19*W.TIC, spr="PISG", fire="B", flash="PISF",
-        dmg=function() return 5*(W.pRandom()%3+1) end, pellets=1, accurate=true, range=2048, sfx="DSPISTOL", auto=true },
-    [3] = { name="SHOTGUN", ammo="shl", cost=1, fireS=44*W.TIC, spr="SHTG", fire="A", flash="SHTF",
-        dmg=function() return 5*(W.pRandom()%3+1) end, pellets=7, range=2048, sfx="DSSHOTGN", auto=true },
-    [4] = { name="CHAINGUN", ammo="bul", cost=1, fireS=8*W.TIC, spr="CHGG", fire="A", flash="CHGF",
-        dmg=function() return 5*(W.pRandom()%3+1) end, pellets=1, accurate=true, range=2048, sfx="DSPISTOL", auto=true },
-    [5] = { name="ROCKET", ammo="rck", cost=1, fireS=20*W.TIC, spr="MISG", fire="B", flash="MISF", proj="ROCKET", sfx="DSRLAUNC", auto=true },
-    [6] = { name="PLASMA", ammo="cel", cost=1, fireS=3*W.TIC, spr="PLSG", fire="A", flash="PLSF", proj="PLASMA", sfx="DSPLASMA", auto=true },
-    [7] = { name="BFG9000", ammo="cel", cost=40, fireS=40*W.TIC, spr="BFGG", fire="B", flash="BFGF", proj="BFG", sfx="DSBFG", auto=false },
-    [8] = { name="CHAINSAW", ammo=nil, cost=0, fireS=8*W.TIC, spr="SAWG", fire="C", melee=true, range=65,
-        dmg=function() return (W.pRandom()%10+1)*2 end, sfx="DSSAWHIT", auto=true },
-    [9] = { name="SSG", ammo="shl", cost=2, fireS=57*W.TIC, spr="SHT2", fire="A", flash="SHT2", pellets=20, range=2048, wide=true,
-        dmg=function() return 5*(W.pRandom()%3+1) end, sfx="DSDSHTGN", auto=true },
+-- Weapon psprite states (info.c). Named flat table, next-pointers by name; a
+-- t=0 state runs its action and falls straight through to nx (P_SetPsprite's
+-- zero-tic cycle), which is how the chaingun re-fire and LIGHTDONE work.
+W.WSTATES = {
+    LIGHTDONE  ={spr="SHTG",f="E",t=0,a="light0"},
+    PUNCH      ={spr="PUNG",f="A",t=1,a="ready",nx="PUNCH"},
+    PUNCHDOWN  ={spr="PUNG",f="A",t=1,a="lower",nx="PUNCHDOWN"},
+    PUNCHUP    ={spr="PUNG",f="A",t=1,a="raise",nx="PUNCHUP"},
+    PUNCH1     ={spr="PUNG",f="B",t=4,nx="PUNCH2"},
+    PUNCH2     ={spr="PUNG",f="C",t=4,a="punch",nx="PUNCH3"},
+    PUNCH3     ={spr="PUNG",f="D",t=5,nx="PUNCH4"},
+    PUNCH4     ={spr="PUNG",f="C",t=4,nx="PUNCH5"},
+    PUNCH5     ={spr="PUNG",f="B",t=5,a="refire",nx="PUNCH"},
+    PISTOL     ={spr="PISG",f="A",t=1,a="ready",nx="PISTOL"},
+    PISTOLDOWN ={spr="PISG",f="A",t=1,a="lower",nx="PISTOLDOWN"},
+    PISTOLUP   ={spr="PISG",f="A",t=1,a="raise",nx="PISTOLUP"},
+    PISTOL1    ={spr="PISG",f="A",t=4,nx="PISTOL2"},
+    PISTOL2    ={spr="PISG",f="B",t=6,a="firepistol",nx="PISTOL3"},
+    PISTOL3    ={spr="PISG",f="C",t=4,nx="PISTOL4"},
+    PISTOL4    ={spr="PISG",f="B",t=5,a="refire",nx="PISTOL"},
+    PISTOLFLASH={spr="PISF",f="A",t=7,b=true,a="light1",nx="LIGHTDONE"},
+    SGUN       ={spr="SHTG",f="A",t=1,a="ready",nx="SGUN"},
+    SGUNDOWN   ={spr="SHTG",f="A",t=1,a="lower",nx="SGUNDOWN"},
+    SGUNUP     ={spr="SHTG",f="A",t=1,a="raise",nx="SGUNUP"},
+    SGUN1      ={spr="SHTG",f="A",t=3,nx="SGUN2"},
+    SGUN2      ={spr="SHTG",f="A",t=7,a="fireshotgun",nx="SGUN3"},
+    SGUN3      ={spr="SHTG",f="B",t=5,nx="SGUN4"},
+    SGUN4      ={spr="SHTG",f="C",t=5,nx="SGUN5"},
+    SGUN5      ={spr="SHTG",f="D",t=4,nx="SGUN6"},
+    SGUN6      ={spr="SHTG",f="C",t=5,nx="SGUN7"},
+    SGUN7      ={spr="SHTG",f="B",t=5,nx="SGUN8"},
+    SGUN8      ={spr="SHTG",f="A",t=3,nx="SGUN9"},
+    SGUN9      ={spr="SHTG",f="A",t=7,a="refire",nx="SGUN"},
+    SGUNFLASH1 ={spr="SHTF",f="A",t=4,b=true,a="light1",nx="SGUNFLASH2"},
+    SGUNFLASH2 ={spr="SHTF",f="B",t=3,b=true,a="light2",nx="LIGHTDONE"},
+    DSGUN      ={spr="SHT2",f="A",t=1,a="ready",nx="DSGUN"},
+    DSGUNDOWN  ={spr="SHT2",f="A",t=1,a="lower",nx="DSGUNDOWN"},
+    DSGUNUP    ={spr="SHT2",f="A",t=1,a="raise",nx="DSGUNUP"},
+    DSGUN1     ={spr="SHT2",f="A",t=3,nx="DSGUN2"},
+    DSGUN2     ={spr="SHT2",f="A",t=7,a="fireshotgun2",nx="DSGUN3"},
+    DSGUN3     ={spr="SHT2",f="B",t=7,nx="DSGUN4"},
+    DSGUN4     ={spr="SHT2",f="C",t=7,a="checkreload",nx="DSGUN5"},
+    DSGUN5     ={spr="SHT2",f="D",t=7,a="opensg2",nx="DSGUN6"},
+    DSGUN6     ={spr="SHT2",f="E",t=7,nx="DSGUN7"},
+    DSGUN7     ={spr="SHT2",f="F",t=7,a="loadsg2",nx="DSGUN8"},
+    DSGUN8     ={spr="SHT2",f="G",t=6,nx="DSGUN9"},
+    DSGUN9     ={spr="SHT2",f="H",t=6,a="closesg2",nx="DSGUN10"},
+    DSGUN10    ={spr="SHT2",f="A",t=5,a="refire",nx="DSGUN"},
+    DSGUNFLASH1={spr="SHT2",f="I",t=5,b=true,a="light1",nx="DSGUNFLASH2"},
+    DSGUNFLASH2={spr="SHT2",f="J",t=4,b=true,a="light2",nx="LIGHTDONE"},
+    CHAIN      ={spr="CHGG",f="A",t=1,a="ready",nx="CHAIN"},
+    CHAINDOWN  ={spr="CHGG",f="A",t=1,a="lower",nx="CHAINDOWN"},
+    CHAINUP    ={spr="CHGG",f="A",t=1,a="raise",nx="CHAINUP"},
+    CHAIN1     ={spr="CHGG",f="A",t=4,a="firecgun",nx="CHAIN2"},
+    CHAIN2     ={spr="CHGG",f="B",t=4,a="firecgun",nx="CHAIN3"},
+    CHAIN3     ={spr="CHGG",f="B",t=0,a="refire",nx="CHAIN"},
+    CHAINFLASH1={spr="CHGF",f="A",t=5,b=true,a="light1",nx="LIGHTDONE"},
+    CHAINFLASH2={spr="CHGF",f="B",t=5,b=true,a="light2",nx="LIGHTDONE"},
+    MISSILE    ={spr="MISG",f="A",t=1,a="ready",nx="MISSILE"},
+    MISSILEDOWN={spr="MISG",f="A",t=1,a="lower",nx="MISSILEDOWN"},
+    MISSILEUP  ={spr="MISG",f="A",t=1,a="raise",nx="MISSILEUP"},
+    MISSILE1   ={spr="MISG",f="B",t=8,a="gunflash",nx="MISSILE2"},
+    MISSILE2   ={spr="MISG",f="B",t=12,a="firemissile",nx="MISSILE3"},
+    MISSILE3   ={spr="MISG",f="B",t=0,a="refire",nx="MISSILE"},
+    MISSILEFLASH1={spr="MISF",f="A",t=3,b=true,a="light1",nx="MISSILEFLASH2"},
+    MISSILEFLASH2={spr="MISF",f="B",t=4,b=true,nx="MISSILEFLASH3"},
+    MISSILEFLASH3={spr="MISF",f="C",t=4,b=true,a="light2",nx="MISSILEFLASH4"},
+    MISSILEFLASH4={spr="MISF",f="D",t=4,b=true,a="light2",nx="LIGHTDONE"},
+    SAW        ={spr="SAWG",f="C",t=4,a="ready",nx="SAWB"},
+    SAWB       ={spr="SAWG",f="D",t=4,a="ready",nx="SAW"},
+    SAWDOWN    ={spr="SAWG",f="C",t=1,a="lower",nx="SAWDOWN"},
+    SAWUP      ={spr="SAWG",f="C",t=1,a="raise",nx="SAWUP"},
+    SAW1       ={spr="SAWG",f="A",t=4,a="saw",nx="SAW2"},
+    SAW2       ={spr="SAWG",f="B",t=4,a="saw",nx="SAW3"},
+    SAW3       ={spr="SAWG",f="B",t=0,a="refire",nx="SAW"},
+    PLASMA     ={spr="PLSG",f="A",t=1,a="ready",nx="PLASMA"},
+    PLASMADOWN ={spr="PLSG",f="A",t=1,a="lower",nx="PLASMADOWN"},
+    PLASMAUP   ={spr="PLSG",f="A",t=1,a="raise",nx="PLASMAUP"},
+    PLASMA1    ={spr="PLSG",f="A",t=3,a="fireplasma",nx="PLASMA2"},
+    PLASMA2    ={spr="PLSG",f="B",t=20,a="refire",nx="PLASMA"},
+    PLASMAFLASH1={spr="PLSF",f="A",t=4,b=true,a="light1",nx="LIGHTDONE"},
+    PLASMAFLASH2={spr="PLSF",f="B",t=4,b=true,a="light1",nx="LIGHTDONE"},
+    BFG        ={spr="BFGG",f="A",t=1,a="ready",nx="BFG"},
+    BFGDOWN    ={spr="BFGG",f="A",t=1,a="lower",nx="BFGDOWN"},
+    BFGUP      ={spr="BFGG",f="A",t=1,a="raise",nx="BFGUP"},
+    BFG1       ={spr="BFGG",f="A",t=20,a="bfgsound",nx="BFG2"},
+    BFG2       ={spr="BFGG",f="B",t=10,a="gunflash",nx="BFG3"},
+    BFG3       ={spr="BFGG",f="B",t=10,a="firebfg",nx="BFG4"},
+    BFG4       ={spr="BFGG",f="B",t=20,a="refire",nx="BFG"},
+    BFGFLASH1  ={spr="BFGF",f="A",t=11,b=true,a="light1",nx="BFGFLASH2"},
+    BFGFLASH2  ={spr="BFGF",f="B",t=6,b=true,a="light2",nx="LIGHTDONE"},
 }
 
--- Synthetic THING_SPR ids (never in a WAD) for pooled fx + projectiles: r=nil so
--- they never block movement; drawn via the normal sprite path (with th.spr/th.frame).
-W.THING_SPR[30030] = { spr="PUFF", seq="A", rot=false, kind="fx" }
-W.THING_SPR[30031] = { spr="BLUD", seq="A", rot=false, kind="fx" }
-W.THING_SPR[30032] = { spr="BEXP", seq="A", rot=false, kind="fx" }
-W.THING_SPR[30040] = { spr="MISL", seq="A", rot=false, kind="fx" }   -- projectile (th.spr overrides prefix)
+-- d_items.c weaponinfo: ammo type, per-shot cost, psprite entry states.
+W.WEAPONS = {
+    [1] = { name="FIST",     ammo=nil,   up="PUNCHUP",   down="PUNCHDOWN",   ready="PUNCH",   atk="PUNCH1" },
+    [2] = { name="PISTOL",   ammo="bul", up="PISTOLUP",  down="PISTOLDOWN",  ready="PISTOL",  atk="PISTOL1",  flash="PISTOLFLASH" },
+    [3] = { name="SHOTGUN",  ammo="shl", up="SGUNUP",    down="SGUNDOWN",    ready="SGUN",    atk="SGUN1",    flash="SGUNFLASH1" },
+    [4] = { name="CHAINGUN", ammo="bul", up="CHAINUP",   down="CHAINDOWN",   ready="CHAIN",   atk="CHAIN1",   flash="CHAINFLASH1", flash2="CHAINFLASH2" },
+    [5] = { name="ROCKET",   ammo="rck", up="MISSILEUP", down="MISSILEDOWN", ready="MISSILE", atk="MISSILE1", flash="MISSILEFLASH1" },
+    [6] = { name="PLASMA",   ammo="cel", up="PLASMAUP",  down="PLASMADOWN",  ready="PLASMA",  atk="PLASMA1",  flash="PLASMAFLASH1", flash2="PLASMAFLASH2" },
+    [7] = { name="BFG9000",  ammo="cel", cost=40, up="BFGUP", down="BFGDOWN", ready="BFG",    atk="BFG1",     flash="BFGFLASH1" },
+    [8] = { name="CHAINSAW", ammo=nil,   up="SAWUP",     down="SAWDOWN",     ready="SAW",     atk="SAW1" },
+    [9] = { name="SSG",      ammo="shl", cost=2, up="DSGUNUP", down="DSGUNDOWN", ready="DSGUN", atk="DSGUN1", flash="DSGUNFLASH1" },
+}
 
--- Missiles (info.c mobjinfo). speed = units/SECOND (Doom fracunit/tic * 35). dmg =
--- direct-hit roll (P_Random%8+1)*info.damage; splash = A_Explode radius+dmg (rockets/
--- BFG only, 0 for fireballs/plasma). flySpr/fly = in-flight sprite + anim frames;
--- boomSpr/boom = explosion sprite + frames. Player and monster share this table.
+-- Synthetic THING_SPR id (never in a WAD) for pooled fx + projectiles: r=nil so
+-- they never block movement; drawn via the normal sprite path (th.spr overrides).
+W.THING_SPR[30040] = { spr="MISL", seq="A", rot=false, kind="fx" }
+
+-- Missiles (info.c mobjinfo, exact). speed = units per TIC (fracunits/tic).
+-- dmg = the direct-hit multiplier ((P_Random%8+1)*dmg). splash = A_Explode
+-- radius+damage (rockets only; the BFG ball sprays tracers instead, see
+-- W.bfgSpray). fly/boom = sprite frames + per-frame tics (all fullbright).
+-- r = missile radius (added to the target radius for the contact test).
 W.PROJ = {
-    ROCKET      = { flySpr="MISL", fly="A",  boomSpr="MISL", boom="BCD",   speed=660, splash=128, boomsfx="DSBAREXP",
-        dmg=function() return (W.pRandom()%8+1)*20 end },
-    PLASMA      = { flySpr="PLSS", fly="AB", boomSpr="PLSE", boom="ABCDE", speed=875, splash=0,   boomsfx="DSFIRXPL",
-        dmg=function() return (W.pRandom()%8+1)*5 end },
-    BFG         = { flySpr="BFS1", fly="AB", boomSpr="BFE1", boom="ABCDEF",speed=875, splash=280, boomsfx="DSRXPLOD", spray=true,
-        dmg=function() return (W.pRandom()%8+1)*100 end },
-    TROOPSHOT   = { flySpr="BAL1", fly="AB", boomSpr="BAL1", boom="CDE",   speed=350, splash=0,   boomsfx="DSFIRXPL",
-        dmg=function() return (W.pRandom()%8+1)*3 end },
-    HEADSHOT    = { flySpr="BAL2", fly="AB", boomSpr="BAL2", boom="CDE",   speed=350, splash=0,   boomsfx="DSFIRXPL",
-        dmg=function() return (W.pRandom()%8+1)*5 end },
-    BRUISERSHOT = { flySpr="BAL7", fly="AB", boomSpr="BAL7", boom="CDE",   speed=525, splash=0,   boomsfx="DSFIRXPL",
-        dmg=function() return (W.pRandom()%8+1)*8 end },
+    ROCKET      = { flySpr="MISL", fly="A",  flyT=1, boomSpr="MISL", boom="BCD",    boomT={8,6,4},
+        speed=20, r=11, splash=128, seesfx="DSRLAUNC", dsfx="DSBAREXP", dmg=20 },
+    PLASMA      = { flySpr="PLSS", fly="AB", flyT=6, boomSpr="PLSE", boom="ABCDE",  boomT=4,
+        speed=25, r=13, splash=0,   seesfx="DSPLASMA", dsfx="DSFIRXPL", dmg=5 },
+    BFG         = { flySpr="BFS1", fly="AB", flyT=4, boomSpr="BFE1", boom="ABCDEF", boomT=8,
+        speed=25, r=13, splash=0,   spray=true,        dsfx="DSRXPLOD", dmg=100 },
+    TROOPSHOT   = { flySpr="BAL1", fly="AB", flyT=4, boomSpr="BAL1", boom="CDE",    boomT=6,
+        speed=10, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=3 },
+    HEADSHOT    = { flySpr="BAL2", fly="AB", flyT=4, boomSpr="BAL2", boom="CDE",    boomT=6,
+        speed=10, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=5 },
+    BRUISERSHOT = { flySpr="BAL7", fly="AB", flyT=4, boomSpr="BAL7", boom="CDE",    boomT=6,
+        speed=15, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=8 },
 }
 
 -- H.2b: build an 8-slot frame/rotation index from the sprite namespace once.
@@ -2032,9 +2184,10 @@ function W.drawThing(th, e, depth)
     local xRight = xLeft + sprW
     if xRight <= 0 or xLeft >= W.viewW then return end
     if sprW <= 0 then return end
-    -- shade: sector light x distance, same curve as planes
+    -- shade: sector light x distance, same curve as planes; fullbright frames
+    -- (muzzle fx, fireballs, explosions, strobing attack frames) skip the shade
     local br = W.planeLight(sec and sec.light or 160, depth)
-    local tint = W.greyTint(br)
+    local tint = th.bright and 0xFFFFFFFF or W.greyTint(br)
     local colW = W.colW
     local cL = clamp(floor(xLeft / colW), 0, W.RW - 1)
     local cR = clamp(floor((xRight - 1e-4) / colW), 0, W.RW - 1)
@@ -2183,11 +2336,28 @@ function W.spawnPlayer(map)
     end
     W.viewX = start.x; W.viewY = start.y
     W.viewAngle = math.rad(start.angle)
-    W.fallVel = 0                           -- vertical velocity for gravity/falling
-    W.viewZ = W.floorZAt(W.viewX, W.viewY) + W.EYE
+    W.momx = 0; W.momy = 0; W.momz = 0      -- vanilla momentum state (units/tic)
+    W.pz = W.floorZAt(W.viewX, W.viewY)     -- feet height
+    W.viewheight = 41; W.dvh = 0; W.bob = 0
+    W.viewZ = W.pz + W.viewheight
+    W.reactionTics = 0
+    W.attacker = nil
+    W.extralight = 0
+    W.usePressed = false
     W.activeSectors = {}                    -- in-progress door/sector movements
     W.spawnSpecials(map)                     -- arm light/damage/secret specials + tic clock
     if W.health == nil then W.newGame() end -- first level of a fresh game
+    W.playerDead = false
+    W.damageCount = 0; W.bonusCount = 0
+    if W.health <= 0 then W.newGame() end
+    -- psprites: raise the current weapon from the bottom (P_SetupPsprites)
+    W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
+    W.psf = { st = nil, tics = -1 }
+    W.attackdown = false; W.refire = 0
+    W.pendingWeapon = W.pendingWeapon or W.curWeapon
+    W.bringUpWeapon()
+    W.stInit()
+    W.oldPX = W.viewX; W.oldPY = W.viewY; W.oldVZ = W.viewZ   -- interp: no glide on spawn
     W.spawnActors(map)                      -- live monsters/barrels + pickup index
     return true
 end
@@ -2252,7 +2422,7 @@ function W.blocked(nx, ny)
             end
         end
     end
-    local feet = W.viewZ - W.EYE
+    local feet = W.pz
     if tmceil - tmfloor < W.PHEIGHT then return true end      -- opening too short to fit
     if tmfloor - feet > W.MAXSTEP then return true end        -- step up too high
     -- Solid THINGS (barrels, columns, trees, monsters) block by AABB overlap.
@@ -2275,7 +2445,7 @@ end
 function W.floorZFor(R, x, y)
     local bl, br, bb, bt = x - R, x + R, y - R, y + R
     local sec = W.sectorAt(x, y)
-    if not sec then return W.viewZ - W.EYE end        -- off-map: keep current height
+    if not sec then return W.pz or 0 end              -- off-map: keep current height
     local fz = sec.floor
     local V, LD, SD, SE = W.map.vertexes, W.map.linedefs, W.map.sidedefs, W.map.sectors
     for _, ld in ipairs(LD) do
@@ -2303,25 +2473,81 @@ end
 -- Player floor (body radius). Monsters call floorZFor with their own radius.
 function W.floorZAt(x, y) return W.floorZFor(W.RADIUS, x, y) end
 
--- One collision-resolved step: full diagonal first (so you can walk out of a
--- concave corner where both single axes are blocked), else axis-separated slide.
-function W.moveStep(dx, dy)
-    if not W.blocked(W.viewX + dx, W.viewY + dy) then
-        W.viewX = W.viewX + dx; W.viewY = W.viewY + dy; return
-    end
-    if not W.blocked(W.viewX + dx, W.viewY) then W.viewX = W.viewX + dx end
-    if not W.blocked(W.viewX, W.viewY + dy) then W.viewY = W.viewY + dy end
+-- P_TryMove for the player: commit the position if the box test passes, firing
+-- any walk-over trigger lines the move crossed. Momentum stays untouched.
+function W.pTryMove(nx, ny)
+    if W.blocked(nx, ny) then return false end
+    local ox, oy = W.viewX, W.viewY
+    W.viewX = nx; W.viewY = ny
+    W.crossLines(ox, oy, nx, ny, true, nil)
+    return true
 end
 
--- Substep the frame's movement so a fast move (at low fps) cannot tunnel a wall.
--- Walk-over line specials fire for any trigger line the move crossed.
-function W.tryMove(dx, dy)
-    local ox, oy = W.viewX, W.viewY
-    local n = ceil(sqrt(dx * dx + dy * dy) / 8)      -- <= 8 units per collision step
-    if n < 1 then n = 1 end
-    local sx, sy = dx / n, dy / n
-    for _ = 1, n do W.moveStep(sx, sy) end
-    W.crossLines(ox, oy, W.viewX, W.viewY, true, nil)
+-- Would this line block the player's box (for the slide trace)? One-sided and
+-- ML_BLOCKING always; a two-sided line blocks when its live opening is too
+-- short for the player or steps up more than MAXSTEP from the current feet.
+function W.lineBlocksPlayer(ld)
+    if ld.back == NONE or ld.front == NONE then return true end
+    if (ld.flags & 0x0001) ~= 0 then return true end
+    local SD, SE = W.map.sidedefs, W.map.sectors
+    local fsd = SD[ld.front + 1]; local bsd = SD[ld.back + 1]
+    local fsec = fsd and SE[fsd.sector + 1]
+    local bsec = bsd and SE[bsd.sector + 1]
+    if not (fsec and bsec) then return true end
+    local ot = (fsec.ceil < bsec.ceil) and fsec.ceil or bsec.ceil
+    local ob = (fsec.floor > bsec.floor) and fsec.floor or bsec.floor
+    if ot - ob < W.PHEIGHT then return true end
+    if ob - W.pz > W.MAXSTEP then return true end
+    if ot - W.pz < W.PHEIGHT then return true end
+    return false
+end
+
+-- P_SlideMove: the blocked move slides along the nearest blocking wall instead
+-- of stopping dead. Three lead-corner traces find the closest blocking line;
+-- the remaining momentum is projected onto it (P_HitSlideLine) and re-tried.
+-- Momentum is CLIPPED to the projected vector, so pushing into a wall does not
+-- keep the full speed (matches vanilla). Stairstep axis fallback if all else fails.
+function W.slideMove()
+    local R = W.RADIUS
+    local V, LD = W.map.vertexes, W.map.linedefs
+    for _ = 1, 3 do
+        local mx, my = W.momx, W.momy
+        if mx == 0 and my == 0 then return end
+        local leadx = W.viewX + ((mx > 0) and R or -R)
+        local leady = W.viewY + ((my > 0) and R or -R)
+        local trailx = W.viewX - ((mx > 0) and R or -R)
+        local traily = W.viewY - ((my > 0) and R or -R)
+        local bestT, bestLd = 1.0, nil
+        for _, ld in ipairs(LD) do
+            local a = V[ld.v1 + 1]; local b = V[ld.v2 + 1]
+            if a and b then
+                local t1, u1 = W.raySeg(leadx, leady, leadx + mx, leady + my, a.x, a.y, b.x, b.y)
+                if t1 and t1 >= 0 and t1 < bestT and u1 >= 0 and u1 <= 1 and W.lineBlocksPlayer(ld) then bestT = t1; bestLd = ld end
+                local t2, u2 = W.raySeg(leadx, traily, leadx + mx, traily + my, a.x, a.y, b.x, b.y)
+                if t2 and t2 >= 0 and t2 < bestT and u2 >= 0 and u2 <= 1 and W.lineBlocksPlayer(ld) then bestT = t2; bestLd = ld end
+                local t3, u3 = W.raySeg(trailx, leady, trailx + mx, leady + my, a.x, a.y, b.x, b.y)
+                if t3 and t3 >= 0 and t3 < bestT and u3 >= 0 and u3 <= 1 and W.lineBlocksPlayer(ld) then bestT = t3; bestLd = ld end
+            end
+        end
+        if not bestLd then                             -- no line found: stairstep
+            if not W.pTryMove(W.viewX, W.viewY + my) then W.pTryMove(W.viewX + mx, W.viewY) end
+            return
+        end
+        -- move up to the blocking line (a hair short), then slide the remainder
+        local goT = bestT - 0.03125 / (abs(mx) + abs(my) + 0.001)
+        if goT > 0 then W.pTryMove(W.viewX + mx * goT, W.viewY + my * goT) end
+        local a = V[bestLd.v1 + 1]; local b = V[bestLd.v2 + 1]
+        local lx, ly = b.x - a.x, b.y - a.y
+        local ll = lx * lx + ly * ly
+        if ll <= 0 then return end
+        local left = 1.0 - ((goT > 0) and goT or 0)
+        local d = (mx * left * lx + my * left * ly) / ll   -- P_HitSlideLine projection
+        W.momx = d * lx
+        W.momy = d * ly
+        if W.pTryMove(W.viewX + W.momx, W.viewY + W.momy) then return end
+    end
+    -- boxed in: stairstep as the last resort, then give up this tic
+    if not W.pTryMove(W.viewX, W.viewY + W.momy) then W.pTryMove(W.viewX + W.momx, W.viewY) end
 end
 
 -- Safety net: if the player is somehow inside a blocking zone (e.g. landed hard
@@ -2549,11 +2775,36 @@ function W.forTagSectors(tag, fn)
     return rtn
 end
 
--- Would a plane closing to [nf, nc] crush the player standing in sector si?
--- Approximates P_ChangeSector's thing-fit test for the one thing we track exactly.
+-- Iterate live solid things standing in sector si (monsters + barrels).
+function W.eachThingInSector(si, fn)
+    local sec = W.map.sectors[si + 1]; if not sec then return end
+    for _, th in ipairs(W.map.things) do
+        if th.think == "monster" and not th.dead and not th.removed then
+            if W.sectorAt(th.x, th.y) == sec then fn(th) end
+        end
+    end
+end
+
+-- Would a plane closing to [nf, nc] crush a thing in sector si? P_ChangeSector's
+-- fit test: the player and any live monster/barrel too tall for the new gap.
 function W.thingBlocksPlane(si, nf, nc)
-    if (nc - nf) >= W.PHEIGHT then return false end
-    return W.playerInSector(si) and not W.playerDead
+    local gap = nc - nf
+    if gap < W.PHEIGHT and W.playerInSector(si) and not W.playerDead then return true end
+    local hit = false
+    W.eachThingInSector(si, function(th)
+        if gap < ((th.info and th.info.h) or 56) then hit = true end
+    end)
+    return hit
+end
+
+-- Crush damage pulse (10 per 4 tics) on everything caught in sector si.
+function W.crushThings(si)
+    if (W.levelTime & 3) ~= 0 then return end
+    if W.playerInSector(si) and not W.playerDead then W.hurtPlayer(10) end
+    W.eachThingInSector(si, function(th)
+        local gap = W.map.sectors[si + 1].ceil - W.map.sectors[si + 1].floor
+        if gap < ((th.info and th.info.h) or 56) then W.damageMobj(th, 10, nil, nil) end
+    end)
 end
 
 -- T_MovePlane: advance one plane of a sector one tic toward dest. Returns "ok",
@@ -2571,7 +2822,7 @@ function W.movePlane(sec, si, speed, dest, crush, isCeil, dir)
     end
     if compress and W.thingBlocksPlane(si, isCeil and sec.floor or nh, isCeil and nh or sec.ceil) then
         if crush then
-            if (W.levelTime & 3) == 0 and W.playerInSector(si) then W.hurtPlayer(10) end
+            W.crushThings(si)                -- crushers keep moving and hurt (10 per 4 tics)
         else
             return "crushed"                 -- do not move; caller reverses/stalls
         end
@@ -2896,21 +3147,85 @@ function W.evBuildStairs(ld, kind)
     end)
 end
 
-function W.exitLevel()
+-- DOOM par times (g_game.c): pars[episode][map], DOOM II cpars[map].
+W.PARS = {
+    [1] = { 30, 75, 120, 90, 165, 180, 180, 30, 165 },
+    [2] = { 90, 90, 90, 120, 90, 360, 240, 30, 170 },
+    [3] = { 90, 45, 90, 150, 90, 90, 165, 30, 135 },
+}
+W.CPARS = {
+    30, 90, 120, 120, 90, 150, 120, 120, 270, 90,
+    210, 150, 150, 150, 210, 150, 420, 150, 210, 150,
+    240, 150, 180, 150, 150, 300, 330, 420, 300, 180,
+    120, 30,
+}
+
+function W.mapExists(name)
+    for _, m in ipairs(W.mapList or {}) do if m == name then return true end end
+    return false
+end
+
+-- G_DoCompleted: gather the intermission stats + compute the next map with the
+-- vanilla secret-exit routing (ExM9 / MAP31/MAP32) and episode-end handling,
+-- then hand off to the intermission screen.
+function W.exitLevel(secret)
     W.finishLevel()                         -- keep gear across the level, drop keys/powers
-    local cur = W.map and W.map.name
-    local list = W.mapList or {}
-    local nxt
-    for i, m in ipairs(list) do if m == cur then nxt = list[i + 1]; break end end
-    if nxt then W.startMap(nxt)
+    local cur = (W.map and W.map.name) or ""
+    local ep, mp = cur:match("^E(%d)M(%d)$")
+    local wm = { last = cur, secret = secret and true or false }
+    if ep then
+        ep, mp = tonumber(ep), tonumber(mp)
+        wm.epsd = ep
+        wm.lastIdx = mp - 1
+        if mp == 9 then W.didsecret = true end
+        local nmp
+        if secret then nmp = 9
+        elseif mp == 9 then nmp = ({ [1] = 4, [2] = 6, [3] = 7, [4] = 3 })[ep] or 4
+        elseif mp == 8 then nmp = nil                    -- episode complete
+        else nmp = mp + 1 end
+        if nmp then wm.next = ("E%dM%d"):format(ep, nmp); wm.nextIdx = nmp - 1 end
+        local p = W.PARS[ep]
+        wm.par = p and p[mp] or nil                      -- E4+ shows no par
+    else
+        mp = tonumber(cur:match("^MAP(%d+)$") or "")
+        if mp then
+            wm.lastIdx = mp - 1
+            local nmp
+            if secret then nmp = (mp == 31) and 32 or 31
+            elseif mp == 31 or mp == 32 then nmp = 16
+            elseif mp == 30 then nmp = nil               -- game complete
+            else nmp = mp + 1 end
+            if nmp then wm.next = ("MAP%02d"):format(nmp); wm.nextIdx = nmp - 1 end
+            wm.par = W.CPARS[mp]
+        end
+    end
+    if wm.next and not W.mapExists(wm.next) then wm.next = nil end
+    wm.kills = W.killCount or 0
+    wm.maxkills = max(1, W.totalKills or 0)
+    wm.items = W.itemCount or 0
+    wm.maxitems = max(1, W.totalItems or 0)
+    wm.secrets = W.secretCount or 0
+    wm.maxsecret = max(1, W.totalSecret or 0)
+    wm.time = floor((W.levelTime or 0) / 35)
+    W.wiStart(wm)
+end
+
+-- After the intermission: load the next map, or return to the front-end menu
+-- when the episode/game is over (the victory text screens are not simulated).
+function W.worldDone(wm)
+    if wm.next then W.startMap(wm.next)
     else
         W.menu.fromPlay = false; W.menu.screen = "main"; W.menu.cursor = 1
         W.gameState = "frontend"; W.status = "level complete"
+        if W.musicOn then W.musPending = "VICTORY" end
     end
 end
 
 -- EV_Teleport: move a player/monster to the MT_TELEPORTMAN (thing type 14) in a
 -- sector matching the line tag. side 1 (came from the back) does not teleport.
+-- Vanilla trimmings: TFOG bursts + sound at BOTH ends, an 18-tic post-teleport
+-- freeze, the player telefrags anything on the pad, and a monster whose pad is
+-- occupied simply does not teleport (P_StompThing rule).
 function W.evTeleport(ld, side, isPlayer, th)
     if side == 1 then return false end
     if not ld.tag or ld.tag == 0 then return false end
@@ -2918,14 +3233,38 @@ function W.evTeleport(ld, side, isPlayer, th)
         if t.dtype == 14 then
             local sec = W.sectorAt(t.x, t.y)
             if sec and sec.tag == ld.tag then
-                if isPlayer then
-                    W.viewX = t.x; W.viewY = t.y; W.fallVel = 0
-                    W.viewZ = W.floorZAt(t.x, t.y) + W.EYE
-                    W.viewAngle = math.rad(t.angle)
-                elseif th then
-                    th.x = t.x; th.y = t.y; th.z = W.floorZFor(W.RADIUS, t.x, t.y)
-                    th.angle = t.angle; th.movecount = 0
+                local dz = W.floorZFor(W.RADIUS, t.x, t.y)
+                -- destination occupancy: player stomps, monsters bounce off
+                for _, o in ipairs(W.map.things) do
+                    if o.think == "monster" and not o.dead and not o.removed and o ~= th then
+                        local oe = W.THING_SPR[o.dtype]
+                        local rr = (oe and oe.r or 20) + ((isPlayer and W.RADIUS)
+                            or (th and th.info and th.info.r) or 20)
+                        if abs(o.x - t.x) < rr and abs(o.y - t.y) < rr then
+                            if isPlayer then W.damageMobj(o, 10000, nil, "player")
+                            else return false end
+                        end
+                    end
                 end
+                local ox, oy, oz
+                if isPlayer then
+                    ox, oy, oz = W.viewX, W.viewY, W.pz
+                    W.viewX = t.x; W.viewY = t.y
+                    W.pz = dz; W.momx = 0; W.momy = 0; W.momz = 0
+                    W.viewZ = dz + (W.viewheight or 41)
+                    W.viewAngle = math.rad(t.angle)
+                    W.reactionTics = 18                       -- vanilla freeze
+                    W.oldPX = W.viewX; W.oldPY = W.viewY; W.oldVZ = W.viewZ  -- no interp glide
+                elseif th then
+                    ox, oy, oz = th.x, th.y, th.z or dz
+                    th.x = t.x; th.y = t.y; th.z = dz
+                    th.angle = t.angle; th.movecount = 0; th.movedir = 8
+                    th.reaction = 18
+                end
+                if ox then W.spawnFx("TFOG", "ABABCDEFGHIJ", 6, ox, oy, oz, { bright = true }) end
+                W.spawnFx("TFOG", "ABABCDEFGHIJ", 6,
+                    t.x + 20 * cos(math.rad(t.angle)), t.y + 20 * sin(math.rad(t.angle)),
+                    dz, { bright = true })
                 pcall(W.playSfx, "DSTELEPT")
                 return true
             end
@@ -2944,7 +3283,7 @@ function W.evLightTurnOn(ld, amount)
             if amount == "off" then
                 sec.light = W.findMinLight(si, sec.light)
             elseif amount == "strobe" then
-                W.spawnStrobe(si, sec, false)
+                W.spawnStrobe(si, sec, 35, false)          -- EV_StartLightStrobing: SLOWDARK
             elseif amount == 0 then
                 local hi = 0
                 W.eachNeighbor(si, function(o) if o.light > hi then hi = o.light end end)
@@ -2999,7 +3338,7 @@ function W.crossSpecialLine(ld, side, isPlayer, th)
     elseif ev == "platstop" then W.evStopPlat(ld)
     elseif ev == "ceilstop" then W.evCeilStop(ld)
     elseif ev == "combo40" then W.evDoCeiling(ld, "raiseToHighest"); W.evDoFloor(ld, "lowerFloorToLowest")
-    elseif ev == "exit" or ev == "secretexit" then W.exitLevel()
+    elseif ev == "exit" or ev == "secretexit" then W.exitLevel(ev == "secretexit")
     end
     if c.once then ld.special = 0 end
 end
@@ -3011,7 +3350,7 @@ function W.useSpecialLine(ld)
     if W.DOOR_SPECIALS[sp] then W.evVerticalDoor(ld); return true end
     local s = W.SWITCH_KIND[sp]; if not s then return false end
     local ev = s.ev
-    if ev == "exit" or ev == "secretexit" then W.changeSwitch(ld, false); W.exitLevel(); return true end
+    if ev == "exit" or ev == "secretexit" then W.changeSwitch(ld, false); W.exitLevel(ev == "secretexit"); return true end
     local ok = false
     if ev == "floor" then ok = W.evDoFloor(ld, s.kind)
     elseif ev == "plat" then ok = W.evDoPlat(ld, s.kind, s.amount or 0)
@@ -3082,25 +3421,31 @@ function W.useLine()
     return nil
 end
 
--- Sector light effects (subset of DOOM p_lights.c). Each thinker toggles a sector
--- light between a bright and a dark level on a tic timer. Cosmetic only.
-function W.spawnStrobe(si, sec, sync)
+-- Sector light effects (DOOM p_lights.c). Each thinker retimes a sector light
+-- on the 35 Hz clock. STROBEBRIGHT=5, FASTDARK=15, SLOWDARK=35, GLOWSPEED=8.
+function W.spawnStrobe(si, sec, darkT, sync)
     W.lightThinkers = W.lightThinkers or {}
     local dark = W.findMinLight(si, sec.light)
     if dark == sec.light then dark = 0 end
     W.lightThinkers[#W.lightThinkers + 1] = { kind = "strobe", sec = sec,
-        bright = sec.light, dark = dark, brightT = 5, darkT = 15,
+        bright = sec.light, dark = dark, brightT = 5, darkT = darkT or 15,
         count = sync and 1 or (1 + (W.pRandom() & 7)) }
 end
 function W.spawnLightFlash(si, sec)
     W.lightThinkers = W.lightThinkers or {}
     W.lightThinkers[#W.lightThinkers + 1] = { kind = "flash", sec = sec,
-        bright = sec.light, dark = W.findMinLight(si, sec.light), count = 1 + (W.pRandom() & 7) }
+        bright = sec.light, dark = W.findMinLight(si, sec.light), count = 1 + (W.pRandom() & 63) }
 end
 function W.spawnGlow(si, sec)
     W.lightThinkers = W.lightThinkers or {}
     W.lightThinkers[#W.lightThinkers + 1] = { kind = "glow", sec = sec,
         maxl = sec.light, minl = W.findMinLight(si, sec.light), val = sec.light, dir = -1 }
+end
+-- T_FireFlicker (sector special 17): every 4 tics, max - (P_Random&3)*16.
+function W.spawnFireFlicker(si, sec)
+    W.lightThinkers = W.lightThinkers or {}
+    W.lightThinkers[#W.lightThinkers + 1] = { kind = "fire", sec = sec,
+        maxl = sec.light, minl = W.findMinLight(si, sec.light) + 16, count = 4 }
 end
 function W.lightTick(lt)
     if lt.kind == "strobe" then
@@ -3113,13 +3458,21 @@ function W.lightTick(lt)
         lt.count = lt.count - 1
         if lt.count <= 0 then
             if lt.sec.light == lt.bright then lt.sec.light = lt.dark; lt.count = 1 + (W.pRandom() & 7)
-            else lt.sec.light = lt.bright; lt.count = 1 + (W.pRandom() & 31) end
+            else lt.sec.light = lt.bright; lt.count = 1 + (W.pRandom() & 32) end
         end
     elseif lt.kind == "glow" then
-        lt.val = lt.val + lt.dir * 4
+        lt.val = lt.val + lt.dir * 8
         if lt.val <= lt.minl then lt.val = lt.minl; lt.dir = 1
         elseif lt.val >= lt.maxl then lt.val = lt.maxl; lt.dir = -1 end
         lt.sec.light = lt.val
+    elseif lt.kind == "fire" then
+        lt.count = lt.count - 1
+        if lt.count <= 0 then
+            local amount = (W.pRandom() & 3) * 16
+            if lt.maxl - amount < lt.minl then lt.sec.light = lt.minl
+            else lt.sec.light = lt.maxl - amount end
+            lt.count = 4
+        end
     end
 end
 
@@ -3130,7 +3483,7 @@ function W.playerInSpecialSector()
     local sec = W.sectorAt(W.viewX, W.viewY); if not sec then return end
     local sp = sec.special or 0
     if sp == 0 then return end
-    if (W.viewZ - W.EYE) - sec.floor > 1 then return end     -- airborne: no floor contact
+    if W.pz - sec.floor > 1 then return end                  -- airborne: no floor contact
     local suit = W.powers and W.powers.radsuit
     local due = (W.levelTime & 0x1f) == 0
     if sp == 5 then
@@ -3170,16 +3523,33 @@ function W.tickSpecials()
     W.playerInSpecialSector()
 end
 
--- Accumulate real time into 35 Hz tics and run the specials clock. Bounded so a
+-- P_Ticker: ONE 35 Hz game tic. Everything gameplay-visible advances here so
+-- every vanilla tic constant drops in verbatim; rendering interpolates the view
+-- between tics (W.rSwap). Order matches vanilla: player, thinkers, specials.
+function W.gameTic()
+    W.oldPX = W.viewX; W.oldPY = W.viewY; W.oldVZ = W.viewZ   -- interp snapshot
+    W.playerThink()
+    W.updateActors()
+    W.tickSpecials()
+    W.updatePickups()
+    W.stTicker()
+end
+
+-- Accumulate real time into 35 Hz tics and run the game clock. Bounded so a
 -- long stall cannot spend the frame running hundreds of catch-up tics.
 function W.runTics(dt)
-    if not W.activeSectors then return end
     W.specAccum = (W.specAccum or 0) + dt
     local steps = 0
     while W.specAccum >= W.TIC and steps < 6 do
         W.specAccum = W.specAccum - W.TIC
-        W.levelTime = (W.levelTime or 0) + 1
-        W.tickSpecials()
+        if W.gameState == "play" then
+            if W.activeSectors then
+                W.levelTime = (W.levelTime or 0) + 1
+                W.gameTic()
+            end
+        elseif W.gameState == "intermission" then
+            W.wiTicker()
+        end
         steps = steps + 1
     end
     if W.specAccum > W.TIC * 6 then W.specAccum = 0 end
@@ -3195,14 +3565,89 @@ function W.spawnSpecials(map)
         local sec = map.sectors[i]; local si = i - 1
         local sp = sec.special or 0
         if sp == 1 then W.spawnLightFlash(si, sec)
-        elseif sp == 2 or sp == 3 or sp == 17 then W.spawnStrobe(si, sec, false)
+        elseif sp == 2 then W.spawnStrobe(si, sec, 15, false)      -- fast strobe
+        elseif sp == 3 then W.spawnStrobe(si, sec, 35, false)      -- slow strobe
+        elseif sp == 4 then W.spawnStrobe(si, sec, 15, false)      -- strobe + 20% damage
         elseif sp == 8 then W.spawnGlow(si, sec)
         elseif sp == 9 then W.totalSecret = W.totalSecret + 1
-        elseif sp == 12 or sp == 13 then W.spawnStrobe(si, sec, true) end
+        elseif sp == 10 then                                       -- door close in 30s
+            sec.special = 0
+            W.activeSectors[si] = { kind = "door", sec = sec, si = si, type = "normal",
+                topheight = sec.ceil, speed = W.VDOORSPEED, dir = 0,
+                topwait = W.VDOORWAIT, topcountdown = 30 * 35 }
+        elseif sp == 12 then W.spawnStrobe(si, sec, 35, true)      -- sync slow
+        elseif sp == 13 then W.spawnStrobe(si, sec, 15, true)      -- sync fast
+        elseif sp == 14 then                                       -- door raise in 5 min
+            sec.special = 0
+            W.activeSectors[si] = { kind = "door", sec = sec, si = si, type = "raiseIn5",
+                topheight = W.findLowestCeil(si) - 4, speed = W.VDOORSPEED, dir = 2,
+                topwait = W.VDOORWAIT, topcountdown = 5 * 60 * 35 }
+        elseif sp == 17 then W.spawnFireFlicker(si, sec) end
     end
     local tl = {}
     for _, ld in ipairs(map.linedefs) do if (ld.special or 0) ~= 0 then tl[#tl + 1] = ld end end
     map.triggerLines = tl
+    -- Sector sound-adjacency graph for P_NoiseAlert: neighbours through every
+    -- two-sided line, flagged when the line is ML_SOUNDBLOCK (0x40).
+    local adj = {}
+    for i = 1, #map.sectors do adj[i - 1] = {} end
+    for _, ld in ipairs(map.linedefs) do
+        if ld.front ~= NONE and ld.back ~= NONE then
+            local fsd = map.sidedefs[ld.front + 1]
+            local bsd = map.sidedefs[ld.back + 1]
+            if fsd and bsd and fsd.sector ~= bsd.sector then
+                local blocked = (ld.flags & 0x0040) ~= 0
+                local fa = adj[fsd.sector]; if fa then fa[#fa + 1] = { s = bsd.sector, ld = ld, blk = blocked } end
+                local ba = adj[bsd.sector]; if ba then ba[#ba + 1] = { s = fsd.sector, ld = ld, blk = blocked } end
+            end
+        end
+    end
+    map.soundAdj = adj
+    W.soundValid = 0
+    for i = 1, #map.sectors do
+        map.sectors[i].soundTarget = nil
+        map.sectors[i].soundValid = 0
+        map.sectors[i].soundTraversed = 0
+    end
+end
+
+-- P_NoiseAlert: flood the player's noise through connected sectors. Sound
+-- passes any live opening; an ML_SOUNDBLOCK line eats one "block level" (sound
+-- travels through at most one). Flooded sectors remember the noise-maker so
+-- A_Look can wake on it. Iterative stack walk (deep maps recurse far).
+function W.noiseAlert()
+    local map = W.map; if not (map and map.soundAdj) then return end
+    W.soundValid = (W.soundValid or 0) + 1
+    local valid = W.soundValid
+    local sec0 = W.sectorAt(W.viewX, W.viewY); if not sec0 then return end
+    local si0
+    for i = 1, #map.sectors do if map.sectors[i] == sec0 then si0 = i - 1; break end end
+    if not si0 then return end
+    local stack = { { si0, 0 } }
+    while #stack > 0 do
+        local e = table.remove(stack)
+        local si, blocks = e[1], e[2]
+        local sec = map.sectors[si + 1]
+        if sec and not (sec.soundValid == valid and sec.soundTraversed <= blocks + 1) then
+            sec.soundValid = valid
+            sec.soundTraversed = blocks + 1
+            sec.soundTarget = "player"
+            for _, n in ipairs(map.soundAdj[si] or {}) do
+                local osec = map.sectors[n.s + 1]
+                if osec then
+                    local opentop = min(sec.ceil, osec.ceil)
+                    local openbot = max(sec.floor, osec.floor)
+                    if opentop - openbot > 0 then            -- closed door stops sound
+                        if n.blk then
+                            if blocks == 0 then stack[#stack + 1] = { n.s, 1 } end
+                        else
+                            stack[#stack + 1] = { n.s, blocks }
+                        end
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- Fire walk-over line specials whose linedef the actor's centre crossed (old->new).
@@ -3240,19 +3685,28 @@ function W.newGame()
     W.keys = { blue = false, yellow = false, red = false }
     W.keyForm = {}
     W.backpack = false
-    W.powers = {}
-    W.damageCount = 0
+    W.powers = {}                           -- power -> tics remaining (huge = level-long)
+    W.damageCount = 0; W.bonusCount = 0
     W.playerDead = false
-    W.hudMsg = nil; W.hudMsgUntil = 0; W.bonusFlash = 0
-    W.psp = { state = "ready", sx = 0, sy = 0, flash = 0, refire = 0, bobT = 0 }
-    W.weaponClock = 0; W.rndIdx = 0
+    W.attacker = nil
+    W.hudMsg = nil; W.hudMsgUntil = 0
+    W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
+    W.psf = { st = nil, tics = -1 }
+    W.attackdown = false; W.refire = 0; W.extralight = 0
+    W.momx = 0; W.momy = 0; W.momz = 0; W.bob = 0
+    W.viewheight = 41; W.dvh = 0
+    W.reactionTics = 0
+    W.didsecret = false
+    W.rndIdx = 0
+    W.stInit()
 end
 
 function W.finishLevel()                    -- between levels: keep gear, drop keys/powers
     W.keys = { blue = false, yellow = false, red = false }
     W.keyForm = {}
     W.powers = {}
-    W.bonusFlash = 0; W.hudMsg = nil
+    W.extralight = 0
+    W.bonusCount = 0; W.damageCount = 0; W.hudMsg = nil
 end
 
 -- Skill 1..5 (ITYTD/HNTR/HMP/UV/Nightmare). W.skillBit maps to the DOOM thing
@@ -3310,8 +3764,10 @@ function W.giveThing(th)
         if W.keys[p.col] then return false end
         W.keys[p.col] = true; W.keyForm[p.col] = p.form; return true
     elseif k == "power" then
+        if (W.powers[p.pw] or 0) > 0 and p.pw ~= "berserk" then return false end
         if p.heal then W.health = max(W.health, p.heal) end
-        W.powers[p.pw] = true; return true
+        W.powers[p.pw] = (p.dur == -1) and 0x40000000 or p.dur
+        return true
     end
     return false
 end
@@ -3327,7 +3783,9 @@ function W.updatePickups()
             if dx * dx + dy * dy <= bd2 and W.giveThing(th) then
                 th.removed = true
                 W.hudMsg = th.pk.msg; W.hudMsgUntil = now() + 2.5
-                W.bonusFlash = now() + 0.2
+                W.bonusCount = min(100, (W.bonusCount or 0) + 6)   -- BONUSADD
+                if th.pk.count then W.itemCount = (W.itemCount or 0) + 1 end
+                if th.pk.k == "weapon" then W.st.gotWeapon = true end  -- evil grin
                 local kk = th.pk.k
                 local sfx = (kk == "weapon") and "DSWPNUP"
                     or (kk == "power" or kk == "mega") and "DSGETPOW" or "DSITEMUP"
@@ -3339,9 +3797,16 @@ end
 
 function W.selectSlot(n)
     local list = W.SLOTKEY[n]; if not list then return end
-    for _, s in ipairs(list) do
-        if W.weaponOwned[s] then W.pendingWeapon = s; return end   -- raise via psprite swap
+    if n == 1 and (W.powers.berserk or 0) ~= 0 then list = { 1, 8 } end  -- berserk: fist first
+    local pick
+    for _, s in ipairs(list) do if W.weaponOwned[s] then pick = s; break end end
+    if not pick then return end
+    if pick == W.curWeapon then                       -- same slot again: toggle the pair
+        for _, s in ipairs(list) do
+            if W.weaponOwned[s] and s ~= W.curWeapon then pick = s; break end
+        end
     end
+    if pick ~= W.curWeapon then W.pendingWeapon = pick end
 end
 
 -- Build the live-actor and pickup indices from the map THINGS (called per level).
@@ -3351,36 +3816,46 @@ end
 function W.spawnActors(map)
     W.thinkers = {}
     W.pickupThings = {}
-    W.projPool = {}
     W.freeThingSlots = {}
+    W.killCount = 0; W.itemCount = 0
+    W.totalKills = 0; W.totalItems = 0
     -- Skill filter (P_SpawnMapThing): a thing spawns only if it is not multiplayer-
     -- only AND carries this skill's flag bit. Filtered things are marked removed so
-    -- the renderer/collision/pickups all skip them (no frozen ghost monsters). This
-    -- is why default (Hurt Me Plenty) has far fewer monsters than "spawn everything".
+    -- the renderer/collision/pickups all skip them (no frozen ghost monsters).
     local bit = W.skillBit()
     for _, th in ipairs(map.things) do
         local e = W.THING_SPR[th.dtype]
         if e then                                            -- only renderable/interactive things
             if (th.flags & 0x0010) == 0 and (th.flags & bit) ~= 0 then
                 th.removed = false
-                if e.kind == "monster" then
+                if e.kind == "monster" or e.spr == "BAR1" then
                     th.think = "monster"
-                    th.info = W.MOBJINFO and W.MOBJINFO[e.spr] or nil
+                    th.info = W.MINFO[e.spr]
+                    th.states = W.SSTATES[e.spr]
                     th.hp = (th.info and th.info.hp) or W.MONHP[e.spr] or 60
-                    th.st = "idle"; th.frame = e.seq:sub(1, 1)
-                    th.z = W.floorZFor(e.r or 20, th.x, th.y)
-                    th.sx, th.sy = th.x, th.y; th.dead = false
-                    th.movedir = 8; th.movecount = 0; th.atkCool = 0
-                    th.target = nil; th.atkKind = nil; th.fired = false
-                    th.lookTimer = (W.pRandom() % 16) * 0.03   -- stagger first LOS check
-                    W.thinkers[#W.thinkers + 1] = th
-                elseif e.spr == "BAR1" then
-                    th.think = "barrel"; th.hp = 20
-                    th.frame = e.seq:sub(1, 1)
-                    th.z = W.floorZFor(10, th.x, th.y); th.dead = false
+                    th.z = W.floorZFor((th.info and th.info.r) or e.r or 20, th.x, th.y)
+                    th.dead = false
+                    th.momx = 0; th.momy = 0
+                    th.movedir = 8; th.movecount = 0
+                    th.reaction = (W.skill == 5) and 0 or 8   -- info reactiontime (0 on NM)
+                    th.threshold = 0
+                    th.justhit = false; th.justattacked = false
+                    th.ambush = (th.flags & 0x0008) ~= 0      -- deaf flag: sight-only wake
+                    th.shadow = (th.dtype == 58)              -- spectre
+                    th.target = nil; th.spr = nil; th.bright = false
+                    if th.states then
+                        -- spawn state set directly, no action (P_SpawnMobj semantics)
+                        local st = th.states.stnd[1]
+                        th.stkey = "stnd"; th.stidx = 1
+                        th.frame = st.f; th.tics = st.t
+                    else
+                        th.frame = e.seq:sub(1, 1); th.tics = -1   -- statue species
+                    end
+                    if th.info and th.info.countkill then W.totalKills = W.totalKills + 1 end
                     W.thinkers[#W.thinkers + 1] = th
                 elseif W.PICKUP[th.dtype] then
                     th.pk = W.PICKUP[th.dtype]
+                    if th.pk.count then W.totalItems = W.totalItems + 1 end
                     W.pickupThings[#W.pickupThings + 1] = th
                 end
             else
@@ -3399,96 +3874,144 @@ end
 -- monster/player collision), and melee + hitscan attacks. Missile species walk up
 -- and melee for now; their projectiles (imp/caco/baron fireballs) land in chunk 4.
 ----------------------------------------------------------------------
--- Spawn a short-lived cosmetic actor (puff/blood/explosion) via the appended-thing
--- pool so it draws + occludes like any billboard. Recycled through W.freeThingSlots.
-function W.spawnFx(dtype, seq, x, y, z, dur)
+-- Spawn a short-lived cosmetic actor (puff/blood/fog/explosion) via the appended
+-- thing pool so it draws + occludes like any billboard. frames = frame letters,
+-- ftics = tics per frame (number or per-frame table). opts: bright, momz (u/tic),
+-- startIdx (blood/melee-puff start mid-chain), spr required.
+function W.spawnFx(spr, frames, ftics, x, y, z, opts)
     local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
     local th = W.map.things[idx]
     if not th then th = {}; W.map.things[idx] = th end
-    th.dtype = dtype; th.x = x; th.y = y; th.z = z; th.angle = 0; th.flags = 0
-    th.think = "fx"; th.seq = seq; th.frameIdx = 1; th.frame = seq:sub(1, 1)
-    th.frdur = dur / #seq; th.stime = th.frdur
-    th.removed = false; th.dead = false; th.pk = nil; th.spr = nil; th._slot = idx
+    opts = opts or {}
+    th.dtype = 30040; th.x = x; th.y = y; th.z = z; th.angle = 0; th.flags = 0
+    th.think = "fx"; th.spr = spr; th.seq = frames; th.ftics = ftics
+    th.frameIdx = opts.startIdx or 1
+    th.frame = frames:sub(th.frameIdx, th.frameIdx)
+    th.tics = (type(ftics) == "table") and ftics[th.frameIdx] or ftics
+    th.bright = opts.bright or false
+    th.momz = opts.momz or 0
+    th.removed = false; th.dead = false; th.pk = nil; th._slot = idx
+    th.info = nil; th.states = nil; th.proj = nil
     W.thinkers[#W.thinkers + 1] = th
 end
 
--- P_SpawnMissile: launch a projectile from (x,y,z) at horizontal angle ang with the
--- given vertical velocity momz. owner ("player" or the firing monster th) is never
--- hit by its own missile. Uses the same appended-thing pool as spawnFx; th.spr
--- drives the flight sprite so drawThing renders it with no THING_SPR change.
+-- One fx tic: rise/fall, then advance the frame chain; past the end -> removed.
+function W.fxThink(th)
+    if th.momz ~= 0 then th.z = th.z + th.momz end
+    th.tics = th.tics - 1
+    if th.tics > 0 then return end
+    th.frameIdx = th.frameIdx + 1
+    if th.frameIdx > #th.seq then th.removed = true; return end
+    th.frame = th.seq:sub(th.frameIdx, th.frameIdx)
+    th.tics = (type(th.ftics) == "table") and th.ftics[th.frameIdx] or th.ftics
+end
+
+-- P_SpawnMissile core: launch projectile kind from (x,y,z) at horizontal angle
+-- ang (radians) with vertical momz (u/tic). owner ("player" or the firing
+-- monster) is never hit by its own missile; a monster's missile also passes
+-- through its own species (vanilla infighting rule). Plays the launch sound.
 function W.spawnProjectile(kind, x, y, z, ang, momz, owner)
     local p = W.PROJ[kind]; if not p then return end
     local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
     local th = W.map.things[idx]
     if not th then th = {}; W.map.things[idx] = th end
-    th.dtype = 30040; th.x = x; th.y = y; th.z = z; th.angle = 0; th.flags = 0
+    th.dtype = 30040; th.x = x; th.y = y; th.z = z
+    th.angle = ang * (180 / pi); th.flags = 0
     th.think = "proj"; th.st = "fly"; th.proj = p; th.owner = owner
-    th.srcTag = (owner == "player") and "player" or nil
-    th.spr = p.flySpr; th.flyseq = p.fly; th.frameIdx = 1; th.frame = p.fly:sub(1, 1)
-    th.frdur = 4 * W.TIC; th.stime = th.frdur
+    th.spr = p.flySpr; th.frameIdx = 1; th.frame = p.fly:sub(1, 1)
+    th.tics = p.flyT; th.bright = true
     th.momx = cos(ang) * p.speed; th.momy = sin(ang) * p.speed; th.momz = momz or 0
-    th.life = 4.0
+    th.life = 20 * 35                                -- leak guard, tics (not vanilla)
     th.removed = false; th.dead = false; th.pk = nil; th._slot = idx
+    th.info = nil; th.states = nil
+    if p.seesfx then pcall(W.playSfx, p.seesfx) end
     W.thinkers[#W.thinkers + 1] = th
 end
 
--- P_ExplodeMissile: stop, switch to the explosion sprite/anim, apply the direct hit
--- (P_Random%8+1 damage roll) and any A_Explode splash, then die when the anim ends.
+-- P_ExplodeMissile: stop, enter the explosion frames (first tics shortened by
+-- P_Random&3 like vanilla), apply the direct-hit roll and any A_Explode splash.
+-- The BFG ball defers its tracer spray to explosion frame 3 (S_BFGLAND3).
 function W.projExplode(th, hit)
     local p = th.proj
-    th.st = "boom"; th.momx = 0; th.momy = 0; th.momz = 0; th.flyseq = nil
+    th.st = "boom"; th.momx = 0; th.momy = 0; th.momz = 0
     th.spr = p.boomSpr; th.seq = p.boom; th.frameIdx = 1; th.frame = p.boom:sub(1, 1)
-    th.frdur = 4 * W.TIC; th.stime = th.frdur
-    if p.boomsfx then pcall(W.playSfx, p.boomsfx) end
-    local dmg = (p.dmg and p.dmg()) or 10
-    if hit == "player" then W.hurtPlayer(dmg)
-    elseif hit then W.damageMobj(hit, dmg, th.srcTag) end
-    if (p.splash or 0) > 0 then W.radiusDamage(th.x, th.y, p.splash, p.splash, th.owner) end
+    local t0 = (type(p.boomT) == "table") and p.boomT[1] or p.boomT
+    t0 = t0 - (W.pRandom() & 3); if t0 < 1 then t0 = 1 end
+    th.tics = t0
+    th.sprayPend = p.spray or false
+    if p.dsfx then pcall(W.playSfx, p.dsfx) end
+    local dmg = (W.pRandom() % 8 + 1) * p.dmg
+    if hit then W.damageMobj(hit, dmg, th, th.owner) end
+    if (p.splash or 0) > 0 then W.radiusDamage(th.x, th.y, p.splash, p.splash, th, th.owner) end
 end
 
--- Missile per-tick: animate, then substep (<=16u) the move testing wall / thing /
--- player / floor-ceiling; explode on the first hit. Horizontal thing test mirrors
--- shootTrace (no z gate); floor/ceiling detonate ground shots. Expires after life.
-function W.projThink(th, dt)
+-- A_BFGSpray: 40 tracer rays over a 90 degree cone from the SHOOTER toward where
+-- the ball hit; each visible target takes the sum of 15 rolls of (P_Random&7)+1
+-- and gets a BFE2 flash at 1/4 body height. Fires on explosion frame 3.
+function W.bfgSpray(th)
+    local ox, oy, oz = W.tgtPos(th.owner or "player")
+    local sz = oz + 36
+    local base = th.angle * (pi / 180)
+    for i = 0, 39 do
+        local an = base - pi / 4 + (pi / 2) * (i / 40)
+        local _, tgt = W.aimLineAttack(th.owner or "player", ox, oy, sz, an, 1024)
+        if tgt and tgt ~= "player" then
+            local tx, ty, tz, hh = W.tgtPos(tgt)
+            W.spawnFx("BFE2", "ABCD", 8, tx, ty, tz + hh / 4, { bright = true })
+            local dmg = 0
+            for _ = 1, 15 do dmg = dmg + (W.pRandom() & 7) + 1 end
+            W.damageMobj(tgt, dmg, nil, th.owner)
+        end
+    end
+end
+
+-- Missile per-tic: animate, substep (<=8u) the move testing wall / thing /
+-- player / floor-ceiling; explode on the first hit. A missile whose blocking
+-- line fronts an F_SKY1 ceiling vanishes without exploding (vanilla sky hack).
+function W.projThink(th)
     if th.st == "boom" then
-        th.stime = th.stime - dt
-        if th.stime <= 0 then
+        th.tics = th.tics - 1
+        if th.tics <= 0 then
             th.frameIdx = th.frameIdx + 1
-            if th.frameIdx > #th.seq then th.removed = true
-            else th.frame = th.seq:sub(th.frameIdx, th.frameIdx); th.stime = th.frdur end
+            if th.frameIdx > #th.seq then th.removed = true; return end
+            th.frame = th.seq:sub(th.frameIdx, th.frameIdx)
+            th.tics = (type(th.proj.boomT) == "table") and th.proj.boomT[th.frameIdx] or th.proj.boomT
+            if th.frameIdx == 3 and th.sprayPend then th.sprayPend = false; W.bfgSpray(th) end
         end
         return
     end
-    th.stime = th.stime - dt
-    if th.stime <= 0 then
-        th.frameIdx = (th.frameIdx % #th.flyseq) + 1
-        th.frame = th.flyseq:sub(th.frameIdx, th.frameIdx); th.stime = th.frdur
+    th.tics = th.tics - 1
+    if th.tics <= 0 then
+        th.frameIdx = (th.frameIdx % #th.proj.fly) + 1
+        th.frame = th.proj.fly:sub(th.frameIdx, th.frameIdx); th.tics = th.proj.flyT
     end
-    th.life = th.life - dt
+    th.life = th.life - 1
     if th.life <= 0 then th.removed = true; return end
     local mx, my, mz = th.momx, th.momy, th.momz
     local hspeed = sqrt(mx * mx + my * my); if hspeed < 1 then hspeed = 1 end
-    local steps = ceil(hspeed * dt / 16); if steps < 1 then steps = 1 end
-    local sdt = dt / steps
+    local steps = ceil(hspeed / 8)
+    local sdt = 1 / steps
     local things = W.map.things
+    local ownerSpr = (th.owner and th.owner ~= "player") and (th.owner.sprOv or (W.THING_SPR[th.owner.dtype] or {}).spr) or nil
     for _ = 1, steps do
         local ox, oy, oz = th.x, th.y, th.z
         local segdx, segdy = mx * sdt, my * sdt
         local seglen = sqrt(segdx * segdx + segdy * segdy); if seglen < 1e-4 then seglen = 1e-4 end
         local ndx, ndy = segdx / seglen, segdy / seglen
-        local wd = W.rayWallDist(ox, oy, ndx, ndy, seglen, oz)
+        local wd, wline = W.rayWallDist(ox, oy, ndx, ndy, seglen, oz)
         local hitThing, hitAlong = nil, min(seglen, wd)
         for _, o in ipairs(things) do
             local oe = W.THING_SPR[o.dtype]
-            if oe and oe.r and o ~= th.owner and not o.dead and not o.removed and (o.flags & 0x0010) == 0 then
+            if oe and oe.r and o ~= th.owner and not o.dead and not o.removed and (o.flags & 0x0010) == 0
+                and not (ownerSpr and oe.spr == ownerSpr) then       -- same species: fly through
                 local rx, ry = o.x - ox, o.y - oy
                 local along = rx * ndx + ry * ndy
                 if along > 0 and along < hitAlong then
                     local perp = abs(rx * (-ndy) + ry * ndx)
-                    -- z-gate so an arcing shot does not clip a thing it flies over/under
-                    -- (full-height decor has no o.z, so it always blocks).
                     local oz2 = o.z
-                    if perp <= oe.r and (not oz2 or (oz >= oz2 - 16 and oz <= oz2 + 72)) then
+                    local oh = (W.MINFO[oe.spr] and W.MINFO[oe.spr].h) or 64
+                    if perp <= oe.r + th.proj.r
+                        and (not oz2 or (oz + 8 >= oz2 and oz <= oz2 + oh)) then
                         hitThing = o; hitAlong = along
                     end
                 end
@@ -3497,10 +4020,10 @@ function W.projThink(th, dt)
         if th.owner ~= "player" then                     -- only monster missiles hit the player
             local rx, ry = W.viewX - ox, W.viewY - oy
             local along = rx * ndx + ry * ndy
-            local pz0 = W.viewZ - W.EYE
-            if along > 0 and along < hitAlong and oz >= pz0 - 8 and oz <= pz0 + W.PHEIGHT then
+            local pz0 = W.pz
+            if along > 0 and along < hitAlong and oz + 8 >= pz0 and oz <= pz0 + W.PHEIGHT then
                 local perp = abs(rx * (-ndy) + ry * ndx)
-                if perp <= W.RADIUS then hitThing = "player"; hitAlong = along end
+                if perp <= W.RADIUS + th.proj.r then hitThing = "player"; hitAlong = along end
             end
         end
         if hitThing then
@@ -3511,36 +4034,103 @@ function W.projThink(th, dt)
         if wd < seglen then
             th.x = ox + ndx * wd; th.y = oy + ndy * wd
             th.z = oz + mz * sdt * (wd / seglen)
+            -- sky hack: a missile that hits an upper wall fronting a sky ceiling vanishes
+            if wline and wline.back ~= NONE and wline.front ~= NONE then
+                local bsd = W.map.sidedefs[wline.back + 1]
+                local bsec = bsd and W.map.sectors[bsd.sector + 1]
+                local fsd = W.map.sidedefs[wline.front + 1]
+                local fsec = fsd and W.map.sectors[fsd.sector + 1]
+                local far = bsec
+                if bsec and fsec then
+                    -- pick whichever side the missile is NOT in as the far sector
+                    local cur = W.sectorAt(ox, oy)
+                    far = (cur == bsec) and fsec or bsec
+                end
+                if far and far.ceilTex == "F_SKY1" and th.z > far.ceil - 8 then
+                    th.removed = true; return
+                end
+            end
             W.projExplode(th, nil); return
         end
         th.x = ox + segdx; th.y = oy + segdy; th.z = oz + mz * sdt
         local sec = W.sectorAt(th.x, th.y)
-        if sec and (th.z <= sec.floor or th.z >= sec.ceil) then W.projExplode(th, nil); return end
+        if sec and th.z >= sec.ceil then
+            if sec.ceilTex == "F_SKY1" then th.removed = true; return end
+            W.projExplode(th, nil); return
+        end
+        if sec and th.z <= sec.floor then W.projExplode(th, nil); return end
     end
 end
 
--- Enter a monster state: pick the frame string + per-frame duration for it.
-function W.setState(th, st)
-    th.st = st; th.frameIdx = 1; th.fired = false
-    local inf = th.info; local seq
-    if inf and inf.frames then
-        if st == "pain" then seq = inf.frames.pain
-        elseif st == "death" then seq = inf.frames.death
-        elseif st == "xdeath" then seq = inf.frames.xdeath or inf.frames.death
-        elseif st == "atk" then seq = inf.frames.atk
-        else seq = inf.frames.walk end
+----------------------------------------------------------------------
+-- Monster state machine core (P_SetMobjState). A thing's state = (chain key,
+-- index) into W.SSTATES[species]; actions run on state ENTRY; a 0-tic state
+-- falls straight through to the next. t=-1 freezes (corpse). Advancing past
+-- the end: stnd/run loop, atk/pain fall back to run, die/xdie removes (barrel).
+----------------------------------------------------------------------
+function W.setMState(th, key, idx)
+    local chains = th.states; if not chains then return end
+    local ch = chains[key]
+    if not ch and key == "xdie" then key = "die"; ch = chains.die end
+    if not ch then return end
+    while true do
+        local st = ch[idx]
+        if not st then
+            if key == "die" or key == "xdie" then th.removed = true; th.think = nil; return end
+            idx = 1; st = ch[1]
+        end
+        th.stkey = key; th.stidx = idx
+        if st.f then th.frame = st.f end
+        th.spr = st.s                       -- sprite prefix override (barrel BEXP) or nil
+        th.bright = st.b or false
+        th.tics = st.t
+        if st.a then
+            local fn = W.MACT[st.a]
+            if fn then fn(th) end
+            if th.removed or not th.think then return end
+            if th.stkey ~= key or th.stidx ~= idx then return end   -- action switched state
+        end
+        if th.tics ~= 0 then return end
+        idx = idx + 1
     end
-    th.seq = seq or "A"
-    th.frame = th.seq:sub(1, 1)
-    th.frdur = (st == "pain") and (6 * W.TIC)
-        or (st == "death" or st == "xdeath") and (8 * W.TIC)
-        or (st == "atk") and (8 * W.TIC) or (4 * W.TIC)
-    th.stime = th.frdur
 end
 
--- Straight-line distance from a monster to the player.
-function W.distToPlayer(th)
-    local dx, dy = W.viewX - th.x, W.viewY - th.y
+function W.advMState(th)
+    local ch = th.states and th.states[th.stkey]
+    if not ch then return end
+    local nidx = th.stidx + 1
+    if not ch[nidx] then
+        local k = th.stkey
+        if k == "atk" or k == "pain" then W.setMState(th, "run", 1); return end
+        if k == "die" or k == "xdie" then th.removed = true; th.think = nil; return end
+        nidx = 1
+    end
+    W.setMState(th, th.stkey, nidx)
+end
+
+-- Target helpers: a monster's target is "player" or another live monster.
+function W.tgtPos(t)
+    if t == "player" or t == nil then return W.viewX, W.viewY, W.pz, W.PHEIGHT, W.RADIUS end
+    local e = W.THING_SPR[t.dtype]
+    local mi = t.info or (e and W.MINFO[e.spr])
+    return t.x, t.y, t.z or 0, (mi and mi.h) or 56, (mi and mi.r) or (e and e.r) or 20
+end
+
+function W.tgtAlive(t)
+    if t == "player" then return not W.playerDead end
+    if type(t) ~= "table" then return false end
+    return not (t.dead or t.removed)
+end
+
+function W.tgtShadow(t)
+    if t == "player" then return (W.powers and (W.powers.invis or 0) ~= 0) and true or false end
+    return type(t) == "table" and t.shadow or false
+end
+
+-- Straight-line distance from a monster to its target.
+function W.distToTarget(th)
+    local tx, ty = W.tgtPos(th.target)
+    local dx, dy = tx - th.x, ty - th.y
     return sqrt(dx * dx + dy * dy)
 end
 
@@ -3588,53 +4178,105 @@ function W.checkSight(x1, y1, z1, x2, y2, zbot, ztop)
     return true
 end
 
--- Can this monster see the player? 3D sight from the monster's eye to the player's
--- full body box, gated by SIGHT_RANGE. Replaces the old flat-Z ray so a monster
--- cannot shoot the player over/under geometry that occludes it on screen.
-function W.monsterSees(th)
-    local dx, dy = W.viewX - th.x, W.viewY - th.y
+-- P_CheckSight wrapper: can the monster see its target? Vanilla eye height is
+-- z + 3/4 of the looker's height; the target's full body box is the aim window.
+function W.monsterSees(th, tgt)
+    tgt = tgt or th.target or "player"
+    if not W.tgtAlive(tgt) then return false end
+    local tx, ty, tz, hh = W.tgtPos(tgt)
+    local dx, dy = tx - th.x, ty - th.y
     if dx * dx + dy * dy > W.SIGHT_RANGE * W.SIGHT_RANGE then return false end
-    local z1 = (th.z or 0) + (th.info and th.info.eye or 42)
-    local pbot = W.viewZ - W.EYE
-    return W.checkSight(th.x, th.y, z1, W.viewX, W.viewY, pbot, pbot + W.PHEIGHT)
+    local mh = (th.info and th.info.h) or 56
+    local z1 = (th.z or 0) + mh * 0.75
+    return W.checkSight(th.x, th.y, z1, tx, ty, tz, tz + hh)
 end
 
--- A_FaceTarget: aim the monster's sprite rotation at the player (WAD degrees).
+-- A_FaceTarget (WAD degrees). Aiming at a shadow target (spectre / blur-sphere
+-- player) fuzzes the angle by (P_Random-P_Random)<<21 like vanilla.
 function W.faceTarget(th)
-    th.angle = atan(W.viewY - th.y, W.viewX - th.x) * (180 / pi)
-end
-
--- P_CheckMeleeRange: player within claw/bite reach and in sight. Doom measures
--- center-to-center: dist < MELEERANGE(64) - 20 + player radius.
-function W.monsterInMelee(th)
-    local inf = th.info; if not inf then return false end
-    local reach = (inf.mrange or 64) - 20 + W.RADIUS
-    return W.distToPlayer(th) <= reach and W.monsterSees(th)
-end
-
--- Wake an idle monster: switch to chase, seed its move state, play the sight cry.
-function W.wakeMonster(th)
-    th.target = "player"
-    if th.st == "idle" then
-        W.setState(th, "chase")
-        th.movedir = 8; th.movecount = 0; th.atkCool = 0
-        if th.info and th.info.sight then pcall(W.playSfx, th.info.sight) end
+    if not th.target then return end
+    th.ambush = false
+    local tx, ty = W.tgtPos(th.target)
+    th.angle = atan(ty - th.y, tx - th.x) * (180 / pi)
+    if W.tgtShadow(th.target) then
+        th.angle = th.angle + (W.pRandom() - W.pRandom()) * (45 / 256)
     end
 end
 
+-- P_CheckMeleeRange: target within claw/bite reach and in sight.
+-- Center-to-center: dist < MELEERANGE(64) - 20 + target radius.
+function W.checkMeleeRange(th)
+    if not th.target then return false end
+    local _, _, _, _, tr = W.tgtPos(th.target)
+    if W.distToTarget(th) >= 64 - 20 + tr then return false end
+    return W.monsterSees(th)
+end
+
+-- P_CheckMissileRange: distance-scaled attack decision, with the vanilla
+-- retaliation (just-hit) fast path and per-species range shaping.
+function W.checkMissileRange(th)
+    if not W.monsterSees(th) then return false end
+    if th.justhit then th.justhit = false; return true end   -- fight back NOW
+    if (th.reaction or 0) > 0 then return false end
+    local dist = W.distToTarget(th) - 64
+    if not (th.info and th.info.melee) then dist = dist - 128 end  -- no melee: fire more
+    local e = W.THING_SPR[th.dtype]
+    if e and e.spr == "HEAD" then dist = dist * 0.5 end
+    if dist > 200 then dist = 200 end
+    if W.pRandom() < dist then return false end
+    return true
+end
+
+-- P_LookForPlayers (single player). allaround=false limits the wake to the 180
+-- degree cone in front of the monster unless the player is within MELEERANGE.
+function W.lookForPlayer(th, allaround)
+    if W.playerDead then return false end
+    if not W.checkSight(th.x, th.y, (th.z or 0) + ((th.info and th.info.h) or 56) * 0.75,
+        W.viewX, W.viewY, W.pz, W.pz + W.PHEIGHT) then return false end
+    if not allaround then
+        local an = atan(W.viewY - th.y, W.viewX - th.x) * (180 / pi) - (th.angle or 0)
+        an = (an + 180) % 360 - 180
+        if an > 90 or an < -90 then                       -- behind its back
+            local dx, dy = W.viewX - th.x, W.viewY - th.y
+            if dx * dx + dy * dy > 64 * 64 then return false end
+        end
+    end
+    th.target = "player"
+    return true
+end
+
+-- Wake a monster into the hunt (see-you path): sight cry + run chain.
+function W.wakeMonster(th)
+    if not th.states or not th.states.run then return end
+    local mi = th.info
+    if mi and mi.sight and th.stkey == "stnd" then
+        pcall(W.playSfx, W.sndPick(mi.sight, mi.sightN))
+    end
+    th.threshold = 0
+    W.setMState(th, "run", 1)
+end
+
 -- Generalized P_CheckPosition for a monster's bounding box at (nx,ny). Returns
--- (blocked, tmfloor, tmdropoff): blocked if the box crosses a one-sided/blocking/
--- block-monsters line, the vertical opening is too short, the step up exceeds
--- MAXSTEP, it would stand over a dropoff > MAXSTEP (non-floaters only), or it
--- overlaps another solid thing or the player. Floaters skip the height/step/
--- dropoff gates (they fly). tmfloor = highest floor the box overlaps.
+-- (blocked, tmfloor, tmdropoff, floatok): blocked if the box crosses a one-sided/
+-- blocking/block-monsters line, the vertical opening is too short, the step up
+-- exceeds MAXSTEP, it would stand over a dropoff > MAXSTEP (non-floaters only),
+-- or it overlaps another solid thing or the player. Floaters skip the height/
+-- step/dropoff gates. floatok = an opening tall enough exists, only the z gates
+-- failed (P_Move nudges a floater vertically then). Crossed special lines are
+-- collected into W.spechit (vanilla spechit[]) so a blocked monster can open a
+-- manual door it walked into.
 function W.monBlocked(th, nx, ny)
     local se = W.THING_SPR[th.dtype]
-    local R = (se and se.r) or 20
+    local mi = th.info
+    local R = (mi and mi.r) or (se and se.r) or 20
+    local H = (mi and mi.h) or 56
     local bl, br, bb, bt = nx - R, nx + R, ny - R, ny + R
     local sec = W.sectorAt(nx, ny)
     if not sec then return true end
     local tmfloor, tmceil, tmdrop = sec.floor, sec.ceil, sec.floor
+    local spechit = W.spechit
+    if spechit then for i = #spechit, 1, -1 do spechit[i] = nil end
+    else spechit = {}; W.spechit = spechit end
     local V, LD, SD, SE = W.map.vertexes, W.map.linedefs, W.map.sidedefs, W.map.sectors
     for _, ld in ipairs(LD) do
         local a = V[ld.v1 + 1]; local b = V[ld.v2 + 1]
@@ -3656,246 +4298,334 @@ function W.monBlocked(th, nx, ny)
                 if ot < tmceil then tmceil = ot end
                 if ob > tmfloor then tmfloor = ob end
                 if lo < tmdrop then tmdrop = lo end
+                if (ld.special or 0) ~= 0 then spechit[#spechit + 1] = ld end
             end
         end
     end
+    local floatok = (tmceil - tmfloor) >= H
     local feet = th.z or tmfloor
-    if not (th.info and th.info.float) then
-        if tmceil - tmfloor < W.MON_HEIGHT then return true end   -- opening too short
-        if tmfloor - feet > W.MAXSTEP then return true end        -- step up too high
-        if tmfloor - tmdrop > W.MAXSTEP then return true end      -- avoid ledges
+    if not (mi and mi.float) then
+        if not floatok then return true, tmfloor, tmdrop, false end
+        if tmfloor - feet > W.MAXSTEP then return true, tmfloor, tmdrop, floatok end
+        if tmfloor - tmdrop > W.MAXSTEP then return true, tmfloor, tmdrop, floatok end
+    else
+        -- floaters still cannot pass a too-short opening at their current z
+        if not floatok then return true, tmfloor, tmdrop, false end
+        if feet + H > tmceil or feet < tmfloor - W.FLOATSPEED * 4 then
+            return true, tmfloor, tmdrop, floatok
+        end
     end
     for _, o in ipairs(W.map.things) do
         if o ~= th then
             local oe = W.THING_SPR[o.dtype]
             if oe and oe.r and (o.flags & 0x0010) == 0 and not o.dead and not o.removed then
                 local rr = R + oe.r
-                if abs(nx - o.x) < rr and abs(ny - o.y) < rr then return true end
+                if abs(nx - o.x) < rr and abs(ny - o.y) < rr then return true, tmfloor, tmdrop, floatok end
             end
         end
     end
     local pr = R + W.RADIUS
-    if abs(nx - W.viewX) < pr and abs(ny - W.viewY) < pr then return true end
-    return false, tmfloor, tmdrop
+    if abs(nx - W.viewX) < pr and abs(ny - W.viewY) < pr then return true, tmfloor, tmdrop, floatok end
+    return false, tmfloor, tmdrop, floatok
 end
 
--- Can the monster take a probe step in direction dir (0..7)? Lookahead is ~one
--- Doom move-tic, floored so wall detection still works at tiny per-frame dt.
-function W.canWalk(th, dir)
-    local probe = (th.info and th.info.speed or 100) * 0.12
-    if probe < 16 then probe = 16 end
-    local nx = th.x + W.DIRX[dir + 1] * probe
-    local ny = th.y + W.DIRY[dir + 1] * probe
-    return not W.monBlocked(th, nx, ny)
+-- P_Move: one step of info.speed along movedir via the box test. On a block:
+-- floaters with a usable opening nudge vertically (FLOATSPEED); walkers that
+-- crossed a manual-door line open it (spechit, special 1 only) and stall one
+-- think. Walkers snap to the destination floor; success fires walk-over lines.
+function W.pMove(th)
+    if th.movedir == nil or th.movedir >= 8 then return false end
+    local mi = th.info
+    local sp = mi.speed or 8
+    local nx = th.x + W.DIRX[th.movedir + 1] * sp
+    local ny = th.y + W.DIRY[th.movedir + 1] * sp
+    local blk, fz, _, floatok = W.monBlocked(th, nx, ny)
+    if blk then
+        if mi.float and floatok and fz then              -- adjust height through the opening
+            if (th.z or 0) < fz then th.z = (th.z or 0) + W.FLOATSPEED
+            else th.z = (th.z or 0) - W.FLOATSPEED end
+            return true
+        end
+        local spechit = W.spechit
+        if not spechit or #spechit == 0 then return false end
+        th.movedir = 8
+        local good = false
+        for i = 1, #spechit do
+            local ld = spechit[i]
+            if ld.special == 1 then                      -- manual raise door: monsters may open
+                W.evVerticalDoor(ld); good = true
+            end
+        end
+        return good
+    end
+    local ox, oy = th.x, th.y
+    th.x = nx; th.y = ny
+    if not mi.float and fz then th.z = fz end
+    W.crossLines(ox, oy, nx, ny, false, th)
+    return true
 end
 
-function W.setMoveCount(th)
-    th.movecount = 0.25 + (W.pRandom() % 16) * 0.03      -- commit to a heading ~0.25..0.7s
+-- P_TryWalk: a successful step also re-arms the heading commitment.
+function W.tryWalk(th)
+    if not W.pMove(th) then return false end
+    th.movecount = W.pRandom() & 15
+    return true
 end
 
--- P_NewChaseDir: choose an 8-way heading toward the player, trying the direct
--- diagonal, then each axis (larger-delta first), then the old heading, then a
--- randomized full search, then the turnaround. Sets movedir (8 = boxed in).
+-- P_NewChaseDir: choose an 8-way heading toward the target, trying the direct
+-- diagonal, then each axis (larger-delta first, with the vanilla 200/256 random
+-- swap), the old heading, a randomized full sweep, then the turnaround.
 function W.newChaseDir(th)
     local olddir = th.movedir or 8
     local turn = W.OPPOSITE[olddir]
-    local dxp, dyp = W.viewX - th.x, W.viewY - th.y
+    local tx, ty = W.tgtPos(th.target)
+    local dxp, dyp = tx - th.x, ty - th.y
     local d1, d2 = 8, 8
     if dxp > 10 then d1 = 0 elseif dxp < -10 then d1 = 4 end          -- EAST / WEST
     if dyp < -10 then d2 = 6 elseif dyp > 10 then d2 = 2 end          -- SOUTH / NORTH
     if d1 ~= 8 and d2 ~= 8 then
         local idx = ((dyp < 0) and 2 or 0) + ((dxp > 0) and 1 or 0)
-        local diag = W.DIAGS[idx + 1]
-        th.movedir = diag
-        if diag ~= turn and W.canWalk(th, diag) then W.setMoveCount(th); return end
+        th.movedir = W.DIAGS[idx + 1]
+        if th.movedir ~= turn and W.tryWalk(th) then return end
     end
     if W.pRandom() > 200 or abs(dyp) > abs(dxp) then d1, d2 = d2, d1 end
     if d1 == turn then d1 = 8 end
     if d2 == turn then d2 = 8 end
-    if d1 ~= 8 then th.movedir = d1; if W.canWalk(th, d1) then W.setMoveCount(th); return end end
-    if d2 ~= 8 then th.movedir = d2; if W.canWalk(th, d2) then W.setMoveCount(th); return end end
-    if olddir ~= 8 then th.movedir = olddir; if W.canWalk(th, olddir) then W.setMoveCount(th); return end end
+    if d1 ~= 8 then th.movedir = d1; if W.tryWalk(th) then return end end
+    if d2 ~= 8 then th.movedir = d2; if W.tryWalk(th) then return end end
+    if olddir ~= 8 then th.movedir = olddir; if W.tryWalk(th) then return end end
     if (W.pRandom() & 1) ~= 0 then
         for t = 0, 7 do
-            if t ~= turn then th.movedir = t; if W.canWalk(th, t) then W.setMoveCount(th); return end end
+            if t ~= turn then th.movedir = t; if W.tryWalk(th) then return end end
         end
     else
         for t = 7, 0, -1 do
-            if t ~= turn then th.movedir = t; if W.canWalk(th, t) then W.setMoveCount(th); return end end
+            if t ~= turn then th.movedir = t; if W.tryWalk(th) then return end end
         end
     end
-    if turn ~= 8 then th.movedir = turn; if W.canWalk(th, turn) then W.setMoveCount(th); return end end
+    if turn ~= 8 then th.movedir = turn; if W.tryWalk(th) then return end end
     th.movedir = 8      -- DI_NODIR: boxed in, stand and keep trying
 end
 
--- P_Move (continuous): step speed*dt along movedir; re-pick on timeout or a block.
--- Floaters glide their feet toward the player's; walkers snap to the floor they land on.
-function W.monMove(th, dt)
-    local inf = th.info
-    th.movecount = (th.movecount or 0) - dt
-    if th.movedir == nil or th.movedir >= 8 or th.movecount <= 0 then W.newChaseDir(th) end
-    if th.movedir >= 8 then return end
-    th.angle = W.DIRDEG[th.movedir + 1]
-    local sp = (inf.speed or 100) * dt
-    local nx = th.x + W.DIRX[th.movedir + 1] * sp
-    local ny = th.y + W.DIRY[th.movedir + 1] * sp
-    local blk, fz = W.monBlocked(th, nx, ny)
-    if not blk then
-        local ox, oy = th.x, th.y
-        th.x = nx; th.y = ny
-        if inf.float then
-            local tz = W.viewZ - W.EYE
-            local dz = tz - th.z
-            if dz > sp then dz = sp elseif dz < -sp then dz = -sp end
-            th.z = th.z + dz
-        elseif fz then
-            th.z = fz
-        end
-        W.crossLines(ox, oy, th.x, th.y, false, th)   -- monster-triggerable specials (teleport etc.)
-    else
-        th.movecount = 0        -- blocked: re-pick a heading next tick
-    end
+-- Hitscan/missile source height: vanilla shootz = z + height/2 + 8.
+function W.monShootZ(th)
+    return (th.z or 0) + ((th.info and th.info.h or 56) * 0.5) + 8
 end
 
--- One hitscan/melee resolution at the attack's fire frame (A_PosAttack /
--- A_SPosAttack / A_SargAttack / A_TroopAttack close). Missile species with no
--- projectile yet (chunk 4) only reach here via their melee branch.
---
--- Hitscan is NOT auto-hit: like A_PosAttack, each bullet takes an angular spread
--- of (P_Random-P_Random)<<20 radians. It only connects if that spread stays inside
--- the half-angle the player's body subtends at this range (atan(RADIUS/dist)), so
--- shots reliably land point-blank but mostly miss at distance. Melee never misses
--- if still in reach (matches A_SargAttack/A_TroopAttack). Vertical aim is auto.
-function W.doMonAttack(th)
-    local inf = th.info; if not inf then return end
-    if th.atkKind == "melee" then
-        if inf.msfx then pcall(W.playSfx, inf.msfx) end
-        if W.monsterInMelee(th) then W.hurtPlayer((inf.melee and inf.melee()) or 5) end
-    elseif th.atkKind == "missile" then
-        if inf.asfx then pcall(W.playSfx, inf.asfx) end
-        if inf.proj and W.monsterSees(th) then          -- A_TroopAttack/A_HeadAttack/A_BruisAttack (ranged)
-            local se = W.THING_SPR[th.dtype]
-            local ang = atan(W.viewY - th.y, W.viewX - th.x)
-            local sz = (th.z or 0) + (inf.eye or 42)
-            local sx = th.x + cos(ang) * ((se and se.r or 20) + 8)
-            local sy = th.y + sin(ang) * ((se and se.r or 20) + 8)
-            local tz = W.viewZ - 8                       -- aim at player torso
-            local dist = W.distToPlayer(th); if dist < 1 then dist = 1 end
-            local momz = (tz - sz) * (W.PROJ[inf.proj].speed) / dist
-            W.spawnProjectile(inf.proj, sx, sy, sz, ang, momz, th)
-        end
-    else
-        if inf.asfx then pcall(W.playSfx, inf.asfx) end
-        if W.monsterSees(th) then
-            local dist = W.distToPlayer(th); if dist < 1 then dist = 1 end
-            local half = atan(W.RADIUS, dist)                 -- player half-width at this range
-            for _ = 1, (inf.shots or 1) do
-                local spread = (W.pRandom() - W.pRandom()) * (pi / 2048)   -- A_PosAttack <<20
-                if abs(spread) <= half then W.hurtPlayer((inf.dmg and inf.dmg()) or 3) end
-            end
+-- P_SpawnMissile: from the monster at z+32 toward the target's feet; momz uses
+-- the vanilla flight-time division; shadow targets fuzz the launch angle.
+function W.spawnMonMissile(th, kind)
+    local p = W.PROJ[kind]; if not p then return end
+    local tx, ty, tz = W.tgtPos(th.target)
+    local ang = atan(ty - th.y, tx - th.x)
+    if W.tgtShadow(th.target) then ang = ang + (W.pRandom() - W.pRandom()) * (pi / 2048) end
+    local dx, dy = tx - th.x, ty - th.y
+    local flight = sqrt(dx * dx + dy * dy) / p.speed
+    if flight < 1 then flight = 1 end
+    W.spawnProjectile(kind, th.x, th.y, (th.z or 0) + 32, ang, (tz - (th.z or 0)) / flight, th)
+end
+
+----------------------------------------------------------------------
+-- Monster action routines (p_enemy.c), dispatched by state entry via W.MACT.
+----------------------------------------------------------------------
+-- A_Look: wake on the sector's flooded sound target (AMBUSH monsters need
+-- sight too) or on a player inside the 180 degree front cone.
+function W.actLook(th)
+    th.threshold = 0
+    local sec = W.sectorAt(th.x, th.y)
+    local targ = sec and sec.soundTarget
+    local woke = false
+    if targ and W.tgtAlive(targ) then
+        th.target = targ
+        if th.ambush then
+            if W.monsterSees(th, targ) then woke = true end
+        else
+            woke = true
         end
     end
+    if not woke and not W.lookForPlayer(th, false) then return end
+    W.wakeMonster(th)
 end
 
--- Decide whether to launch an attack this evaluation. Melee if in reach; hitscan and
--- missile species fire at range with a per-tic probability (missile species still
--- prefer the melee branch above when the player is adjacent).
-function W.tryMonAttack(th)
-    local inf = th.info; if not inf then return false end
-    if not W.monsterSees(th) then return false end
-    if inf.melee and W.monsterInMelee(th) then
-        W.setState(th, "atk"); th.atkKind = "melee"; return true
+-- A_Chase: the full vanilla decision ladder, one call per run-state entry.
+function W.actChase(th)
+    local mi = th.info
+    if (th.reaction or 0) > 0 then th.reaction = th.reaction - 1 end
+    if (th.threshold or 0) > 0 then                       -- fixate on the current target
+        if not W.tgtAlive(th.target) then th.threshold = 0
+        else th.threshold = th.threshold - 1 end
     end
-    if inf.atk == "hitscan" and (W.pRandom() % 255) < 40 then
-        W.setState(th, "atk"); th.atkKind = "hitscan"; return true
+    if (th.movedir or 8) < 8 then                         -- turn toward movedir in 45s
+        th.angle = (th.angle or 0) % 360
+        th.angle = th.angle - (th.angle % 45)
+        local delta = ((th.angle - th.movedir * 45) + 180) % 360 - 180
+        if delta > 0 then th.angle = th.angle - 45
+        elseif delta < 0 then th.angle = th.angle + 45 end
     end
-    if inf.atk == "missile" and inf.proj and (W.pRandom() % 255) < 40 then
-        W.setState(th, "atk"); th.atkKind = "missile"; return true
-    end
-    return false
-end
-
--- Advance an in-progress attack animation; land the hit on the fire frame, then
--- return to chase with a short cooldown.
-function W.monAttackState(th, dt)
-    th.stime = th.stime - dt
-    if th.stime > 0 then return end
-    local inf = th.info
-    th.frameIdx = th.frameIdx + 1
-    if th.frameIdx > #th.seq then
-        W.setState(th, "chase")
-        th.atkCool = 0.4 + (W.pRandom() % 16) * 0.03
+    if not th.target or not W.tgtAlive(th.target) then
+        if W.lookForPlayer(th, true) then return end
+        W.setMState(th, "stnd", 1)                        -- nothing left to chase
         return
     end
-    th.frame = th.seq:sub(th.frameIdx, th.frameIdx)
-    th.stime = th.frdur
-    if not th.fired and th.frameIdx >= ((inf and inf.frames and inf.frames.fireAt) or 99) then
-        th.fired = true
-        W.faceTarget(th)
-        W.doMonAttack(th)
+    if th.justattacked then                               -- do not attack twice in a row
+        th.justattacked = false
+        if W.skill ~= 5 then W.newChaseDir(th) end
+        return
+    end
+    if mi.melee and W.checkMeleeRange(th) then
+        if mi.atksfx then pcall(W.playSfx, mi.atksfx) end
+        W.setMState(th, "atk", 1)
+        return
+    end
+    if mi.missile and (W.skill == 5 or (th.movecount or 0) <= 0) and W.checkMissileRange(th) then
+        W.setMState(th, "atk", 1)
+        th.justattacked = true
+        return
+    end
+    th.movecount = (th.movecount or 0) - 1
+    if th.movecount < 0 or not W.pMove(th) then
+        W.newChaseDir(th)
+    end
+    if mi.act and W.pRandom() < 3 then                    -- occasional active grunt
+        pcall(W.playSfx, mi.act)
     end
 end
 
-function W.monsterThink(th, dt)
-    local st = th.st
-    if st == "pain" then
-        th.stime = th.stime - dt
-        if th.stime <= 0 then W.setState(th, "chase") end      -- resume the hunt
+function W.actPosAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    local base = (th.angle or 0) * (pi / 180)
+    local sz = W.monShootZ(th)
+    local slope = W.aimLineAttack(th, th.x, th.y, sz, base, 2048)
+    pcall(W.playSfx, "DSPISTOL")
+    local ang = base + (W.pRandom() - W.pRandom()) * (pi / 2048)
+    W.lineAttack(th, th.x, th.y, sz, ang, 2048, slope, (W.pRandom() % 5 + 1) * 3)
+end
+
+function W.actSPosAttack(th)
+    if not th.target then return end
+    pcall(W.playSfx, "DSSHOTGN")
+    W.faceTarget(th)
+    local base = (th.angle or 0) * (pi / 180)
+    local sz = W.monShootZ(th)
+    local slope = W.aimLineAttack(th, th.x, th.y, sz, base, 2048)
+    for _ = 1, 3 do
+        local ang = base + (W.pRandom() - W.pRandom()) * (pi / 2048)
+        W.lineAttack(th, th.x, th.y, sz, ang, 2048, slope, (W.pRandom() % 5 + 1) * 3)
+    end
+end
+
+function W.actTroopAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    if W.checkMeleeRange(th) then
+        pcall(W.playSfx, "DSCLAW")
+        W.damageMobj(th.target, (W.pRandom() % 8 + 1) * 3, th, th)
         return
-    elseif st == "death" or st == "xdeath" then
-        th.stime = th.stime - dt
-        if th.stime <= 0 then
-            th.frameIdx = th.frameIdx + 1
-            if th.frameIdx > #th.seq then th.think = nil        -- corpse: stop ticking, stays drawn
-            else th.frame = th.seq:sub(th.frameIdx, th.frameIdx); th.stime = th.frdur end
+    end
+    W.spawnMonMissile(th, "TROOPSHOT")
+end
+
+function W.actSargAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    if W.checkMeleeRange(th) then
+        W.damageMobj(th.target, (W.pRandom() % 10 + 1) * 4, th, th)
+    end
+end
+
+function W.actHeadAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    if W.checkMeleeRange(th) then
+        W.damageMobj(th.target, (W.pRandom() % 6 + 1) * 10, th, th)
+        return
+    end
+    W.spawnMonMissile(th, "HEADSHOT")
+end
+
+function W.actBruisAttack(th)
+    if not th.target then return end
+    if W.checkMeleeRange(th) then
+        pcall(W.playSfx, "DSCLAW")
+        W.damageMobj(th.target, (W.pRandom() % 8 + 1) * 10, th, th)
+        return
+    end
+    W.spawnMonMissile(th, "BRUISERSHOT")
+end
+
+function W.actScream(th)
+    local mi = th.info
+    if mi and mi.dsfx then pcall(W.playSfx, W.sndPick(mi.dsfx, mi.dsfxN)) end
+    if not mi and th.states == W.SSTATES.BAR1 then pcall(W.playSfx, "DSBAREXP") end
+end
+
+function W.actXScream(th)
+    pcall(W.playSfx, "DSSLOP")
+end
+
+function W.actPain(th)
+    local mi = th.info
+    if mi and mi.psfx then pcall(W.playSfx, mi.psfx) end
+end
+
+function W.actFall(th)
+    -- vanilla clears MF_SOLID here; th.dead already stopped blocking at kill time
+end
+
+-- A_Explode (barrel): 128/128 splash credited to whoever killed the barrel.
+function W.actExplode(th)
+    W.radiusDamage(th.x, th.y, 128, 128, th, th.target)
+end
+
+-- A_BossDeath: on E1M8, when the last Baron dies, floor tag 666 lowers to the
+-- lowest neighbour (opens the exit yard). Other boss maps need species that are
+-- not simulated yet, so only the E1 gate is armed.
+function W.actBossDeath(th)
+    local nm = W.map and W.map.name or ""
+    local ep, mp = nm:match("^E(%d)M(%d)$")
+    if not (ep == "1" and mp == "8") then return end
+    local e = W.THING_SPR[th.dtype]
+    if not (e and e.spr == "BOSS") then return end
+    if W.playerDead then return end
+    for _, o in ipairs(W.thinkers) do
+        if o ~= th and o.think == "monster" and not o.dead and not o.removed then
+            local oe = W.THING_SPR[o.dtype]
+            if oe and oe.spr == "BOSS" then return end     -- a Baron still lives
         end
-        return
-    elseif st == "atk" then
-        W.monAttackState(th, dt)
-        return
     end
-    local inf = th.info; if not inf then return end
-    if st == "idle" then
-        th.lookTimer = (th.lookTimer or 0) - dt               -- A_Look, throttled
-        if th.lookTimer <= 0 then
-            th.lookTimer = 0.2 + (W.pRandom() % 8) * 0.02
-            if W.monsterSees(th) then W.wakeMonster(th) end
+    W.evDoFloor({ tag = 666, front = NONE, back = NONE }, "lowerFloorToLowest")
+end
+
+W.MACT = {
+    look = W.actLook, chase = W.actChase, face = W.faceTarget,
+    posatk = W.actPosAttack, sposatk = W.actSPosAttack, troopatk = W.actTroopAttack,
+    sargatk = W.actSargAttack, headatk = W.actHeadAttack, bruisatk = W.actBruisAttack,
+    scream = W.actScream, xscream = W.actXScream, pain = W.actPain, fall = W.actFall,
+    explode = W.actExplode, bossdeath = W.actBossDeath,
+}
+
+-- One monster tic: damage-thrust knockback (friction 0.90625, STOPSPEED 1/16),
+-- then the state clock (t=-1 corpses never advance).
+function W.monsterThink(th)
+    if th.momx and (th.momx ~= 0 or th.momy ~= 0) then
+        local nx, ny = th.x + th.momx, th.y + th.momy
+        if not W.monBlocked(th, nx, ny) then th.x = nx; th.y = ny end
+        th.momx = th.momx * 0.90625; th.momy = th.momy * 0.90625
+        if th.momx > -0.0625 and th.momx < 0.0625 and th.momy > -0.0625 and th.momy < 0.0625 then
+            th.momx = 0; th.momy = 0
         end
-        return
     end
-    -- CHASE: face + animate walk frames, evaluate attacks, then move.
-    if not th.target then th.target = "player" end
-    th.stime = th.stime - dt
-    if th.stime <= 0 then
-        th.frameIdx = (th.frameIdx % #th.seq) + 1
-        th.frame = th.seq:sub(th.frameIdx, th.frameIdx)
-        th.stime = th.frdur
-    end
-    th.atkCool = (th.atkCool or 0) - dt
-    if th.atkCool <= 0 then
-        th.atkCool = 0.12 + (W.pRandom() % 8) * 0.02          -- re-evaluate ~7x/sec
-        if W.tryMonAttack(th) then return end
-    end
-    W.monMove(th, dt)
+    if not th.info then return end          -- statue species: renderable, no AI
+    if th.tics == -1 then return end
+    th.tics = (th.tics or 1) - 1
+    if th.tics <= 0 then W.advMState(th) end
 end
 
-function W.barrelThink(th, dt)
-    -- barrels do nothing until destroyed; explosion is handled in W.explodeBarrel
-end
+W.THINK = { monster = W.monsterThink, fx = W.fxThink, proj = W.projThink }
 
-function W.fxThink(th, dt)
-    th.stime = th.stime - dt
-    if th.stime <= 0 then
-        th.frameIdx = th.frameIdx + 1
-        if th.frameIdx > #th.seq then th.removed = true
-        else th.frame = th.seq:sub(th.frameIdx, th.frameIdx); th.stime = th.frdur end
-    end
-end
-
-W.THINK = { monster = W.monsterThink, barrel = W.barrelThink, fx = W.fxThink, proj = W.projThink }
-
--- Advance every live thing; swap-remove finished ones (recycle fx/proj slots).
-function W.updateActors(dt)
+-- Advance every live thing one TIC; swap-remove finished ones (recycle slots).
+function W.updateActors()
     local list = W.thinkers; if not list then return end
     for i = #list, 1, -1 do
         local th = list[i]
@@ -3903,110 +4633,204 @@ function W.updateActors(dt)
             list[i] = list[#list]; list[#list] = nil
             if th.removed and th._slot then W.freeThingSlots[#W.freeThingSlots + 1] = th._slot end
         else
-            local fn = W.THINK[th.think]; if fn then fn(th, dt) end
+            local fn = W.THINK[th.think]; if fn then fn(th) end
         end
     end
 end
 
--- DOOM (P_Random - P_Random) << 18 BAM spread converted to radians (~ +-5.6 deg).
-function W.hAngle() return (W.pRandom() - W.pRandom()) * (pi / 8192) end
-
 -- Nearest bullet-stopping distance along a ray (blockmap-free). A one-sided line
--- always stops; a two-sided line stops only if shootZ is outside its opening (so
--- shots pass through open doorways/windows at eye height, stop at closed doors).
-function W.rayWallDist(x1, y1, dx, dy, range, shootZ)
+-- always stops; a two-sided line stops only if the shot's z AT THE CROSSING
+-- (shootZ + slope*dist) is outside its live opening, so sloped shots clear lips
+-- and window sills exactly like PTR_ShootTraverse. Returns (dist, line).
+function W.rayWallDist(x1, y1, dx, dy, range, shootZ, slope)
+    slope = slope or 0
     local x2, y2 = x1 + dx * range, y1 + dy * range
     local V, LD, SD, SE = W.map.vertexes, W.map.linedefs, W.map.sidedefs, W.map.sectors
-    local best = range
+    local best, bestLd = range, nil
     for _, ld in ipairs(LD) do
         local a = V[ld.v1 + 1]; local b = V[ld.v2 + 1]
         if a and b then
             local t, u = W.raySeg(x1, y1, x2, y2, a.x, a.y, b.x, b.y)
             if t and t >= 0 and t <= 1 and u >= 0 and u <= 1 then
-                local stops
-                if ld.back == NONE or ld.front == NONE then stops = true
-                else
-                    local fsd = SD[ld.front + 1]; local bsd = SD[ld.back + 1]
-                    local fsec = fsd and SE[fsd.sector + 1]; local bsec = bsd and SE[bsd.sector + 1]
-                    if fsec and bsec then
-                        local ot = min(fsec.ceil, bsec.ceil); local ob = max(fsec.floor, bsec.floor)
-                        stops = (shootZ <= ob or shootZ >= ot)
-                    else stops = true end
+                local d = t * range
+                if d < best then
+                    local stops
+                    if ld.back == NONE or ld.front == NONE then stops = true
+                    else
+                        local fsd = SD[ld.front + 1]; local bsd = SD[ld.back + 1]
+                        local fsec = fsd and SE[fsd.sector + 1]; local bsec = bsd and SE[bsd.sector + 1]
+                        if fsec and bsec then
+                            local ot = min(fsec.ceil, bsec.ceil); local ob = max(fsec.floor, bsec.floor)
+                            local zc = shootZ + slope * d
+                            stops = (zc <= ob or zc >= ot)
+                        else stops = true end
+                    end
+                    if stops then best = d; bestLd = ld end
                 end
-                if stops then local d = t * range; if d < best then best = d end end
             end
         end
     end
-    return best
+    return best, bestLd
 end
 
--- One hitscan ray: stops at the nearest wall, hits the nearest actor before it.
-function W.shootTrace(x1, y1, ang, range, dmg)
+-- P_LineAttack: one hitscan ray from src ("player" or a monster). Walls stop it
+-- (slope-aware); the nearest shootable thing before the wall takes the damage.
+-- Monster shots can hit the player AND other monsters (infighting). Blood spawns
+-- on flesh (state skips by damage size), rising puffs on walls (pulled back 4u,
+-- melee puffs start at the small frame). Returns (victim or nil, distance).
+function W.lineAttack(src, x1, y1, shootZ, ang, range, slope, dmg)
+    slope = slope or 0
     local dx, dy = cos(ang), sin(ang)
-    local wd = W.rayWallDist(x1, y1, dx, dy, range, W.viewZ)
-    -- Vertical autoaim (P_AimLineAttack): the target search runs to the FULL range,
-    -- not the flat-Z wall stop, and each candidate must have a clear SLOPED sight
-    -- line from the eye to its torso. So a monster up (or down) a staircase gets hit
-    -- even though a level ray would stop in a step riser. Horizontal aim = crosshair
-    -- angle; vertical is resolved by sight, exactly like Doom's no-freelook autoaim.
-    local best, bestAlong = nil, range
+    local wd = W.rayWallDist(x1, y1, dx, dy, range, shootZ, slope)
+    local best, bestAlong = nil, wd
     for _, th in ipairs(W.map.things) do
-        local e = W.THING_SPR[th.dtype]
-        if e and e.r and not th.dead and not th.removed and (th.flags & 0x0010) == 0 then
-            local rx, ry = th.x - x1, th.y - y1
-            local along = rx * dx + ry * dy
-            if along > 0 and along < bestAlong then
-                local perp = abs(rx * (-dy) + ry * dx)
-                if perp <= e.r then
-                    local tz = (th.z or 0) + 24
-                    if W.checkSight(x1, y1, W.viewZ, th.x, th.y, tz - 6, tz + 6) then
-                        best = th; bestAlong = along
+        if th ~= src and th.think == "monster" and not th.dead and not th.removed
+            and (th.flags & 0x0010) == 0 then
+            local e = W.THING_SPR[th.dtype]
+            if e and e.r then
+                local rx, ry = th.x - x1, th.y - y1
+                local along = rx * dx + ry * dy
+                if along > 0 and along < bestAlong then
+                    local perp = abs(rx * (-dy) + ry * dx)
+                    if perp <= e.r then
+                        local bz = shootZ + slope * along
+                        local mi = th.info or W.MINFO[e.spr]
+                        local oz, oh = th.z or 0, (mi and mi.h) or 56
+                        if bz >= oz and bz <= oz + oh then
+                            best = th; bestAlong = along
+                        end
                     end
+                end
+            end
+        end
+    end
+    if src ~= "player" and not W.playerDead then
+        local rx, ry = W.viewX - x1, W.viewY - y1
+        local along = rx * dx + ry * dy
+        if along > 0 and along < bestAlong then
+            local perp = abs(rx * (-dy) + ry * dx)
+            if perp <= W.RADIUS then
+                local bz = shootZ + slope * along
+                if bz >= W.pz and bz <= W.pz + W.PHEIGHT then
+                    best = "player"; bestAlong = along
                 end
             end
         end
     end
     if best then
-        local tz = (best.z or 0) + 24
-        W.spawnFx(30031, "ABC", x1 + dx * bestAlong, y1 + dy * bestAlong, tz, 0.18)
-        W.damageMobj(best, dmg, "player")
-    else
-        W.spawnFx(30030, "ABCD", x1 + dx * wd, y1 + dy * wd, W.viewZ, 0.16)
+        local hx, hy = x1 + dx * bestAlong, y1 + dy * bestAlong
+        local hz = shootZ + slope * bestAlong + (W.pRandom() - W.pRandom()) * (4 / 255)
+        local noblood = best ~= "player" and best.info and best.info.noblood
+        if noblood then
+            W.spawnFx("PUFF", "ABCD", 4, hx, hy, hz, { bright = true, momz = 1 })
+        else
+            local startIdx = 1
+            if dmg < 9 then startIdx = 3 elseif dmg <= 12 then startIdx = 2 end
+            W.spawnFx("BLUD", "CBA", 8, hx, hy, hz, { momz = 2, startIdx = startIdx })
+        end
+        W.damageMobj(best, dmg, src, src)
+    elseif wd < range then
+        local pd = wd - 4; if pd < 1 then pd = 1 end       -- pull the puff off the wall
+        local melee = range <= 65
+        W.spawnFx("PUFF", "ABCD", 4, x1 + dx * pd, y1 + dy * pd,
+            shootZ + slope * pd + (W.pRandom() - W.pRandom()) * (4 / 255),
+            { bright = not melee, momz = 1, startIdx = melee and 3 or 1 })
     end
-    return best
+    return best, bestAlong
 end
 
--- Autoaim slope for player PROJECTILES: nearest thing along the crosshair that has
--- a clear sloped sight line, returning dz/horizontal to its torso (0 if none). The
--- rocket/plasma/bfg ball is launched with momz = slope*speed so it arcs up or down
--- to whatever the crosshair covers, clearing intervening steps as its z rises.
-function W.playerAimSlope(ang, range)
+-- P_AimLineAttack: autoaim slope toward the nearest shootable thing under the
+-- crosshair inside the +-100/160 vertical window; wall occlusion via the sloped
+-- sight walk. Returns (slope, target); slope 0 when nothing is aimed at.
+function W.aimLineAttack(src, x1, y1, shootZ, ang, range)
     local dx, dy = cos(ang), sin(ang)
-    local bestAlong, slope = range, 0
+    local bestAlong, slope, tgt = range, 0, nil
     for _, th in ipairs(W.map.things) do
-        local e = W.THING_SPR[th.dtype]
-        if e and e.r and not th.dead and not th.removed and (th.flags & 0x0010) == 0 then
-            local rx, ry = th.x - W.viewX, th.y - W.viewY
-            local along = rx * dx + ry * dy
-            if along > 0 and along < bestAlong then
-                local perp = abs(rx * (-dy) + ry * dx)
-                if perp <= e.r then
-                    local tz = (th.z or 0) + 24
-                    if W.checkSight(W.viewX, W.viewY, W.viewZ, th.x, th.y, tz - 6, tz + 6) then
-                        bestAlong = along; slope = (tz - W.viewZ) / along
+        if th ~= src and th.think == "monster" and not th.dead and not th.removed
+            and (th.flags & 0x0010) == 0 then
+            local e = W.THING_SPR[th.dtype]
+            if e and e.r then
+                local rx, ry = th.x - x1, th.y - y1
+                local along = rx * dx + ry * dy
+                if along > 0 and along < bestAlong then
+                    local perp = abs(rx * (-dy) + ry * dx)
+                    if perp <= e.r then
+                        local mi = th.info or W.MINFO[e.spr]
+                        local oz, oh = th.z or 0, (mi and mi.h) or 56
+                        local ts = (oz + oh - shootZ) / along
+                        local bs = (oz - shootZ) / along
+                        if ts > 100 / 160 then ts = 100 / 160 end
+                        if bs < -100 / 160 then bs = -100 / 160 end
+                        if ts > bs and W.checkSight(x1, y1, shootZ, th.x, th.y, oz, oz + oh) then
+                            bestAlong = along; slope = (ts + bs) / 2; tgt = th
+                        end
                     end
                 end
             end
         end
     end
-    return slope
+    if src ~= "player" and not W.playerDead then
+        local rx, ry = W.viewX - x1, W.viewY - y1
+        local along = rx * dx + ry * dy
+        if along > 0 and along < bestAlong then
+            local perp = abs(rx * (-dy) + ry * dx)
+            if perp <= W.RADIUS then
+                local ts = (W.pz + W.PHEIGHT - shootZ) / along
+                local bs = (W.pz - shootZ) / along
+                if ts > 100 / 160 then ts = 100 / 160 end
+                if bs < -100 / 160 then bs = -100 / 160 end
+                if ts > bs and W.checkSight(x1, y1, shootZ, W.viewX, W.viewY, W.pz, W.pz + W.PHEIGHT) then
+                    slope = (ts + bs) / 2; tgt = "player"
+                end
+            end
+        end
+    end
+    return slope, tgt
 end
 
--- P_DamageMobj: target is "player" or a thing. Player gets armor absorb + red flash.
-function W.damageMobj(target, dmg, src)
+-- Player hitscan origin: vanilla shootz = feet + height/2 + 8.
+function W.pShootZ() return W.pz + 36 end
+
+-- P_BulletSlope: aim dead ahead at 1024, then retry ~5.6 degrees right/left.
+function W.bulletSlope()
+    local sz = W.pShootZ()
+    local s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle, 1024)
+    if not t then
+        s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle + pi / 32, 1024)
+        if not t then
+            s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle - pi / 32, 1024)
+            if not t then s = 0 end
+        end
+    end
+    W.bslope = s; W.linetarget = t
+    return s, t
+end
+
+-- P_GunShot: one bullet at MISSILERANGE with the shared bullet slope.
+function W.gunShot(accurate)
+    local dmg = 5 * (W.pRandom() % 3 + 1)
+    local ang = W.viewAngle
+    if not accurate then ang = ang + (W.pRandom() - W.pRandom()) * (pi / 8192) end
+    W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 2048, W.bslope or 0, dmg)
+end
+
+-- P_SpawnPlayerMissile: straight ahead from feet+32 with the 3-try autoaim.
+function W.spawnPlayerMissile(kind)
+    local slope, t = W.bulletSlope()
+    if not t then slope = 0 end
+    W.spawnProjectile(kind, W.viewX, W.viewY, W.pz + 32, W.viewAngle,
+        slope * W.PROJ[kind].speed, "player")
+end
+
+-- P_DamageMobj: target is "player" or a thing. inflictor = what physically hit
+-- (missile/attacker, thrust origin; nil for slime/crushers = no thrust), source
+-- = who to blame (infighting retaliation + kill credit). Player gets armor
+-- absorb, pain sound, damage flash and the same knockback thrust as monsters.
+function W.damageMobj(target, dmg, inflictor, source)
     if target == "player" then
         if W.playerDead then return end
-        if W.skill == 1 then dmg = floor(dmg / 2) end        -- sk_baby: player takes half damage
+        if (W.powers.invuln or 0) ~= 0 and dmg < 1000 then return end
+        if W.skill == 1 then dmg = floor(dmg / 2) end        -- sk_baby: half damage
         local absorb = 0
         if W.armor > 0 and W.armorType > 0 then
             absorb = min(W.armor, floor(dmg * ((W.armorType == 1) and (1 / 3) or (1 / 2))))
@@ -4016,170 +4840,342 @@ function W.damageMobj(target, dmg, src)
         local d = dmg - absorb
         W.health = W.health - d
         W.damageCount = min(100, (W.damageCount or 0) + d)
-        if W.health <= 0 and not W.playerDead then
+        W.attacker = source
+        pcall(W.playSfx, "DSPLPAIN")
+        local inf = (type(inflictor) == "table") and inflictor
+            or ((type(source) == "table") and source or nil)
+        if inf then                                          -- knockback (rocket jumps!)
+            local ang = atan(W.viewY - inf.y, W.viewX - inf.x)
+            local thrust = dmg * 12.5 / 100
+            W.momx = W.momx + cos(ang) * thrust
+            W.momy = W.momy + sin(ang) * thrust
+        end
+        if W.health <= 0 then
             W.health = 0; W.playerDead = true; W.deadTimer = now()
+            W.dropWeapon()
             pcall(W.playSfx, "DSPLDETH")
         end
         return
     end
     local th = target
-    if th.dead or th.removed then return end
+    if type(th) ~= "table" or th.dead or th.removed then return end
+    local mi = th.info
+    local inf = (inflictor == "player" or source == "player") and "player"
+        or ((type(inflictor) == "table") and inflictor
+            or ((type(source) == "table") and source or nil))
+    if inf then                                              -- damage thrust, mass-scaled
+        local ix, iy
+        if inf == "player" then ix, iy = W.viewX, W.viewY else ix, iy = inf.x, inf.y end
+        local ang = atan(th.y - iy, th.x - ix)
+        local thrust = dmg * 12.5 / ((mi and mi.mass) or 100)
+        th.momx = (th.momx or 0) + cos(ang) * thrust
+        th.momy = (th.momy or 0) + sin(ang) * thrust
+    end
     th.hp = (th.hp or 0) - dmg
-    if th.hp <= 0 then
-        if th.think == "barrel" then W.explodeBarrel(th); return end
-        th.dead = true
-        local inf = th.info
-        local gib = inf and inf.frames and inf.frames.xdeath and th.hp < -(inf.hp or 60)
-        W.setState(th, gib and "xdeath" or "death")
-        pcall(W.playSfx, (inf and inf.dsfx) or "DSPODTH1")
-    elseif th.think == "monster" then                -- barrels take damage silently
-        local inf = th.info
-        if W.pRandom() < (inf and inf.pain or 128) and th.st ~= "pain" then
-            W.setState(th, "pain")
-            pcall(W.playSfx, (inf and inf.psfx) or "DSPOPAIN")
+    if th.hp <= 0 then W.killMobj(th, source); return end
+    if mi and W.pRandom() < (mi.pain or 0) then
+        th.justhit = true                                    -- retaliate on the next chase
+        W.setMState(th, "pain", 1)
+    end
+    th.reaction = 0                                          -- awake now
+    if source and source ~= target and (th.threshold or 0) <= 0 then
+        th.target = source                                   -- infighting: blame the shooter
+        th.threshold = 100                                   -- BASETHRESHOLD
+        if th.stkey == "stnd" and th.states and th.states.run then
+            W.setMState(th, "run", 1)
         end
-        W.wakeMonster(th)                            -- retaliate: enter the hunt
     end
 end
 
-function W.hurtPlayer(dmg) W.damageMobj("player", dmg, nil) end
-
--- A_Explode: barrel vanishes into a BEXP burst and splash-damages everything near.
-function W.explodeBarrel(th)
-    th.dead = true; th.removed = true
-    W.spawnFx(30032, "ABCDE", th.x, th.y, th.z or (W.viewZ - W.EYE), 0.5)
-    pcall(W.playSfx, "DSBAREXP")
-    W.radiusDamage(th.x, th.y, W.BARREL.boomdmg, W.BARREL.boomrad, th)
+-- P_KillMobj: gib below -spawnhealth, credit the kill, blame stored on the
+-- corpse (a barrel's target is its killer, so A_Explode credits the chain).
+function W.killMobj(th, source)
+    th.dead = true
+    th.target = source
+    local mi = th.info
+    if mi and mi.countkill then W.killCount = (W.killCount or 0) + 1 end
+    if th.states then
+        if th.states.xdie and mi and th.hp < -mi.hp then W.setMState(th, "xdie", 1)
+        else W.setMState(th, "die", 1) end
+    else
+        th.think = nil                                       -- statue species: freeze
+    end
 end
 
--- P_RadiusAttack: falloff = radius - (max(|dx|,|dy|) - target radius), LOS-gated.
-function W.radiusDamage(x, y, dmg, rad, src)
-    local function reach(tx, ty)
+function W.hurtPlayer(dmg) W.damageMobj("player", dmg, nil, nil) end
+
+-- P_RadiusAttack: falloff = radius - (max(|dx|,|dy|) - target radius), LOS-gated
+-- from the blast spot. spot (the exploding thing) is exempt; the SHOOTER is NOT
+-- (self rockets hurt). source only sets blame for infighting/credit.
+function W.radiusDamage(x, y, dmg, rad, spot, source)
+    local function reach(tx, ty, tz)
         local ddx, ddy = tx - x, ty - y; local dd = sqrt(ddx * ddx + ddy * ddy)
         if dd <= 1 then return true end
-        return W.rayWallDist(x, y, ddx / dd, ddy / dd, dd, W.viewZ) >= dd - 1
+        return W.rayWallDist(x, y, ddx / dd, ddy / dd, dd, tz) >= dd - 1
     end
     for _, th in ipairs(W.map.things) do
-        local e = W.THING_SPR[th.dtype]
-        if e and e.r and not th.dead and not th.removed and (th.flags & 0x0010) == 0 and th ~= src then
-            local dist = max(abs(th.x - x), abs(th.y - y)) - e.r
-            if dist < 0 then dist = 0 end
-            if dist < rad and reach(th.x, th.y) then W.damageMobj(th, rad - dist, src) end
+        if th ~= spot and th.think == "monster" and not th.dead and not th.removed then
+            local e = W.THING_SPR[th.dtype]
+            if e and e.r then
+                local dist = max(abs(th.x - x), abs(th.y - y)) - e.r
+                if dist < 0 then dist = 0 end
+                if dist < rad and reach(th.x, th.y, (th.z or 0) + 28) then
+                    W.damageMobj(th, rad - dist, spot, source)
+                end
+            end
         end
     end
     local pdist = max(abs(W.viewX - x), abs(W.viewY - y)) - W.RADIUS
     if pdist < 0 then pdist = 0 end
-    if pdist < rad and reach(W.viewX, W.viewY) then W.hurtPlayer(rad - pdist) end
+    if pdist < rad and reach(W.viewX, W.viewY, W.pz + 28) then
+        W.damageMobj("player", rad - pdist, spot, source)
+    end
 end
 
--- Best owned weapon that has ammo, DOOM downgrade order, for auto-switch on empty.
+-- Best owned weapon that has ammo (P_CheckAmmo preference order, with the
+-- shareware plasma/BFG and commercial SSG gates), for auto-switch on empty.
 function W.bestWeapon()
-    local order = { 6, 9, 4, 3, 2, 8, 1 }
-    for _, s in ipairs(order) do
-        local w = W.WEAPONS[s]
-        if W.weaponOwned[s] and (not w.ammo or W.ammo[w.ammo] >= (w.cost or 1)) then return s end
-    end
+    local ammo, owned = W.ammo, W.weaponOwned
+    if owned[6] and ammo.cel > 0 and W.gameMode ~= "shareware" then return 6 end
+    if owned[9] and ammo.shl > 2 and W.gameMode == "commercial" then return 9 end
+    if owned[4] and ammo.bul > 0 then return 4 end
+    if owned[3] and ammo.shl > 0 then return 3 end
+    if ammo.bul > 0 then return 2 end
+    if owned[8] then return 8 end
+    if owned[5] and ammo.rck > 0 then return 5 end
+    if owned[7] and ammo.cel > 40 and W.gameMode ~= "shareware" then return 7 end
     return 1
 end
 
--- Fire the current weapon once (hitscan / melee / projectile).
+----------------------------------------------------------------------
+-- Player weapon psprites (p_pspr.c). Two layers: W.psp (the gun) and W.psf
+-- (the muzzle flash), each a named state in W.WSTATES with a tic countdown.
+-- Actions run on state entry; a 0-tic state falls through (chaingun refire).
+----------------------------------------------------------------------
+function W.setPsprite(layer, stname)
+    while true do
+        if not stname then layer.st = nil; layer.tics = -1; return end
+        local s = W.WSTATES[stname]
+        if not s then layer.st = nil; layer.tics = -1; return end
+        layer.st = stname
+        layer.tics = s.t
+        if s.a then
+            local fn = W.PACT[s.a]
+            if fn then fn(layer, s) end
+            if layer.st ~= stname then return end   -- action redirected the layer
+        end
+        if layer.tics ~= 0 then return end
+        stname = s.nx
+    end
+end
+
+-- P_CheckAmmo: enough for one shot? Else pick the fallback and start lowering.
+function W.checkAmmo()
+    local w = W.WEAPONS[W.curWeapon]
+    if not w.ammo or W.ammo[w.ammo] >= (w.cost or 1) then return true end
+    W.pendingWeapon = W.bestWeapon()
+    W.setPsprite(W.psp, w.down)
+    return false
+end
+
+-- P_FireWeapon: enter the attack chain and alert every monster in earshot.
 function W.fireWeapon()
-    local w = W.WEAPONS[W.curWeapon]; if not w then return end
-    W.psp.flash = 3 * W.TIC
-    pcall(W.playSfx, w.sfx)
-    if w.melee then
-        W.shootTrace(W.viewX, W.viewY, W.viewAngle, w.range, w.dmg())
-        W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, w.range)
-        return
-    end
-    if w.proj then                                   -- rocket / plasma / bfg
-        local slope = W.playerAimSlope(W.viewAngle, 2048)   -- autoaim up/down stairs
-        local px = W.viewX + cos(W.viewAngle) * (W.RADIUS + 8)
-        local py = W.viewY + sin(W.viewAngle) * (W.RADIUS + 8)
-        W.spawnProjectile(w.proj, px, py, W.viewZ - 8, W.viewAngle, slope * W.PROJ[w.proj].speed, "player")
-        return
-    end
-    local pellets = w.pellets or 1
-    for _ = 1, pellets do
-        local ang = W.viewAngle
-        local spread = (pellets > 1) or (w.accurate and W.psp.refire > 0) or (not w.accurate)
-        if spread then ang = ang + W.hAngle() * (w.wide and 2 or 1) end
-        W.shootTrace(W.viewX, W.viewY, ang, w.range, w.dmg())
-    end
-    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, w.range)   -- gun-triggered switch lines
+    if not W.checkAmmo() then return end
+    W.setPsprite(W.psp, W.WEAPONS[W.curWeapon].atk)
+    W.noiseAlert()
 end
 
--- Fire scheduler + ammo + auto-switch (P_FireWeapon / A_ReFire / P_CheckAmmo).
-function W.tryFire(dt)
-    W.weaponClock = (W.weaponClock or 0) - dt
-    if W.weaponClock > 0 then return end
-    local w = W.WEAPONS[W.curWeapon]; if not w then return end
-    local canFire = w.auto and W.fireHeld or (W.fireHeld and not W.firePrev)
-    if not canFire then W.psp.refire = 0; return end
-    if w.ammo then
-        if W.ammo[w.ammo] < (w.cost or 1) then
-            W.pendingWeapon = W.bestWeapon(); W.weaponClock = 0.2; W.psp.refire = 0; return
-        end
-        W.ammo[w.ammo] = W.ammo[w.ammo] - w.cost
-    end
-    W.fireWeapon()
-    W.weaponClock = w.fireS
-    W.psp.refire = (W.psp.refire or 0) + 1
+-- P_BringUpWeapon: swap to the pending weapon and raise it from the bottom.
+function W.bringUpWeapon()
+    local wnum = W.pendingWeapon or W.curWeapon
+    W.curWeapon = wnum; W.pendingWeapon = nil
+    if wnum == 8 then pcall(W.playSfx, "DSSAWUP") end
+    W.psp.sy = 128
+    W.setPsprite(W.psp, W.WEAPONS[wnum].up)
 end
 
--- Psprite state machine (dt-driven): lower/raise on switch, bob + fire when ready.
-function W.updateWeapon(dt)
-    local psp = W.psp
-    if psp.flash > 0 then psp.flash = psp.flash - dt end
-    if W.pendingWeapon and W.pendingWeapon ~= W.curWeapon and psp.state ~= "raise" then psp.state = "lower" end
-    if psp.state == "lower" then
-        psp.sy = (psp.sy or 0) + 900 * dt
-        if psp.sy >= 128 then
-            psp.sy = 128; W.curWeapon = W.pendingWeapon or W.curWeapon; W.pendingWeapon = nil
-            psp.state = "raise"; W.weaponClock = 0; psp.refire = 0
+function W.dropWeapon()
+    W.setPsprite(W.psp, W.WEAPONS[W.curWeapon].down)
+end
+
+-- Weapon action routines. layer = the psprite the state belongs to.
+W.PACT = {}
+W.PACT.ready = function(layer)
+    if W.curWeapon == 8 and layer.st == "SAW" then pcall(W.playSfx, "DSSAWIDL") end
+    if W.pendingWeapon or W.playerDead or W.health <= 0 then
+        W.setPsprite(layer, W.WEAPONS[W.curWeapon].down)
+        return
+    end
+    if W.fireHeld then
+        -- rocket launcher + BFG do not autofire on a held button
+        if not W.attackdown or (W.curWeapon ~= 5 and W.curWeapon ~= 7) then
+            W.attackdown = true
+            W.fireWeapon()
+            return
         end
-    elseif psp.state == "raise" then
-        psp.sy = (psp.sy or 128) - 900 * dt
-        if psp.sy <= 0 then psp.sy = 0; psp.state = "ready" end
     else
-        psp.state = "ready"
-        W.tryFire(dt)
-        psp.bobT = (psp.bobT or 0) + dt
-        local amp = min((W.playerSpeed or 0) * 0.02, 7)
-        psp.sx = cos(psp.bobT * 8) * amp
-        psp.sy = abs(sin(psp.bobT * 8)) * amp
+        W.attackdown = false
+    end
+    local a = (W.levelTime % 64) * (TWO_PI / 64)          -- weapon bob (A_WeaponReady)
+    layer.sx = 1 + W.bob * cos(a)
+    local a2 = (W.levelTime % 32) * (TWO_PI / 64)
+    layer.sy = 32 + W.bob * sin(a2)
+end
+W.PACT.lower = function(layer)
+    layer.sy = layer.sy + 6                                -- LOWERSPEED
+    if layer.sy < 128 then return end
+    if W.playerDead or W.health <= 0 then
+        layer.sy = 128
+        W.setPsprite(layer, nil)                           -- dead: keep it down
+        return
+    end
+    W.bringUpWeapon()
+end
+W.PACT.raise = function(layer)
+    layer.sy = layer.sy - 6                                -- RAISESPEED
+    if layer.sy > 32 then return end
+    layer.sy = 32                                          -- WEAPONTOP
+    W.setPsprite(layer, W.WEAPONS[W.curWeapon].ready)
+end
+W.PACT.refire = function(layer)
+    if W.fireHeld and not W.pendingWeapon and not W.playerDead then
+        W.refire = (W.refire or 0) + 1
+        W.fireWeapon()
+    else
+        W.refire = 0
+        W.checkAmmo()
+    end
+end
+W.PACT.checkreload = function() W.checkAmmo() end
+W.PACT.gunflash = function()
+    W.setPsprite(W.psf, W.WEAPONS[W.curWeapon].flash)
+end
+W.PACT.light0 = function() W.extralight = 0 end
+W.PACT.light1 = function() W.extralight = 16 end
+W.PACT.light2 = function() W.extralight = 32 end
+W.PACT.punch = function()
+    local dmg = (W.pRandom() % 10 + 1) * 2
+    if (W.powers.berserk or 0) ~= 0 then dmg = dmg * 10 end
+    local ang = W.viewAngle + (W.pRandom() - W.pRandom()) * (pi / 8192)
+    local slope, tgt = W.aimLineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 64)
+    local hit = W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 64, tgt and slope or 0, dmg)
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 64)
+    if hit then
+        pcall(W.playSfx, "DSPUNCH")
+        local tx, ty = W.tgtPos(hit)
+        W.viewAngle = atan(ty - W.viewY, tx - W.viewX)     -- face the victim
+    end
+end
+W.PACT.saw = function()
+    local dmg = (W.pRandom() % 10 + 1) * 2
+    local ang = W.viewAngle + (W.pRandom() - W.pRandom()) * (pi / 8192)
+    -- meleerange+1 so the puff does not skip on the flat
+    local slope, tgt = W.aimLineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 65)
+    local hit = W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 65, tgt and slope or 0, dmg)
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 65)
+    if not hit then pcall(W.playSfx, "DSSAWFUL"); return end
+    pcall(W.playSfx, "DSSAWHIT")
+    local tx, ty = W.tgtPos(hit)
+    W.viewAngle = atan(ty - W.viewY, tx - W.viewX)
+end
+W.PACT.firepistol = function()
+    pcall(W.playSfx, "DSPISTOL")
+    W.ammo.bul = W.ammo.bul - 1
+    W.setPsprite(W.psf, W.WEAPONS[2].flash)
+    W.bulletSlope()
+    W.gunShot(W.refire == 0)
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
+end
+W.PACT.fireshotgun = function()
+    pcall(W.playSfx, "DSSHOTGN")
+    W.ammo.shl = W.ammo.shl - 1
+    W.setPsprite(W.psf, W.WEAPONS[3].flash)
+    W.bulletSlope()
+    for _ = 1, 7 do W.gunShot(false) end
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
+end
+W.PACT.fireshotgun2 = function()
+    pcall(W.playSfx, "DSDSHTGN")
+    W.ammo.shl = W.ammo.shl - 2
+    W.setPsprite(W.psf, W.WEAPONS[9].flash)
+    W.bulletSlope()
+    for _ = 1, 20 do
+        local dmg = 5 * (W.pRandom() % 3 + 1)
+        local ang = W.viewAngle + (W.pRandom() - W.pRandom()) * (pi / 4096)
+        W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 2048,
+            (W.bslope or 0) + (W.pRandom() - W.pRandom()) * (32 / 65536), dmg)
+    end
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
+end
+W.PACT.opensg2 = function() pcall(W.playSfx, "DSDBOPN") end
+W.PACT.loadsg2 = function() pcall(W.playSfx, "DSDBLOAD") end
+W.PACT.closesg2 = function(layer)
+    pcall(W.playSfx, "DSDBCLS")
+    W.PACT.refire(layer)
+end
+W.PACT.firecgun = function(layer)
+    pcall(W.playSfx, "DSPISTOL")
+    if W.ammo.bul <= 0 then return end
+    W.ammo.bul = W.ammo.bul - 1
+    local w = W.WEAPONS[4]
+    W.setPsprite(W.psf, (layer.st == "CHAIN1") and w.flash or w.flash2)
+    W.bulletSlope()
+    W.gunShot(W.refire == 0)
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
+end
+W.PACT.firemissile = function()
+    W.ammo.rck = W.ammo.rck - 1
+    W.spawnPlayerMissile("ROCKET")
+end
+W.PACT.fireplasma = function()
+    W.ammo.cel = W.ammo.cel - 1
+    local w = W.WEAPONS[6]
+    W.setPsprite(W.psf, ((W.pRandom() & 1) == 0) and w.flash or w.flash2)
+    W.spawnPlayerMissile("PLASMA")
+end
+W.PACT.firebfg = function()
+    W.ammo.cel = W.ammo.cel - 40
+    W.spawnPlayerMissile("BFG")
+end
+W.PACT.bfgsound = function() pcall(W.playSfx, "DSBFG") end
+
+-- P_MovePsprites: one tic of both layers.
+function W.movePsprites()
+    local p = W.psp
+    if p.st and p.tics ~= -1 then
+        p.tics = p.tics - 1
+        if p.tics <= 0 then W.setPsprite(p, W.WSTATES[p.st].nx) end
+    end
+    local f = W.psf
+    if f.st and f.tics ~= -1 then
+        f.tics = f.tics - 1
+        if f.tics <= 0 then W.setPsprite(f, W.WSTATES[f.st].nx) end
     end
 end
 
--- Draw the view weapon (psprite): centered, bobbing, with a muzzle flash overlay.
+-- Draw the view weapon + flash psprites with the vanilla R_DrawPSprite
+-- transform: 320x168-view coordinates (BASEYCENTER 100), sprite offsets from
+-- the WAD, scaled by viewH/168 and anchored to the view center/horizon. The
+-- flash layer rides the gun's bob and draws fullbright.
 function W.drawWeapon(sw, viewH)
-    local w = W.WEAPONS[W.curWeapon]; if not w then return end
-    local psp = W.psp
-    local firing = psp.flash > 0
-    local frame = firing and (w.fire or "A") or "A"
-    local lump = W.spriteFrameLump(w.spr, frame, 1)
-    if not lump then return end
-    local meta = W.spriteTex(lump); if not meta or not meta.tex then return end
-    local S = W.viewW / 320                   -- DOOM psprite scale (view width / 320)
-    local bx = (psp.sx or 0) * S; local by = (psp.sy or 0) * S
-    local wpx, hpx = meta.w * S, meta.h * S
-    local dx = W.centerX - wpx * 0.5 + bx      -- centered on the crosshair
-    local dy = viewH - hpx + by
-    local uw, vh = 0.5 / meta.w, 0.5 / meta.h  -- half-texel inset (no edge bleed line)
-    ImGui.AddImage(meta.tex, dx, dy, dx + wpx, dy + hpx, uw, vh, 1 - uw, 1 - vh, 0xFFFFFFFF)
-    if firing and w.flash then
-        local fl = W.spriteFrameLump(w.flash, "A", 1)
-        if fl then
-            local fm = W.spriteTex(fl)
-            if fm and fm.tex then
-                -- keep the flash aligned to the gun's muzzle (its offset relative to the gun sprite)
-                local fdx = dx + (meta.xoff - fm.xoff) * S
-                local fdy = dy + (meta.yoff - fm.yoff) * S
-                local fuw, fvh = 0.5 / fm.w, 0.5 / fm.h
-                ImGui.AddImage(fm.tex, fdx, fdy, fdx + fm.w * S, fdy + fm.h * S, fuw, fvh, 1 - fuw, 1 - fvh, 0xFFFFFFFF)
-            end
-        end
+    local S2 = viewH / 168
+    local secl = W.sectorAt(W.viewX, W.viewY)
+    local lgt = clamp(0.22 + 0.78 * (((secl and secl.light or 160) + (W.extralight or 0)) / 255), 0.10, 1.0)
+    local baseTint = W.greyTint(lgt)
+    local bobx, boby = W.psp.sx or 1, W.psp.sy or 32
+    local function layer(ps)
+        if not ps.st then return end
+        local st = W.WSTATES[ps.st]; if not st then return end
+        local lump = W.spriteFrameLump(st.spr, st.f, 1); if not lump then return end
+        local meta = W.spriteTex(lump); if not (meta and meta.tex) then return end
+        local x0 = W.centerX + (bobx - 160 - meta.xoff) * S2
+        local y0 = W.horizon + (boby - meta.yoff - 100.5) * S2
+        local uw, vh = 0.5 / meta.w, 0.5 / meta.h
+        ImGui.AddImage(meta.tex, x0, y0, x0 + meta.w * S2, y0 + meta.h * S2,
+            uw, vh, 1 - uw, 1 - vh, st.b and 0xFFFFFFFF or baseTint)
     end
+    layer(W.psp)
+    layer(W.psf)
 end
 
 ----------------------------------------------------------------------
@@ -4200,80 +5196,220 @@ W.trackVK = { W.VK.ENTER, W.VK.M, W.VK.BACKSPACE, W.VK.SPACE, W.VK.E,
     W.VK.ONE, W.VK.TWO, W.VK.THREE, W.VK.FOUR, W.VK.FIVE, W.VK.SIX, W.VK.SEVEN,
     W.VK.UP, W.VK.DOWN, W.VK.LEFT, W.VK.RIGHT, W.VK.ESCAPE, W.VK.Y, W.VK.N }
 
+----------------------------------------------------------------------
+-- Player think (p_user.c), all on the 35 Hz tic clock.
+----------------------------------------------------------------------
+-- P_Thrust: momentum impulse along angle. move is in vanilla cmd units
+-- (forwardmove 25/50, sidemove 24/40); impulse = move*2048/65536 = move/32.
+function W.thrust(angle, move)
+    W.momx = W.momx + (move / 32) * cos(angle)
+    W.momy = W.momy + (move / 32) * sin(angle)
+end
+
+-- P_MovePlayer: sample the held movement keys as this tic's command; thrust
+-- applies only on the ground (no air control, momentum carries).
+function W.movePlayerCmd()
+    local run = kdown(W.VK.SHIFT)
+    local fm = 0
+    if kdown(W.VK.W) or kdown(W.VK.UP) then fm = fm + 1 end
+    if kdown(W.VK.S) or kdown(W.VK.DOWN) then fm = fm - 1 end
+    local sm = 0
+    if kdown(W.VK.A) then sm = sm - 1 end
+    if kdown(W.VK.DK) then sm = sm + 1 end
+    W.cmdForward = fm * (run and 50 or 25)
+    W.cmdSide = sm * (run and 40 or 24)
+    W.onground = W.pz <= W.floorZAt(W.viewX, W.viewY) + 0.01
+    if W.cmdForward ~= 0 and W.onground then W.thrust(W.viewAngle, W.cmdForward) end
+    if W.cmdSide ~= 0 and W.onground then W.thrust(W.viewAngle - pi / 2, W.cmdSide) end
+end
+
+-- P_XYMovement: clamp to MAXMOVE (30/tic), substep halves above MAXMOVE/2,
+-- blocked moves slide along the wall; ground friction 0.90625 with the
+-- STOPSPEED no-input stop. Walk tops out ~8.3 u/tic, run ~15.6 (vanilla).
+function W.playerXYMovement()
+    if W.momx ~= 0 or W.momy ~= 0 then
+        if W.momx > 30 then W.momx = 30 elseif W.momx < -30 then W.momx = -30 end
+        if W.momy > 30 then W.momy = 30 elseif W.momy < -30 then W.momy = -30 end
+        local xm, ym = W.momx, W.momy
+        repeat
+            local px, py
+            if xm > 15 or ym > 15 or xm < -15 or ym < -15 then
+                px = W.viewX + xm / 2; py = W.viewY + ym / 2
+                xm = xm / 2; ym = ym / 2
+            else
+                px = W.viewX + xm; py = W.viewY + ym
+                xm, ym = 0, 0
+            end
+            if not W.pTryMove(px, py) then
+                W.slideMove()
+                break
+            end
+        until xm == 0 and ym == 0
+    end
+    if not W.onground then return end                 -- no friction airborne
+    if W.momx > -0.0625 and W.momx < 0.0625 and W.momy > -0.0625 and W.momy < 0.0625
+        and (W.cmdForward or 0) == 0 and (W.cmdSide or 0) == 0 then
+        W.momx = 0; W.momy = 0
+    else
+        W.momx = W.momx * 0.90625                     -- FRICTION 0xE800
+        W.momy = W.momy * 0.90625
+    end
+end
+
+-- P_ZMovement: smooth step-up eases the view down, gravity doubles on the
+-- first airborne tic, hard landings (momz < -8) squat the view and grunt.
+function W.playerZMovement()
+    local floorz = W.floorZAt(W.viewX, W.viewY)
+    if W.pz < floorz then                             -- stepped up: ease the view
+        W.viewheight = W.viewheight - (floorz - W.pz)
+        W.dvh = (41 - W.viewheight) / 8
+    end
+    W.pz = W.pz + W.momz
+    if W.pz <= floorz then
+        if W.momz < 0 then
+            if W.momz < -8 then
+                W.dvh = W.momz / 8                    -- squat on hard landing
+                pcall(W.playSfx, "DSOOF")
+            end
+            W.momz = 0
+        end
+        W.pz = floorz
+    else
+        if W.momz == 0 then W.momz = -2 else W.momz = W.momz - 1 end
+    end
+    local sec = W.sectorAt(W.viewX, W.viewY)
+    if sec and W.pz + W.PHEIGHT > sec.ceil then       -- ceiling clip
+        W.pz = sec.ceil - W.PHEIGHT
+        if W.momz > 0 then W.momz = 0 end
+    end
+end
+
+-- P_CalcHeight: momentum bob (cap MAXBOB 16) on a 20-tic sine, viewheight
+-- easing back to 41 after squats/step-ups; airborne uses raw viewheight.
+function W.calcHeight()
+    W.bob = (W.momx * W.momx + W.momy * W.momy) / 4
+    if W.bob > 16 then W.bob = 16 end
+    local sec = W.sectorAt(W.viewX, W.viewY)
+    if not W.onground then
+        W.viewZ = W.pz + W.viewheight
+        if sec and W.viewZ > sec.ceil - 4 then W.viewZ = sec.ceil - 4 end
+        return
+    end
+    local bobz = (W.bob / 2) * sin((W.levelTime % 20) * (TWO_PI / 20))
+    if not W.playerDead and W.dvh ~= 0 then
+        W.viewheight = W.viewheight + W.dvh
+        if W.viewheight > 41 then W.viewheight = 41; W.dvh = 0 end
+        if W.viewheight < 20.5 then
+            W.viewheight = 20.5
+            if W.dvh <= 0 then W.dvh = 0.03 end
+        end
+        if W.dvh ~= 0 then W.dvh = W.dvh + 0.25 end
+    end
+    W.viewZ = W.pz + W.viewheight + bobz
+    if sec and W.viewZ > sec.ceil - 4 then W.viewZ = sec.ceil - 4 end
+end
+
+-- Power countdown; a power at 0 is gone (berserk/allmap are level-long).
+function W.tickPowers()
+    for pw, t in pairs(W.powers) do
+        if t > 0 then
+            W.powers[pw] = t - 1
+            if W.powers[pw] <= 0 then W.powers[pw] = nil end
+        end
+    end
+end
+
+-- P_DeathThink: sink the view, coast the corpse, turn to face the killer
+-- (damage flash fades once facing), USE restarts the level.
+function W.deathThink()
+    W.movePsprites()
+    W.cmdForward = 0; W.cmdSide = 0
+    if W.viewheight > 6 then W.viewheight = W.viewheight - 1 end
+    if W.viewheight < 6 then W.viewheight = 6 end
+    W.onground = W.pz <= W.floorZAt(W.viewX, W.viewY) + 0.01
+    W.playerXYMovement()
+    W.playerZMovement()
+    W.viewZ = W.pz + W.viewheight
+    local att = W.attacker
+    if att and type(att) == "table" then
+        local ang = atan(att.y - W.viewY, att.x - W.viewX)
+        local delta = angNorm(ang - W.viewAngle)
+        local step = pi / 36                              -- ANG5 per tic
+        if abs(delta) < step then
+            W.viewAngle = ang
+            if (W.damageCount or 0) > 0 then W.damageCount = W.damageCount - 1 end
+        elseif delta > 0 then W.viewAngle = W.viewAngle + step
+        else W.viewAngle = W.viewAngle - step end
+    elseif (W.damageCount or 0) > 0 then
+        W.damageCount = W.damageCount - 1
+    end
+    if W.usePressed then
+        W.usePressed = false
+        if now() - (W.deadTimer or 0) > 1.0 then
+            W.newGame(); W.startMap(W.map and W.map.name)
+        end
+    end
+end
+
+-- P_PlayerThink: one player tic (movement, z, view, use, psprites, powers).
+function W.playerThink()
+    if W.playerDead then W.deathThink(); return end
+    if (W.reactionTics or 0) > 0 then
+        W.reactionTics = W.reactionTics - 1               -- post-teleport freeze
+        W.cmdForward = 0; W.cmdSide = 0
+    else
+        W.movePlayerCmd()
+    end
+    W.playerXYMovement()
+    W.playerZMovement()
+    W.calcHeight()
+    W.unstick()                              -- safety net, inert in normal play
+    if W.usePressed then
+        W.usePressed = false
+        local l = W.useLine()
+        if l then W.useSpecialLine(l) end
+    end
+    W.movePsprites()
+    W.tickPowers()
+    if (W.damageCount or 0) > 0 then W.damageCount = W.damageCount - 1 end
+    if (W.bonusCount or 0) > 0 then W.bonusCount = W.bonusCount - 1 end
+end
+
 function W.update(dt, menuOpen)
     W.updateWipe(dt)                             -- advance the screen melt (over any state)
     -- World is frozen (no input, no move) while the menu is open or a wipe plays.
     if W.gameState == "play" and not menuOpen and not W.wipe.active then
-        if W.playerDead then                 -- dead: frozen; USE/fire to restart the level
-            local floorz = W.floorZAt(W.viewX, W.viewY)   -- Doom death cam: view sinks to the floor
-            local target = floorz + 12
-            if W.viewZ > target then W.viewZ = max(target, W.viewZ - 90 * dt) end
-            if now() - (W.deadTimer or 0) > 1.0 and (kpressed(W.VK.E) or kpressed(W.VK.SPACE)) then
-                W.newGame(); W.startMap(W.map and W.map.name)
-            end
-            return
-        end
-        -- fire input: held for auto weapons, rising edge for the BFG. Check LCTRL/
-        -- RCTRL specifically (generic VK_CONTROL 0x11 is often not reported) + LMB.
-        W.firePrev = W.fireHeld
+        -- fire input: held state; the psprite ready/refire actions consume it.
+        -- Check LCTRL/RCTRL specifically (VK_CONTROL is often not reported) + LMB.
         local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
         W.fireHeld = kdown(0xA2) or kdown(0xA3) or kdown(W.VK.CTRL) or md
-        -- turn: LEFT = CCW = +angle, RIGHT = -angle
-        local turn = 0
-        if kdown(W.VK.LEFT) then turn = turn + 1 end
-        if kdown(W.VK.RIGHT) then turn = turn - 1 end
-        W.viewAngle = W.viewAngle + turn * W.TURN * dt
-        if W.mouseLook then
-            -- Turn with GTA's raw mouse-look input (INPUT_LOOK_LR) rather than the
-            -- cursor position: there is no cursor to warp, no screen-edge stall, and
-            -- it reads 0 while the game window is unfocused, so alt-tabbing never
-            -- steals the desktop mouse. Read the DISABLED control because
-            -- W.suppressGameInput disables all game controls each frame.
-            local ok, look = pcall(Natives.InvokeFloat, 0x11E65974A982637C, 0, 1)
-            if ok and look then W.viewAngle = W.viewAngle - look * W.LOOKSENS end
+
+        if not W.playerDead then
+            -- per-frame turning for latency; vanilla rates (6-tic slow ramp, run doubles)
+            local turn = 0
+            if kdown(W.VK.LEFT) then turn = turn + 1 end
+            if kdown(W.VK.RIGHT) then turn = turn - 1 end
+            if turn ~= 0 then
+                W.turnHeld = (W.turnHeld or 0) + dt
+                local rate
+                if W.turnHeld < 6 * W.TIC then rate = W.TURNSLOW
+                elseif kdown(W.VK.SHIFT) then rate = W.TURNFAST
+                else rate = W.TURNNORM end
+                W.viewAngle = W.viewAngle + turn * rate * dt
+            else
+                W.turnHeld = 0
+            end
+            if W.mouseLook then
+                -- GTA's raw mouse-look input (INPUT_LOOK_LR): no cursor warp, reads 0
+                -- unfocused. Read the DISABLED control (all controls are suppressed).
+                local ok, look = pcall(Natives.InvokeFloat, 0x11E65974A982637C, 0, 1)
+                if ok and look then W.viewAngle = W.viewAngle - look * W.LOOKSENS end
+            end
+            W.viewAngle = angNorm(W.viewAngle)
         end
-        W.viewAngle = angNorm(W.viewAngle)
 
-        W.unstick()                          -- free the player if wedged from a fall/landing
-
-        -- move: forward/back + strafe
-        local mf, ms = 0, 0
-        if kdown(W.VK.W) or kdown(W.VK.UP) then mf = mf + 1 end
-        if kdown(W.VK.S) or kdown(W.VK.DOWN) then mf = mf - 1 end
-        if kdown(W.VK.A) then ms = ms - 1 end
-        if kdown(W.VK.DK) then ms = ms + 1 end
-        local sp = W.MOVE * (kdown(W.VK.SHIFT) and W.RUN or 1) * dt
-        local fx, fy = cos(W.viewAngle), sin(W.viewAngle)
-        local rx, ry = sin(W.viewAngle), -cos(W.viewAngle)
-        if mf ~= 0 or ms ~= 0 then
-            W.tryMove((fx * mf + rx * ms) * sp, (fy * mf + ry * ms) * sp)
-        end
-        W.playerSpeed = (mf ~= 0 or ms ~= 0) and (W.MOVE * (kdown(W.VK.SHIFT) and W.RUN or 1)) or 0
-
-        -- use: open a door / hit a switch on the line straight ahead. Scanned once
-        -- per frame so the HUD can prompt when something usable is in reach.
-        W.useHint = W.useLine()
-        if W.useHint and (kpressed(W.VK.SPACE) or kpressed(W.VK.E)) then W.useSpecial(W.useHint) end
-        W.runTics(dt)                        -- doors/lifts/floors/crushers/lights/damage floors (35 Hz)
-        W.updateActors(dt)                   -- monster pain/death anim, barrels, fx
-
-        -- floor follow with gravity. Stand on the highest floor the body overlaps
-        -- (W.floorZAt = DOOM tmfloorz), NOT just the center sector, so a landing that
-        -- straddles a step rests ON the step instead of wedging below it. Grounded:
-        -- snap up/down for small changes (crisp stairs, <= MAXSTEP); a real ledge
-        -- (drop > MAXSTEP) hands off to gravity until you land. fallVel ~= 0 = airborne.
-        local floorz = W.floorZAt(W.viewX, W.viewY)
-        local feet = W.viewZ - W.EYE
-        if W.fallVel == 0 and (feet - floorz) <= W.MAXSTEP then
-            feet = floorz                                 -- grounded: step up / down
-        else
-            W.fallVel = W.fallVel - W.GRAVITY * dt        -- airborne: accelerate down
-            feet = feet + W.fallVel * dt
-            if feet <= floorz then feet = floorz; W.fallVel = 0 end
-        end
-        W.viewZ = feet + W.EYE
-
-        W.updatePickups()                    -- walk-over item touch (end of frame)
+        -- edges consumed by the next tic
+        if kpressed(W.VK.SPACE) or kpressed(W.VK.E) then W.usePressed = true end
         if kpressed(W.VK.ONE) then W.selectSlot(1) end
         if kpressed(W.VK.TWO) then W.selectSlot(2) end
         if kpressed(W.VK.THREE) then W.selectSlot(3) end
@@ -4281,15 +5417,24 @@ function W.update(dt, menuOpen)
         if kpressed(W.VK.FIVE) then W.selectSlot(5) end
         if kpressed(W.VK.SIX) then W.selectSlot(6) end
         if kpressed(W.VK.SEVEN) then W.selectSlot(7) end
+        W.useHint = W.useLine()              -- HUD prompt scan
 
-        W.updateWeapon(dt)                    -- psprite: switch anim, bob, fire scheduler
-        if W.damageCount > 0 then W.damageCount = max(0, W.damageCount - dt * 45) end
+        W.runTics(dt)                        -- 35 Hz: player, actors, psprites, specials
 
         if kpressed(W.VK.M) then W.mouseLook = not W.mouseLook end
         if kpressed(W.VK.BACKSPACE) or kpressed(W.VK.ESCAPE) then    -- pause -> front-end main
             W.menu.fromPlay = true; W.menu.screen = "main"; W.menu.cursor = 1
             W.gameState = "frontend"; pcall(W.playSfx, "DSSWTCHN")
         end
+    elseif W.gameState == "intermission" and not menuOpen then
+        local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
+        local fire = kdown(0xA2) or kdown(0xA3) or kdown(W.VK.CTRL) or md
+        if (fire and not W.firePrevWi) or kpressed(W.VK.SPACE) or kpressed(W.VK.E)
+            or kpressed(W.VK.ENTER) then
+            W.wiAccel = true
+        end
+        W.firePrevWi = fire
+        W.runTics(dt)
     elseif W.gameState == "frontend" and not menuOpen then
         if not W.menu.fromPlay then                  -- fresh menu: attract level behind the buttons
             if W.menu.screen ~= "title" and not W.attractOn then W.startAttract() end
@@ -4309,8 +5454,21 @@ function W.suppressGameInput()
     if not ok then W.nativesOk = false end
 end
 
+-- Which IWAD flavour is loaded? Gates SSG/plasma/BFG auto-select + WI layout.
+function W.detectGameMode()
+    local hasMapxx, hasE2 = false, false
+    for _, m in ipairs(W.mapList or {}) do
+        if m:match("^MAP%d%d$") then hasMapxx = true end
+        if m:match("^E[2-9]M%d$") then hasE2 = true end
+    end
+    if hasMapxx then W.gameMode = "commercial"
+    elseif hasE2 then W.gameMode = "registered"
+    else W.gameMode = "shareware" end
+end
+
 -- Load a map and drop the player at its start.
 function W.startMap(name)
+    if not W.gameMode then W.detectGameMode() end
     W.gameState = "loading"
     W.pendingMap = name
     local m = W.loadMap(name)
@@ -4325,47 +5483,448 @@ end
 ----------------------------------------------------------------------
 -- SECTION K: HUD + frame render
 ----------------------------------------------------------------------
-function W.drawHUD(sw, sh)
-    local y = W.viewH
-    rectf(0, y, sw, sh, 24, 22, 28, 235)
-    ImGui.AddText(8, y + 2, tostring(W.map and W.map.name or "-"), 175, 170, 155, 255)
-    -- status line: health / armor / weapon / ammo, with coloured key pips at right
-    local sy = y + floor(W.hudH * 0.42)
-    ImGui.AddText(8, sy, string.format("HEALTH %d%%", floor(W.health or 0)), 235, 90, 80, 255)
-    ImGui.AddText(floor(sw * 0.22), sy, string.format("ARMOR %d%%", floor(W.armor or 0)), 120, 180, 235, 255)
-    ImGui.AddText(floor(sw * 0.44), sy, W.WEAPNAME[W.curWeapon or 2] or "-", 230, 220, 140, 255)
-    local ak = W.HUDAMMOKEY[W.curWeapon or 2]
-    local ammoStr = (ak and W.ammo and W.ammo[ak] ~= nil) and tostring(W.ammo[ak]) or "--"
-    ImGui.AddText(floor(sw * 0.64), sy, "AMMO " .. ammoStr, 230, 210, 120, 255)
-    local kx, ki = floor(sw * 0.85), 0
+-- Vanilla status bar (st_stuff.c): STBAR background, STTNUM big numbers with
+-- STTPRCNT, STARMS + STYSNUM/STGNUM arms grid, STKEYS pips, the STYSNUM ammo
+-- table and the STF* face widget, all at their 320x200 coordinates scaled by
+-- sh/200 and centered (black wings on widescreen).
+W.ST_FACES = nil
+function W.stInit()
+    W.st = { faceIndex = 0, faceCount = 0, priority = 0, oldHealth = -1,
+        gotWeapon = false, lastAttackDown = -1, rnd = 0 }
+    if not W.ST_FACES then
+        local f = {}
+        for p = 0, 4 do
+            local base = p * 8
+            f[base + 0] = "STFST" .. p .. "0"; f[base + 1] = "STFST" .. p .. "1"
+            f[base + 2] = "STFST" .. p .. "2"
+            f[base + 3] = "STFTR" .. p .. "0"; f[base + 4] = "STFTL" .. p .. "0"
+            f[base + 5] = "STFOUCH" .. p; f[base + 6] = "STFEVL" .. p
+            f[base + 7] = "STFKILL" .. p
+        end
+        f[40] = "STFGOD0"; f[41] = "STFDEAD0"
+        W.ST_FACES = f
+    end
+end
+
+-- ST_calcPainOffset: 5 health tiers of 8 faces each.
+function W.stPainOffset()
+    local h = W.health or 0
+    if h > 100 then h = 100 end
+    return floor((100 - h) * 5 / 101) * 8
+end
+
+-- ST_updateFaceWidget, one tic. Priorities: dead(9) > evil grin(8) > hit(7) >
+-- own hurt(6) > rampage(5) > god(4) > look-about(0). The vanilla OUCH check
+-- (health INCREASED by 20+, a famous inversion) is kept as-is.
+function W.stTicker()
+    local st = W.st; if not st then return end
+    st.rnd = W.pRandom()
+    if st.priority < 10 and (W.health or 0) <= 0 then
+        st.priority = 9; st.faceIndex = 41; st.faceCount = 1
+    end
+    if st.priority < 9 and (W.bonusCount or 0) > 0 and st.gotWeapon then
+        st.gotWeapon = false
+        st.priority = 8; st.faceCount = 2 * 35
+        st.faceIndex = W.stPainOffset() + 6                -- evil grin
+    end
+    if st.priority < 8 and (W.damageCount or 0) > 0
+        and W.attacker and type(W.attacker) == "table" then
+        st.priority = 7
+        if (W.health or 0) - st.oldHealth > 20 then
+            st.faceCount = 35; st.faceIndex = W.stPainOffset() + 5   -- ouch
+        else
+            local bad = atan(W.attacker.y - W.viewY, W.attacker.x - W.viewX)
+            local diff = angNorm(bad - W.viewAngle)
+            st.faceCount = 35
+            if abs(diff) < pi / 4 then
+                st.faceIndex = W.stPainOffset() + 7        -- head-on: rampage face
+            elseif diff < 0 then
+                st.faceIndex = W.stPainOffset() + 3        -- attacker right: turn right
+            else
+                st.faceIndex = W.stPainOffset() + 4        -- attacker left: turn left
+            end
+        end
+    end
+    if st.priority < 7 and (W.damageCount or 0) > 0 then
+        if (W.health or 0) - st.oldHealth > 20 then
+            st.priority = 7; st.faceCount = 35
+            st.faceIndex = W.stPainOffset() + 5            -- ouch
+        else
+            st.priority = 6; st.faceCount = 35
+            st.faceIndex = W.stPainOffset() + 7            -- pain grimace
+        end
+    end
+    if st.priority < 6 then
+        if W.attackdown then
+            if st.lastAttackDown == -1 then st.lastAttackDown = 2 * 35
+            else
+                st.lastAttackDown = st.lastAttackDown - 1
+                if st.lastAttackDown == 0 then
+                    st.priority = 5; st.faceCount = 1; st.lastAttackDown = 1
+                    st.faceIndex = W.stPainOffset() + 7    -- rampage
+                end
+            end
+        else
+            st.lastAttackDown = -1
+        end
+    end
+    if st.priority < 5 and (W.powers.invuln or 0) ~= 0 then
+        st.priority = 4; st.faceIndex = 40; st.faceCount = 1
+    end
+    if st.faceCount <= 0 then                              -- look about
+        st.faceIndex = W.stPainOffset() + st.rnd % 3
+        st.faceCount = 17                                  -- ST_STRAIGHTFACECOUNT
+        st.priority = 0
+    end
+    st.faceCount = st.faceCount - 1
+    st.oldHealth = W.health or 0
+end
+
+-- One status-bar patch at 320x200 coords (patch offsets honoured).
+function W.stPatchXY(name, x, y, S, xb, top)
+    local wpx, hpx, lo, to = W.patchSize(name)
+    local handle = W.menuTex(name)
+    if not (handle and wpx) then return false end
+    local px = xb + (x - (lo or 0)) * S
+    local py = top + (y - 168 - (to or 0)) * S
+    ImGui.AddImage(handle, px, py, px + wpx * S, py + hpx * S, 0, 0, 1, 1, 0xFFFFFFFF)
+    return true
+end
+
+-- Right-justified number: digits drawn leftward ending at x (STlib_drawNum).
+function W.stNumR(prefix, x, y, n, S, xb, top)
+    n = floor(n or 0); if n < 0 then n = 0 end
+    local s = tostring(n)
+    local xx = x
+    for i = #s, 1, -1 do
+        local nm = prefix .. s:sub(i, i)
+        local dw = W.patchSize(nm) or 4
+        xx = xx - dw
+        W.stPatchXY(nm, xx, y, S, xb, top)
+    end
+end
+
+function W.drawStatusBar(sw, sh)
+    local S = sh / 200
+    local barW = 320 * S
+    local xb = (sw - barW) * 0.5
+    local top = sh - 32 * S
+    rectf(0, top, sw, sh, 0, 0, 0, 255)                    -- widescreen wings
+    if not W.stPatchXY("STBAR", 0, 168, S, xb, top) then   -- background
+        rectf(xb, top, xb + barW, sh, 24, 22, 28, 255)     -- fallback while baking
+    end
+    W.stPatchXY("STARMS", 104, 168, S, xb, top)
+    -- big ammo counter (blank for fist/saw)
+    local ak = W.WEAPONS[W.curWeapon or 2] and W.WEAPONS[W.curWeapon or 2].ammo
+    if ak then W.stNumR("STTNUM", 44, 171, W.ammo[ak], S, xb, top) end
+    -- health / armor percents (the % sign sits AT the coordinate)
+    W.stPatchXY("STTPRCNT", 90, 171, S, xb, top)
+    W.stNumR("STTNUM", 90, 171, W.health, S, xb, top)
+    W.stPatchXY("STTPRCNT", 221, 171, S, xb, top)
+    W.stNumR("STTNUM", 221, 171, W.armor, S, xb, top)
+    -- arms grid: yellow owned, grey not
+    for i = 2, 7 do
+        local gx = 111 + ((i - 2) % 3) * 12
+        local gy = 172 + floor((i - 2) / 3) * 10
+        W.stPatchXY((W.weaponOwned[i] and "STYSNUM" or "STGNUM") .. i, gx, gy, S, xb, top)
+    end
+    -- face
+    local fname = W.ST_FACES and W.ST_FACES[W.st and W.st.faceIndex or 0]
+    if fname then W.stPatchXY(fname, 143, 168, S, xb, top) end
+    -- keys (cards 0-2, skulls 3-5)
+    local slot = 0
     for _, col in ipairs({ "blue", "yellow", "red" }) do
         if W.keys and W.keys[col] then
-            local c = W.KEYCOL[col]; local x0 = kx + ki * 16
-            rectf(x0, sy, x0 + 11, sy + 13, c[1], c[2], c[3], 255)
+            local idx = slot + ((W.keyForm[col] == "skull") and 3 or 0)
+            W.stPatchXY("STKEYS" .. idx, 239, 171 + slot * 10, S, xb, top)
         end
-        ki = ki + 1
+        slot = slot + 1
     end
-    -- No crosshair: original DOOM had none, and with vertical autoaim a fixed
-    -- center mark would misrepresent where shots actually land.
-    local cx, cy = W.centerX, W.horizon
-    -- "use" prompt when facing a door / switch
+    -- ammo table: current + max per type
+    local rows = { { "bul", 173 }, { "shl", 179 }, { "rck", 185 }, { "cel", 191 } }
+    for _, r in ipairs(rows) do
+        W.stNumR("STYSNUM", 288, r[2], W.ammo[r[1]], S, xb, top)
+        W.stNumR("STYSNUM", 314, r[2], W.maxammo[r[1]], S, xb, top)
+    end
+end
+
+function W.drawHUD(sw, sh)
+    W.drawStatusBar(sw, sh)
+    -- palette flashes over the 3D view (red damage tiers, gold bonus, radsuit
+    -- green, invulnerability wash), from the vanilla (count+7)>>3 tiering
+    local dc = W.damageCount or 0
+    local bc = W.bonusCount or 0
+    if dc > 0 then
+        local tier = min(floor((dc + 7) / 8), 8)
+        rectf(0, 0, sw, W.viewH, 255, 2, 3, floor(tier * 28))
+    elseif bc > 0 then
+        local tier = min(floor((bc + 7) / 8), 4)
+        rectf(0, 0, sw, W.viewH, 215, 186, 69, floor(tier * 25))
+    elseif (W.powers.radsuit or 0) > 4 * 32
+        or ((W.powers.radsuit or 0) > 0 and ((W.powers.radsuit or 0) & 8) ~= 0) then
+        rectf(0, 0, sw, W.viewH, 0, 256 / 3, 0, 32)
+    end
+    if (W.powers.invuln or 0) > 4 * 32
+        or ((W.powers.invuln or 0) > 0 and ((W.powers.invuln or 0) & 8) ~= 0) then
+        rectf(0, 0, sw, W.viewH, 220, 220, 255, 26)        -- INVERSECOLORMAP stand-in
+    end
+    -- "use" prompt when facing a door / switch (not vanilla, kept for usability)
     local hint = W.useHint
     if hint then
         local sp = hint.special
         local label = (sp == 11 or sp == 51) and "SPACE: EXIT"
             or W.DOOR_SPECIALS[sp] and "SPACE: OPEN" or "SPACE: USE"
-        ImGui.AddText(cx - 34, cy + 16, label, 245, 230, 140, 255)
+        ImGui.AddText(W.centerX - 34, W.horizon + 16, label, 245, 230, 140, 255)
     end
-    -- pickup / locked-door message (top center) + gold bonus flash
+    -- pickup / locked-door message, vanilla top-left
     local m = (W.hudMsgUntil and now() < W.hudMsgUntil) and W.hudMsg or nil
-    if m then ImGui.AddText(floor(W.centerX - #m * 3), 26, m, 245, 235, 150, 255) end
-    if W.bonusFlash and now() < W.bonusFlash then rectf(0, 0, sw, W.viewH, 220, 180, 60, 40) end
-    -- red pain flash scaled by recent damage
-    if (W.damageCount or 0) > 0 then rectf(0, 0, sw, W.viewH, 200, 0, 0, floor(min(90, W.damageCount * 1.4))) end
-    -- death overlay
+    if m then ImGui.AddText(4, 2, m, 245, 235, 150, 255) end
     if W.playerDead then
-        ImGui.AddText(floor(W.centerX - 44), floor(W.viewH * 0.42), "YOU DIED", 235, 60, 55, 255)
-        ImGui.AddText(floor(W.centerX - 78), floor(W.viewH * 0.42) + 18, "press USE to restart", 210, 190, 120, 255)
+        ImGui.AddText(floor(W.centerX - 78), floor(W.viewH * 0.46), "press USE to restart", 210, 190, 120, 255)
+    end
+end
+
+----------------------------------------------------------------------
+-- SECTION W: intermission screen (wi_stuff.c)
+--
+-- After a level exits: "<name> FINISHED" with KILLS/ITEMS/SECRET percentages
+-- counting up (+2/tic, pistol tick every 4th, shotgun blast on each finished
+-- row), TIME vs PAR, then (Doom 1) the episode map with splats on completed
+-- levels and the blinking you-are-here arrow, then the next level loads.
+-- Graphics are the WAD's own WI* patches through the shared menuTex pipeline.
+----------------------------------------------------------------------
+-- Episode map node coordinates (wi_stuff.c lnodes, 320x200 space).
+W.WI_LNODES = {
+    [1] = { {185,164},{148,143},{69,122},{209,102},{116,89},{166,55},{71,56},{135,29},{71,24} },
+    [2] = { {254,25},{97,50},{188,64},{128,78},{214,92},{133,130},{208,136},{148,140},{235,158} },
+    [3] = { {156,168},{48,154},{174,95},{265,75},{130,48},{279,23},{198,48},{140,25},{281,136} },
+}
+-- E1 background animation spots (10 looping 3-frame WIA000xx anims, 11 tics).
+W.WI_ANIMS1 = { {224,104},{184,160},{112,136},{72,112},{88,96},{64,48},{192,40},{136,16},{80,16},{64,24} }
+
+function W.wiStart(wm)
+    W.wi = {
+        wm = wm, state = "stats", bcnt = 0,
+        cntKills = -1, cntItems = -1, cntSecret = -1, cntTime = -1, cntPar = -1,
+        spState = 1, cntPause = 35, showCnt = 0, noCnt = 0,
+    }
+    W.wiAccel = false
+    W.firePrevWi = true            -- swallow the held fire that flipped the exit switch
+    W.gameState = "intermission"
+    if W.musicOn then W.musPending = (W.gameMode == "commercial") and "D_DM2INT" or "D_INTER" end
+end
+
+-- WI_Ticker (35 Hz). One press jumps the counters to their totals, the next
+-- advances to the map page / next level.
+function W.wiTicker()
+    local wi = W.wi; if not wi then return end
+    local wm = wi.wm
+    wi.bcnt = wi.bcnt + 1
+    local accel = W.wiAccel; W.wiAccel = false
+    if wi.state == "stats" then
+        local kMax = floor(wm.kills * 100 / wm.maxkills)
+        local iMax = floor(wm.items * 100 / wm.maxitems)
+        local sMax = floor(wm.secrets * 100 / wm.maxsecret)
+        if accel and wi.spState ~= 10 then
+            wi.cntKills = kMax; wi.cntItems = iMax; wi.cntSecret = sMax
+            wi.cntTime = wm.time; wi.cntPar = wm.par or 0
+            pcall(W.playSfx, "DSBAREXP")
+            wi.spState = 10
+            accel = false
+        end
+        local s = wi.spState
+        if s == 2 then
+            wi.cntKills = ((wi.cntKills < 0) and 0 or wi.cntKills) + 2
+            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if wi.cntKills >= kMax then
+                wi.cntKills = kMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 3
+            end
+        elseif s == 4 then
+            wi.cntItems = ((wi.cntItems < 0) and 0 or wi.cntItems) + 2
+            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if wi.cntItems >= iMax then
+                wi.cntItems = iMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 5
+            end
+        elseif s == 6 then
+            wi.cntSecret = ((wi.cntSecret < 0) and 0 or wi.cntSecret) + 2
+            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if wi.cntSecret >= sMax then
+                wi.cntSecret = sMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 7
+            end
+        elseif s == 8 then
+            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            wi.cntTime = ((wi.cntTime < 0) and 0 or wi.cntTime) + 3
+            if wi.cntTime >= wm.time then wi.cntTime = wm.time end
+            wi.cntPar = ((wi.cntPar < 0) and 0 or wi.cntPar) + 3
+            if wi.cntPar >= (wm.par or 0) then
+                wi.cntPar = wm.par or 0
+                if wi.cntTime >= wm.time then
+                    pcall(W.playSfx, "DSBAREXP"); wi.spState = 9
+                end
+            end
+        elseif s == 10 then
+            if accel then
+                pcall(W.playSfx, "DSSGCOCK")
+                if wm.epsd and W.gameMode ~= "commercial" then
+                    wi.state = "next"; wi.showCnt = 4 * 35     -- SHOWNEXTLOCDELAY
+                else
+                    wi.state = "nostate"; wi.noCnt = 10
+                end
+            end
+        elseif (s % 2) == 1 then
+            wi.cntPause = wi.cntPause - 1
+            if wi.cntPause <= 0 then wi.spState = s + 1; wi.cntPause = 35 end
+        end
+    elseif wi.state == "next" then
+        wi.showCnt = wi.showCnt - 1
+        if wi.showCnt <= 0 or accel then wi.state = "nostate"; wi.noCnt = 10 end
+    elseif wi.state == "nostate" then
+        wi.noCnt = wi.noCnt - 1
+        if wi.noCnt <= 0 then
+            W.wi = nil
+            W.worldDone(wm)
+        end
+    end
+end
+
+-- One WI patch at 320x200 coords with its own offsets applied.
+function W.wiPatch(name, x, y, S, xb)
+    local wpx, hpx, lo, to = W.patchSize(name)
+    local handle = W.menuTex(name)
+    if not (handle and wpx) then return false, 0, 0 end
+    local px = xb + (x - (lo or 0)) * S
+    local py = (y - (to or 0)) * S
+    ImGui.AddImage(handle, px, py, px + wpx * S, py + hpx * S, 0, 0, 1, 1, 0xFFFFFFFF)
+    return true, wpx, hpx
+end
+
+-- Right-justified WINUM number ending at x; minDigits pads with zeros.
+function W.wiNumR(x, y, n, S, xb, minDigits)
+    if n == nil or n < 0 then return x end
+    n = floor(n)
+    local s = tostring(n)
+    while #s < (minDigits or 1) do s = "0" .. s end
+    local xx = x
+    for i = #s, 1, -1 do
+        local nm = "WINUM" .. s:sub(i, i)
+        local dw = W.patchSize(nm) or 11
+        xx = xx - dw
+        W.wiPatch(nm, xx, y, S, xb)
+    end
+    return xx
+end
+
+-- Percent: digits end at x, the % sign sits at x (WI_drawPercent).
+function W.wiPercent(x, y, p, S, xb)
+    if p == nil or p < 0 then return end
+    W.wiPatch("WIPCNT", x, y, S, xb)
+    W.wiNumR(x, y, p, S, xb)
+end
+
+-- Time as M:SS ending at x; an hour or more draws the SUCKS patch instead.
+function W.wiTime(x, y, t, S, xb)
+    if t == nil or t < 0 then return end
+    if t >= 3600 then
+        local wpx = W.patchSize("WISUCKS")
+        if wpx then W.wiPatch("WISUCKS", x - wpx, y, S, xb) end
+        return
+    end
+    local xx = W.wiNumR(x, y, t % 60, S, xb, 2)
+    local cw = W.patchSize("WICOLON")
+    if cw then xx = xx - cw; W.wiPatch("WICOLON", xx, y, S, xb) end
+    if t >= 60 then W.wiNumR(xx, y, floor(t / 60), S, xb) end
+end
+
+-- Level-name patch (WILVxy / CWILVxx), centered. Returns its height.
+function W.wiLevelName(idx, y, S, xb)
+    if idx == nil then return 0 end
+    local wm = W.wi and W.wi.wm
+    local name
+    if wm and wm.epsd and W.gameMode ~= "commercial" then
+        name = "WILV" .. (wm.epsd - 1) .. idx
+    else
+        name = ("CWILV%02d"):format(idx)
+    end
+    local wpx, hpx = W.patchSize(name)
+    if not wpx then
+        W.bigText((W.gameMode == "commercial") and ("MAP" .. (idx + 1)) or ("LEVEL " .. (idx + 1)),
+            xb + 160 * S, y * S + 8, 2.0, 235, 60, 50, 255)
+        return 12
+    end
+    W.wiPatch(name, (320 - wpx) / 2, y, S, xb)
+    return hpx
+end
+
+function W.wiDrawBackground(sw, sh, S, xb)
+    rectf(0, 0, sw, sh, 0, 0, 0, 255)
+    local wm = W.wi and W.wi.wm
+    local bg
+    if W.gameMode == "commercial" or not (wm and wm.epsd) then bg = "INTERPIC"
+    else bg = "WIMAP" .. min(wm.epsd - 1, 2) end
+    local handle = W.menuTex(bg)
+    if handle then
+        ImGui.AddImage(handle, xb, 0, xb + 320 * S, 200 * S, 0, 0, 1, 1, 0xFFFFFFFF)
+    end
+    -- E1 animated background overlays
+    if wm and wm.epsd == 1 and W.gameMode ~= "commercial" then
+        local bcnt = W.wi.bcnt
+        for i, loc in ipairs(W.WI_ANIMS1) do
+            local frame = floor(bcnt / 11 + i * 2) % 3
+            W.wiPatch(("WIA0%02d%02d"):format(i - 1, frame), loc[1], loc[2], S, xb)
+        end
+    end
+end
+
+function W.wiDrawOnNode(idx, patch, S, xb)
+    local wm = W.wi and W.wi.wm
+    local ep = wm and wm.epsd
+    local nodes = ep and W.WI_LNODES[ep]
+    local n = nodes and nodes[idx + 1]
+    if not n then return end
+    W.wiPatch(patch, n[1], n[2], S, xb)
+end
+
+function W.wiDraw(sw, sh)
+    local wi = W.wi; if not wi then return end
+    local wm = wi.wm
+    local S = sh / 200
+    local xb = (sw - 320 * S) * 0.5
+    W.bakeUsed = 0
+    W.wiDrawBackground(sw, sh, S, xb)
+    if wi.state == "stats" then
+        -- "<level> FINISHED"
+        local h = W.wiLevelName(wm.lastIdx, 2, S, xb)
+        local fw, fh = W.patchSize("WIF")
+        if fw then W.wiPatch("WIF", (320 - fw) / 2, 2 + (5 * h) / 4, S, xb) end
+        -- stat rows
+        local nh = select(2, W.patchSize("WINUM0")) or 12
+        local lh = floor((3 * nh) / 2)
+        W.wiPatch("WIOSTK", 50, 50, S, xb)
+        W.wiPercent(320 - 50, 50, wi.cntKills, S, xb)
+        W.wiPatch("WIOSTI", 50, 50 + lh, S, xb)
+        W.wiPercent(320 - 50, 50 + lh, wi.cntItems, S, xb)
+        W.wiPatch("WISCRT2", 50, 50 + 2 * lh, S, xb)
+        W.wiPercent(320 - 50, 50 + 2 * lh, wi.cntSecret, S, xb)
+        -- time / par
+        W.wiPatch("WITIME", 16, 168, S, xb)
+        W.wiTime(160 - 16, 168, wi.cntTime, S, xb)
+        if wm.par then
+            W.wiPatch("WIPAR", 160 + 16, 168, S, xb)
+            W.wiTime(320 - 16, 168, wi.cntPar, S, xb)
+        end
+    elseif wi.state == "next" or wi.state == "nostate" then
+        if wm.epsd and W.gameMode ~= "commercial" and W.WI_LNODES[wm.epsd] then
+            for i = 0, wm.lastIdx or 0 do W.wiDrawOnNode(i, "WISPLAT", S, xb) end
+            if W.didsecret then W.wiDrawOnNode(8, "WISPLAT", S, xb) end
+            if wm.nextIdx and (wi.bcnt & 31) < 20 then
+                W.wiDrawOnNode(wm.nextIdx, "WIURH0", S, xb)
+            end
+        end
+        if wm.next then
+            local ew, eh = W.patchSize("WIENTER")
+            if ew then W.wiPatch("WIENTER", (320 - ew) / 2, 2, S, xb) end
+            W.wiLevelName(wm.nextIdx, 2 + (5 * (eh or 16)) / 4, S, xb)
+        end
     end
 end
 
@@ -4390,7 +5949,11 @@ end
 function W.musicLumpFor(mapName)
     mapName = trimName(mapName)
     local cand
-    if mapName:match("^E%dM%d$") then
+    if mapName:match("^D_") then
+        cand = mapName                       -- direct lump (D_INTER between levels)
+    elseif mapName == "VICTORY" then
+        cand = "D_VICTOR"
+    elseif mapName:match("^E%dM%d$") then
         cand = "D_" .. mapName
     elseif mapName:match("^MAP%d%d$") then
         cand = W.MUS_DOOM2[mapName]
@@ -4842,7 +6405,8 @@ function W.menuTex(name)
     return nil
 end
 
--- Patch pixel size (cheap 4-int header read, cached), independent of the GPU bake.
+-- Patch pixel size + offsets (cheap 4-int header read, cached), independent of
+-- the GPU bake. Returns w, h, leftoffset, topoffset.
 function W.patchSize(name)
     W.patchWH = W.patchWH or {}
     local m = W.patchWH[name]
@@ -4850,12 +6414,12 @@ function W.patchSize(name)
         local li = W.lumpIndex and W.lumpIndex[name]
         local data = W.lumpBytes(li and li[1])
         if not data or #data < 8 then W.patchWH[name] = false; return nil end
-        local w, h = string.unpack("<i2i2", data, 1)
+        local w, h, lo, to = string.unpack("<i2i2i2i2", data, 1)
         if w <= 0 or h <= 0 or w > 4096 or h > 4096 then W.patchWH[name] = false; return nil end
-        m = { w = w, h = h }; W.patchWH[name] = m
+        m = { w = w, h = h, lo = lo, to = to }; W.patchWH[name] = m
     end
     if m == false then return nil end
-    return m.w, m.h
+    return m.w, m.h, m.lo, m.to
 end
 
 -- Draw a menu patch at Doom-space (dx,dy) scaled by S with left base xbase; falls
@@ -4986,7 +6550,8 @@ function W.startAttract()
     for _, th in ipairs(m.things) do if th.dtype == 1 then ax, ay, aang = th.x, th.y, math.rad(th.angle); break end end
     W.attractCam = { x = ax, y = ay, ang = aang, t = 0 }
     W.viewX = ax; W.viewY = ay; W.viewAngle = aang
-    W.attractCam.baseZ = W.floorZAt(ax, ay) + W.EYE
+    W.pz = W.floorZAt(ax, ay)
+    W.attractCam.baseZ = W.pz + W.EYE
     W.viewZ = W.attractCam.baseZ
     pcall(W.spawnActors, m)                  -- render a populated scene (static, not ticked)
 end
@@ -5134,6 +6699,25 @@ function W.drawWipe(sw, sh)
     end
 end
 
+-- View interpolation: the sim runs at 35 Hz; the renderer swaps in a position
+-- lerped between the last two tics (angle stays live for mouse latency) and
+-- restores the sim values afterwards, even if the body errors.
+function W.rSwap()
+    if W.gameState ~= "play" or not W.oldPX then return end
+    local a = clamp((W.specAccum or 0) / W.TIC, 0, 1)
+    W.simVX, W.simVY, W.simVZ = W.viewX, W.viewY, W.viewZ
+    W.viewX = W.oldPX + (W.viewX - W.oldPX) * a
+    W.viewY = W.oldPY + (W.viewY - W.oldPY) * a
+    W.viewZ = W.oldVZ + (W.viewZ - W.oldVZ) * a
+end
+
+function W.rRestore()
+    if W.simVX then
+        W.viewX, W.viewY, W.viewZ = W.simVX, W.simVY, W.simVZ
+        W.simVX = nil
+    end
+end
+
 function W.render()
     local sok, sw, sh = pcall(ImGui.GetDisplaySize)
     if not sok or not sw or sw < 16 or sh < 16 then return end
@@ -5143,7 +6727,9 @@ function W.render()
     -- Draw the body under pcall so a mid-frame error can never skip ImGui.End():
     -- an unbalanced Begin/End would desync the shared ImGui window stack and
     -- corrupt Cherax's own overlay/menu on later frames.
+    W.rSwap()
     local bok, berr = pcall(W.renderBody, sw, sh)
+    W.rRestore()
     ImGui.End()
     if not bok then Logger.LogError("[DOOMWAD] render body: " .. tostring(berr)) end
 end
@@ -5162,6 +6748,8 @@ function W.renderBody(sw, sh)
         if W.menuOpen then
             ImGui.AddText(floor(sw * 0.5 - 120), 8, "PAUSED - CLOSE MENU TO PLAY", 240, 220, 90, 255)
         end
+    elseif gs == "intermission" then
+        W.wiDraw(sw, sh)
     elseif gs == "frontend" then
         -- Button screens render over a live view: the attract level (fresh menu) or
         -- the frozen game (pause). The title screen keeps its full-screen TITLEPIC.
@@ -5381,12 +6969,17 @@ function W.init()
             | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoInputs
             | ImGuiWindowFlags.NoNav
     end)
-    -- Phase-2 constants (MOVE is units/sec; run with Shift, tune in-game)
+    -- Player physics constants (vanilla units; movement itself is momentum
+    -- + friction on the 35 Hz tic clock, see W.playerXYMovement). Turn rates
+    -- are the BAM angleturn {320,640,1280}<<16 per tic as radians/second.
     W.EYE = 41; W.RADIUS = 16; W.MAXSTEP = 24; W.PHEIGHT = 56
     W.NEARZ = 4; W.HFOV = pi / 2
-    W.MOVE = 200; W.RUN = 1.8; W.TURN = 2.6; W.MOUSE = 0.0026
+    W.MAXMOVE = 30                       -- momentum clamp, units/tic
+    W.TURNSLOW = (320 / 65536) * TWO_PI * 35
+    W.TURNNORM = (640 / 65536) * TWO_PI * 35
+    W.TURNFAST = (1280 / 65536) * TWO_PI * 35
+    W.FLOATSPEED = 4                     -- cacodemon vertical adjust, units/tic
     W.LOOKSENS = 0.1                     -- mouse turn sensitivity (GTA INPUT_LOOK_LR -> radians)
-    W.GRAVITY = 1225                     -- units/s^2 for falling off ledges (Doom ~1 u/tic^2)
     -- Phase-4 visplane (textured floors/ceilings) + sky constants.
     W.ROWSTEP = 2          -- plane row granularity (1=full res, 2=half draws)
     W.FLAT_TILE = 8        -- flats baked tiled NxN (8 => 512x512); 1 uv unit = 64*8 world units
@@ -5401,12 +6994,17 @@ function W.init()
     W.SPRITE_PLACEHOLDER = true -- faint kind-colored rect while a sprite bakes
     W.DS_MAXSEGS = 2048        -- max silhouette-occluder segs recorded per frame
     -- Phase-6 enemy AI (p_enemy.c) constants.
-    W.SIGHT_RANGE = 2048       -- max distance a monster can notice/attack the player
-    W.MON_HEIGHT = 56          -- opening a monster's box needs to fit through a portal
+    W.SIGHT_RANGE = 8192       -- perf guard only; vanilla sight is unbounded
     -- combat / weapon input state (inventory itself lives in W.newGame)
-    W.psp = W.psp or { state = "ready", sx = 0, sy = 0, flash = 0, refire = 0, bobT = 0 }
-    W.weaponClock = 0; W.autoAim = false
-    W.fireHeld = false; W.firePrev = false; W.playerSpeed = 0
+    W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
+    W.psf = { st = nil, tics = -1 }
+    W.attackdown = false; W.refire = 0; W.extralight = 0
+    W.fireHeld = false; W.usePressed = false
+    W.momx = 0; W.momy = 0; W.momz = 0; W.bob = 0
+    W.pz = 0; W.viewheight = 41; W.dvh = 0
+    W.reactionTics = 0; W.turnHeld = 0
+    W.cmdForward = 0; W.cmdSide = 0
+    W.stInit()
     -- camera / view state
     W.viewX = 0; W.viewY = 0; W.viewZ = W.EYE; W.viewAngle = 0
     W.active = false
