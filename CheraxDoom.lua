@@ -117,6 +117,27 @@ W.MUS_DOOM2 = {
     MAP29 = "D_SHAWN3", MAP30 = "D_OPENIN", MAP31 = "D_EVIL",   MAP32 = "D_ULTIMA",
 }
 
+-- Verbatim DOOM strings (d_englsh.h / dstrings.c) so the front-end prompts read
+-- exactly like the game instead of paraphrases. \n = line break.
+W.STR = {
+    NIGHTMARE  = "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.",
+    DOSY       = "(press y to quit)",
+    PD_BLUEK   = "You need a blue key to open this door",
+    PD_YELLOWK = "You need a yellow key to open this door",
+    PD_REDK    = "You need a red key to open this door",
+}
+-- Quit taunts (endmsg[], DOOM1 set); one is picked per quit-screen open.
+W.QUITMSGS = {
+    "are you sure you want to\nquit this great game?",
+    "please don't leave, there's more\ndemons to toast!",
+    "let's beat it -- this is turning\ninto a bloodbath!",
+    "i wouldn't leave if i were you.\ndos is much worse.",
+    "you're trying to say you like dos\nbetter than me, right?",
+    "don't leave yet -- there's a\ndemon around that corner!",
+    "ya know, next time you come in here\ni'm gonna toast ya.",
+    "go ahead and leave. see if i care.",
+}
+
 ----------------------------------------------------------------------
 -- SECTION A: WAD container
 ----------------------------------------------------------------------
@@ -2901,11 +2922,18 @@ function W.evDoDoor(ld, kind)
     end)
 end
 
+-- "You need a <colour> key to open this door" (PD_*K), or a generic fallback.
+W.KEYDOORMSG = { blue = "PD_BLUEK", yellow = "PD_YELLOWK", red = "PD_REDK" }
+function W.needKeyMsg(col)
+    W.hudMsg = W.STR[W.KEYDOORMSG[col]] or ("You need a " .. tostring(col) .. " key")
+    W.hudMsgUntil = now() + 2.0
+    pcall(W.playSfx, "DSOOF")
+end
+
 -- EV_DoLockedDoor: a remote door gated behind a keycard.
 function W.evDoLockedDoor(ld, kind, lock)
     if lock and not (W.keys and W.keys[lock]) then
-        W.hudMsg = "You need a " .. lock .. " key."; W.hudMsgUntil = now() + 2.0
-        pcall(W.playSfx, "DSOOF"); return false
+        W.needKeyMsg(lock); return false
     end
     return W.evDoDoor(ld, kind)
 end
@@ -2914,8 +2942,7 @@ end
 function W.evVerticalDoor(ld)
     local d = W.DOOR_SPECIALS[ld.special]; if not d then return end
     if d.key and not (W.keys and W.keys[d.key]) then
-        W.hudMsg = "You need a " .. d.key .. " key."; W.hudMsgUntil = now() + 2.0
-        pcall(W.playSfx, "DSOOF"); return
+        W.needKeyMsg(d.key); return
     end
     if ld.back == NONE then return end
     local bsd = W.map.sidedefs[ld.back + 1]; if not bsd then return end
@@ -5431,7 +5458,7 @@ function W.update(dt, menuOpen)
 
         W.runTics(dt)                        -- 35 Hz: player, actors, psprites, specials
 
-        if kpressed(W.VK.M) then W.mouseLook = not W.mouseLook end
+        if kpressed(W.VK.M) then W.mouseLook = not W.mouseLook; pcall(W.saveSettings) end
         if kpressed(W.VK.BACKSPACE) or kpressed(W.VK.ESCAPE) then    -- pause -> front-end main
             W.menu.fromPlay = true; W.menu.screen = "main"; W.menu.cursor = 1
             W.gameState = "frontend"; pcall(W.playSfx, "DSSWTCHN")
@@ -5992,7 +6019,11 @@ end
 
 -- Core MUS -> MIDI conversion. May return nil on any structural problem; the
 -- public W.mus2midi wraps this in pcall so a truncated/garbage lump is silent.
-function W._mus2midi(mus)
+-- volScale (0..1) multiplies note-on velocities so the music-volume slider can
+-- attenuate the whole track at conversion time (MCI's sequencer has no live
+-- volume command, so volume is baked into the cached .mid per level).
+function W._mus2midi(mus, volScale)
+    volScale = volScale or 1
     if type(mus) ~= "string" or #mus < 4 then return nil end
     -- Passthrough: a lump that is already a Standard MIDI File is returned as-is
     -- (0 = unknown exact length -> caller disables auto-loop for it).
@@ -6075,7 +6106,12 @@ function W._mus2midi(mus)
                 if not vb then break end
                 vol[mch] = vb & 0x7F
             end
-            emit(string.char(0x90 | ch, n, vol[mch]))
+            local vel = vol[mch]
+            if volScale < 1 then
+                vel = floor(vel * volScale)
+                if vel < 1 and vol[mch] > 0 and volScale > 0 then vel = 1 end   -- keep the note audible
+            end
+            emit(string.char(0x90 | ch, n, vel))
         elseif etype == 2 then                -- pitch bend (1 byte)
             local b = mus:byte(pos); pos = pos + 1
             if not b then break end
@@ -6125,8 +6161,8 @@ function W._mus2midi(mus)
 end
 
 -- Public MUS -> MIDI. Returns (midiBytes, totalSeconds) or nil. Never throws.
-function W.mus2midi(mus)
-    local ok, midi, secs = pcall(W._mus2midi, mus)
+function W.mus2midi(mus, volScale)
+    local ok, midi, secs = pcall(W._mus2midi, mus, volScale)
     if not ok then return nil end
     return midi, secs
 end
@@ -6138,6 +6174,53 @@ function W.mci(cmd)
     local ok, res = pcall(Utils.MciSendString, cmd)
     if not ok then return false end
     return res ~= false
+end
+
+-- Settings persistence: a tiny key=value text file in Lua/DoomWad, loaded once
+-- at boot and rewritten on every options change (so mouselook/music/volumes
+-- stick between sessions with no manual save, like the host's saveable toggles).
+-- Best-effort; a missing/garbage file just leaves the init defaults in place.
+function W.settingsFile()
+    if W.settingsPath ~= nil then return W.settingsPath end
+    W.settingsPath = false
+    local rok, root = pcall(FileMgr.GetMenuRootPath)
+    if rok and root and root ~= "" then
+        root = tostring(root)
+        pcall(FileMgr.CreateDir, root .. "/Lua/DoomWad")
+        W.settingsPath = root .. "/Lua/DoomWad/settings.cfg"
+    end
+    return W.settingsPath
+end
+
+function W.loadSettings()
+    if W.settingsLoaded then return end
+    W.settingsLoaded = true
+    local path = W.settingsFile(); if not path then return end
+    local ook, f = pcall(io.open, path, "r"); if not ook or not f then return end
+    local rok, data = pcall(f.read, f, "*a"); pcall(f.close, f)
+    if not rok or type(data) ~= "string" then return end
+    for k, v in data:gmatch("([%w_]+)%s*=%s*([^\r\n]+)") do
+        v = v:gsub("%s+$", "")
+        if k == "mouselook" then W.mouseLook = (v == "1" or v == "true")
+        elseif k == "music" then W.musicOn = not (v == "0" or v == "false")
+        elseif k == "looksens" then W.LOOKSENS = clamp(tonumber(v) or W.LOOKSENS, 0.02, 0.5)
+        elseif k == "musicvol" then W.musicVol = clamp(floor(tonumber(v) or 15), 0, 15)
+        elseif k == "sfxvol" then W.sfxVol = clamp(floor(tonumber(v) or 15), 0, 15) end
+    end
+end
+
+-- Write current settings. Called on every options change (cheap, ~5 short lines).
+function W.saveSettings()
+    local path = W.settingsFile(); if not path then return end
+    local body = table.concat({
+        "mouselook=" .. (W.mouseLook and "1" or "0"),
+        "music=" .. (W.musicOn and "1" or "0"),
+        ("looksens=%.3f"):format(W.LOOKSENS or 0.1),
+        "musicvol=" .. tostring(W.musicVol or 15),
+        "sfxvol=" .. tostring(W.sfxVol or 15),
+    }, "\n") .. "\n"
+    local ook, f = pcall(io.open, path, "w"); if not ook or not f then return end
+    pcall(f.write, f, body); pcall(f.close, f)
 end
 
 -- Ensure the on-disk cache directory exists (shared with the texture cache).
@@ -6157,31 +6240,36 @@ end
 -- Convert (if needed), cache, and start the music for a map. No-op if music is
 -- off or nothing suitable is found. Any prior track is closed first.
 function W.playMusic(mapName)
+    W.musReq = mapName                        -- remembered so a volume change can restart it
     if not W.musicOn then return end
     W.stopMusic()
     if not W.ensureCacheDir() then return end
     local ord, name = W.musicLumpFor(mapName)
     if not ord then return end
-    local path = W.cacheDir .. "/mus_" .. name:gsub("[^%w_%-]", "_") .. ".mid"
+    -- Volume is baked into the .mid, so cache per (track, volume): a level plays
+    -- silently at vol 0, at full velocity at vol 15. The file name carries the vol.
+    local vol = clamp(floor(W.musicVol or 15), 0, 15)
+    local volScale = vol / 15
+    local key = name .. "_v" .. vol
+    local path = W.cacheDir .. "/mus_" .. key:gsub("[^%w_%-]", "_") .. ".mid"
     local exists = false
     if FileMgr and FileMgr.DoesFileExist then
         local dok, de = pcall(FileMgr.DoesFileExist, path)
         if dok and de then exists = true end
     end
-    -- Convert + cache once per track. If the .mid is already on disk and we know
-    -- its duration, skip the (re)conversion entirely (avoids redundant work on
-    -- map switches / re-enable).
+    -- Convert + cache once per (track, volume). If the .mid is already on disk and
+    -- we know its duration, skip the (re)conversion entirely.
     W.musLenByName = W.musLenByName or {}
-    local secs = W.musLenByName[name]
+    local secs = W.musLenByName[key]
     if not (exists and secs) then
         local bytes = W.lumpBytes(ord)
         if #bytes < 4 then return end
         local head = bytes:sub(1, 4)
         local midi
         if head == "MThd" then
-            midi, secs = bytes, 0             -- already a MIDI (custom PWAD)
+            midi, secs = bytes, 0             -- already a MIDI (custom PWAD; not scaled)
         elseif head == "MUS\26" then
-            midi, secs = W.mus2midi(bytes)
+            midi, secs = W.mus2midi(bytes, volScale)
         else
             return                            -- unknown music format -> silence
         end
@@ -6189,7 +6277,7 @@ function W.playMusic(mapName)
         if not exists then
             if not W.writeBytes(path, midi) then return end   -- io.open "wb"
         end
-        W.musLenByName[name] = secs
+        W.musLenByName[key] = secs
     end
     local mp = path:gsub("/", "\\")           -- MCI prefers backslash paths
     W.musAlias = W.musAlias or "doommus"
@@ -6260,7 +6348,11 @@ function W.serviceStop()
 end
 
 -- Core DMX (DSxxx) -> WAV conversion. May return nil on a malformed lump.
-function W._dmx2wav(bytes)
+-- volScale (0..1) attenuates the 8-bit PCM around its unsigned midpoint (128),
+-- baked in per (sfx, volume) so the sound-volume slider works with Utils.PlaySound
+-- (which takes no volume argument).
+function W._dmx2wav(bytes, volScale)
+    volScale = volScale or 1
     if type(bytes) ~= "string" or #bytes < 8 then return nil end
     local formatNum   = string.unpack("<I2", bytes, 1)
     local sampleRate  = string.unpack("<I2", bytes, 3)
@@ -6278,6 +6370,15 @@ function W._dmx2wav(bytes)
     if dataOfs + dataLen > #bytes then dataLen = #bytes - dataOfs end
     if dataLen < 0 then dataLen = 0 end
     local pcm = bytes:sub(dataOfs + 1, dataOfs + dataLen)
+    if volScale < 1 and #pcm > 0 then                      -- attenuate around midpoint 128
+        local out = {}
+        for i = 1, #pcm do
+            local v = 128 + floor((pcm:byte(i) - 128) * volScale + 0.5)
+            if v < 0 then v = 0 elseif v > 255 then v = 255 end
+            out[i] = string.char(v)
+        end
+        pcm = table.concat(out)
+    end
     if sampleRate <= 0 then sampleRate = 11025 end
     -- 8-bit WAV PCM is UNSIGNED, exactly like DMX, so no sample conversion.
     local byteRate = sampleRate                            -- blockAlign(1) * rate
@@ -6290,25 +6391,28 @@ function W._dmx2wav(bytes)
 end
 
 -- Public DMX -> WAV. Returns wavBytes or nil. Never throws.
-function W.dmx2wav(bytes)
-    local ok, wav = pcall(W._dmx2wav, bytes)
+function W.dmx2wav(bytes, volScale)
+    local ok, wav = pcall(W._dmx2wav, bytes, volScale)
     if not ok then return nil end
     return wav
 end
 
 -- Convert (if needed), cache, and play a DOOM sound effect lump one-shot.
+-- Cached per (sfx, volume); silent at vol 0.
 function W.playSfx(name)
+    local vol = clamp(floor(W.sfxVol or 15), 0, 15)
+    if vol <= 0 then return end
     if not W.ensureCacheDir() then return end
     local ord = W.lumpIndex and W.lumpIndex[name] and W.lumpIndex[name][1]
     if not ord then return end
-    local path = W.cacheDir .. "/sfx_" .. name:gsub("[^%w_%-]", "_") .. ".wav"
+    local path = W.cacheDir .. "/sfx_" .. name:gsub("[^%w_%-]", "_") .. "_v" .. vol .. ".wav"
     local exists = false
     if FileMgr and FileMgr.DoesFileExist then
         local dok, de = pcall(FileMgr.DoesFileExist, path)
         if dok and de then exists = true end
     end
     if not exists then
-        local wav = W.dmx2wav(W.lumpBytes(ord))
+        local wav = W.dmx2wav(W.lumpBytes(ord), vol / 15)
         if not wav then return end
         if not W.writeBytes(path, wav) then return end     -- io.open "wb"
     end
@@ -6347,6 +6451,8 @@ W.SKILL_ITEMS = {
 W.OPT_ITEMS = {
     { text = "Mouse Look",       opt = "mouselook" },
     { text = "Music",            opt = "music" },
+    { text = "Music Volume",     opt = "musicvol", slider = true },
+    { text = "Sound Volume",     opt = "sfxvol",   slider = true },
     { text = "Look Sensitivity", opt = "looksens" },
 }
 
@@ -6476,20 +6582,56 @@ function W.drawPatchFS(name, sw, sh)
     else ImGui.AddText(floor(sw * 0.5 - 60), floor(sh * 0.32), "D O O M", 235, 60, 50, 255) end
 end
 
+-- DOOM thermometer slider (m_menu.c M_DrawThermo): M_THERML end-cap, 16 M_THERMM
+-- middle cells, M_THERMR end-cap, M_THERMO knob at dot*8. Falls back to a drawn
+-- bar when the WAD lacks the lumps. val/maxv sets the knob position (0..maxv).
+function W.drawThermo(dx, dy, S, xbase, val, maxv)
+    local segW = W.patchSize("M_THERMM") or 8
+    local drewLumps = W.stPatchThermoPart("M_THERML", dx, dy, S, xbase)
+    if drewLumps then
+        local xx = dx + segW
+        for _ = 1, maxv do W.stPatchThermoPart("M_THERMM", xx, dy, S, xbase); xx = xx + segW end
+        W.stPatchThermoPart("M_THERMR", xx, dy, S, xbase)
+        W.stPatchThermoPart("M_THERMO", dx + segW + val * segW, dy, S, xbase)
+    else
+        -- fallback bar: a dark groove with a gold filled portion
+        local x0 = floor(xbase + dx * S); local y0 = floor(dy * S)
+        local w = floor(maxv * 8 * S); local h = floor(8 * S)
+        ImGui.AddRectFilled(x0, y0, x0 + w, y0 + h, 40, 36, 44, 255)
+        ImGui.AddRectFilled(x0, y0, x0 + floor(w * val / maxv), y0 + h, 200, 170, 90, 255)
+    end
+end
+
+-- draw one thermometer patch at doom-space (dx,dy); returns true if it drew a lump
+function W.stPatchThermoPart(name, dx, dy, S, xbase)
+    local w, h = W.patchSize(name)
+    local handle = W.menuTex(name)
+    if not (handle and w) then return false end
+    local x = floor(xbase + dx * S); local y = floor(dy * S)
+    ImGui.AddImage(handle, x, y, x + floor(w * S), y + floor(h * S), 0, 0, 1, 1, 0xFFFFFFFF)
+    return true
+end
+
 function W.drawOptions(sw, sh, S, xbase)
     ImGui.AddText(floor(xbase + 100 * S), floor(18 * S), "OPTIONS", 235, 210, 120, 255)
     for i, it in ipairs(W.OPT_ITEMS) do
-        local dy = 50 + (i - 1) * 16; local sel = (W.menu.cursor == i)
-        local val
-        if it.opt == "mouselook" then val = W.mouseLook and "ON" or "OFF"
-        elseif it.opt == "music" then val = W.musicOn and "ON" or "OFF"
-        else val = string.format("%.2f", W.LOOKSENS or 0.1) end
+        local dy = 44 + (i - 1) * 18; local sel = (W.menu.cursor == i)
         local x = floor(xbase + 60 * S); local y = floor(dy * S)
         local r, g, b = 200, 200, 205; if sel then r, g, b = 255, 240, 150 end
-        ImGui.AddText(x, y, it.text .. ":  " .. val, r, g, b, 255)
+        if it.slider then
+            ImGui.AddText(x, y, it.text, r, g, b, 255)
+            local v = (it.opt == "musicvol") and (W.musicVol or 15) or (W.sfxVol or 15)
+            W.drawThermo(150, dy + 3, S, xbase, clamp(floor(v), 0, 15), 15)
+        else
+            local val
+            if it.opt == "mouselook" then val = W.mouseLook and "ON" or "OFF"
+            elseif it.opt == "music" then val = W.musicOn and "ON" or "OFF"
+            else val = string.format("%.2f", W.LOOKSENS or 0.1) end
+            ImGui.AddText(x, y, it.text .. ":  " .. val, r, g, b, 255)
+        end
         if sel then W.drawSkull(60, dy, S, xbase) end
     end
-    ImGui.AddText(floor(xbase + 40 * S), floor(120 * S), "Left/Right adjust, Enter toggle, Esc back", 170, 170, 180, 220)
+    ImGui.AddText(floor(xbase + 40 * S), floor(150 * S), "Left/Right adjust, Enter toggle, Esc back", 170, 170, 180, 220)
 end
 
 function W.drawFrontend(sw, sh)
@@ -6514,16 +6656,16 @@ function W.drawFrontend(sw, sh)
         W.drawPatch("M_SKILL", "Choose Skill:", 54, 38, S, xbase, false)
         W.drawMenuList(W.SKILL_ITEMS, 48, 63, 16, S, xbase)
         if W.menu.nmConfirm then
-            ImGui.AddRectFilled(0, floor(sh * 0.44), floor(sw), floor(sh * 0.56), 8, 6, 10, 235)
-            ImGui.AddText(floor(sw * 0.5 - 200), floor(sh * 0.48), "are you sure? this skill level isn't even remotely fair.  (y / n)", 235, 120, 90, 255)
+            ImGui.AddRectFilled(0, floor(sh * 0.40), floor(sw), floor(sh * 0.60), 8, 6, 10, 235)
+            W.drawMsgLines(W.STR.NIGHTMARE, sw * 0.5, sh * 0.43, 16 * S, 235, 120, 90, 255)
         end
     elseif scr == "options" then
         W.drawOptions(sw, sh, S, xbase)
     elseif scr == "readthis" then
         W.drawPatchFS("HELP1", sw, sh)
     elseif scr == "quit" then
-        ImGui.AddText(floor(sw * 0.5 - 110), floor(sh * 0.48),
-            BLAD_MODE and "Quit DOOM?  (Y / N)" or "Quit to the title screen?  (Y / N)", 235, 210, 120, 255)
+        local msg = (W.QUITMSGS[W.quitMsgIdx or 1] or W.QUITMSGS[1]) .. "\n\n" .. W.STR.DOSY
+        W.drawMsgLines(msg, sw * 0.5, sh * 0.42, 16 * S, 235, 210, 120, 255)
     end
 end
 
@@ -6546,6 +6688,19 @@ function W.bigText(text, cx, cy, scale, r, g, b, a)
     end
     ImGui.AddText(floor(cx - tw / 2), floor(cy - th / 2), text, r, g, b, a)
     pcall(ImGui.SetWindowFontScale, 1.0)
+end
+
+-- Draw a possibly multi-line string (\n separated) centered on cx, lines stacked
+-- downward from y0. Used for the verbatim DOOM prompts (NIGHTMARE / quit taunts).
+function W.drawMsgLines(text, cx, y0, lh, r, g, b, a)
+    local y = y0
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local w = #line * 7                       -- default-font width estimate
+        local cok, a1 = pcall(ImGui.CalcTextSize, line)
+        if cok then if type(a1) == "number" then w = a1 elseif type(a1) == "table" then w = a1.x or w end end
+        ImGui.AddText(floor(cx - w / 2), floor(y), line, r, g, b, a)
+        y = y + lh
+    end
 end
 
 -- Attract background: load the first map and pose a camera at the player start so
@@ -6595,7 +6750,11 @@ function W.menuSelect()
         if act == "newgame" then m.screen = "skill"; m.cursor = 3; pcall(W.playSfx, "DSPISTOL")
         elseif act == "options" then m.screen = "options"; m.cursor = 1; pcall(W.playSfx, "DSPISTOL")
         elseif act == "readthis" then m.screen = "readthis"; pcall(W.playSfx, "DSPISTOL")
-        elseif act == "quit" then m.screen = "quit"; pcall(W.playSfx, "DSSWTCHN") end
+        elseif act == "quit" then
+            m.screen = "quit"
+            W.quitMsgIdx = (W.quitMsgIdx or 0) % #W.QUITMSGS + 1   -- rotate the taunt (endmsg[])
+            pcall(W.playSfx, "DSSWTCHN")
+        end
     elseif m.screen == "skill" then
         local it = W.SKILL_ITEMS[m.cursor]
         if it.skill == 5 then m.nmConfirm = true; pcall(W.playSfx, "DSSWTCHN") else W.launchGame(it.skill) end
@@ -6613,15 +6772,29 @@ function W.menuBack()
     end
 end
 
+-- Restart the currently-playing track at the new music volume (the volume is
+-- baked into the cached .mid, so a change means a re-convert + replay). Deferred
+-- to the present thread via musPending so every MCI call shares one thread.
+function W.reapplyMusicVol()
+    if W.musPlaying and W.musReq then W.musPending = W.musReq end
+end
+
 function W.optionAdjust(it, dir)
     if it.opt == "mouselook" then W.mouseLook = not W.mouseLook; pcall(W.playSfx, "DSPISTOL")
     elseif it.opt == "music" then
         W.musicOn = not W.musicOn
         if not W.musicOn then pcall(W.requestStop, "opt") elseif W.gameState == "play" and W.map then W.musPending = W.map.name end
         pcall(W.playSfx, "DSPISTOL")
+    elseif it.opt == "musicvol" then
+        W.musicVol = clamp((W.musicVol or 15) + dir, 0, 15)
+        W.reapplyMusicVol(); pcall(W.playSfx, "DSPISTOL")
+    elseif it.opt == "sfxvol" then
+        W.sfxVol = clamp((W.sfxVol or 15) + dir, 0, 15)
+        pcall(W.playSfx, "DSPISTOL")             -- audible preview at the new level
     elseif it.opt == "looksens" then
         W.LOOKSENS = clamp((W.LOOKSENS or 0.1) + dir * 0.02, 0.02, 0.5); pcall(W.playSfx, "DSSTNMOV")
     end
+    pcall(W.saveSettings)                        -- auto-save on every change
 end
 
 function W.updateFrontend(dt)
@@ -7024,7 +7197,11 @@ function W.init()
     W.mouseLook = false
     -- audio / music state (Section M). musicOn is a user toggle (default on);
     -- looping is duration-driven off now() since MCI cannot report position.
+    -- musicVol/sfxVol are 0..15 (DOOM's range), baked into the cached MIDI/WAV.
+    -- These defaults are overridden by W.loadSettings on first activation.
     W.musicOn = true
+    W.musicVol = 15
+    W.sfxVol = 15
     W.musPlaying = false
     W.musStart = 0
     W.musLen = 0
@@ -7088,6 +7265,7 @@ function W.onPresent()
     if not W.active then
         W.active = true
         W.lastTime = now()
+        pcall(W.loadSettings)                -- restore saved options before anything uses them
         pcall(W.autoLoad)
         -- Re-enable: autoLoad only runs once, so resume the already-loaded map's
         -- music (deferred to the musPending service below, on this present thread).
