@@ -2186,6 +2186,7 @@ function W.spawnPlayer(map)
     W.fallVel = 0                           -- vertical velocity for gravity/falling
     W.viewZ = W.floorZAt(W.viewX, W.viewY) + W.EYE
     W.activeSectors = {}                    -- in-progress door/sector movements
+    W.spawnSpecials(map)                     -- arm light/damage/secret specials + tic clock
     if W.health == nil then W.newGame() end -- first level of a fresh game
     W.spawnActors(map)                      -- live monsters/barrels + pickup index
     return true
@@ -2313,11 +2314,14 @@ function W.moveStep(dx, dy)
 end
 
 -- Substep the frame's movement so a fast move (at low fps) cannot tunnel a wall.
+-- Walk-over line specials fire for any trigger line the move crossed.
 function W.tryMove(dx, dy)
+    local ox, oy = W.viewX, W.viewY
     local n = ceil(sqrt(dx * dx + dy * dy) / 8)      -- <= 8 units per collision step
     if n < 1 then n = 1 end
     local sx, sy = dx / n, dy / n
     for _ = 1, n do W.moveStep(sx, sy) end
+    W.crossLines(ox, oy, W.viewX, W.viewY, true, nil)
 end
 
 -- Safety net: if the player is somehow inside a blocking zone (e.g. landed hard
@@ -2343,20 +2347,132 @@ end
 -- both reveals it and unblocks passage with no other change. W.activeSectors[si]
 -- holds at most one in-progress movement per sector index (keyed by sidedef sector).
 ----------------------------------------------------------------------
--- Use-activated (manual) door line specials -> {stay=open-and-hold, blaze=fast}.
--- key is the required keycard; not enforced yet (no inventory), doors open anyway.
+-- Specials engine constants (DOOM units per 35 Hz tic; movers run on a tic clock).
+W.VDOORSPEED = 2      -- door plane units per tic (blazing = x4)
+W.VDOORWAIT  = 150    -- tics a door holds open before auto-closing
+W.PLATSPEED  = 1      -- lift base speed (variants scale this)
+W.PLATWAIT   = 105    -- tics a lift waits down/up (35 * 3)
+W.FLOORSPEED = 1      -- floor mover base speed (turbo = x4)
+W.CEILSPEED  = 1      -- ceiling mover base speed
+W.BUTTONTIME = 35     -- tics a pressed switch stays flipped before reverting
+
+-- Manual (use-activated) door line specials. type = door behaviour; key = keycard
+-- colour required to open; one = one-shot (special cleared, door stays open).
 W.DOOR_SPECIALS = {
-    [1]   = {},                              -- DR door: open, wait, auto-close
-    [26]  = { key = "blue" },                -- DR, blue-locked
-    [27]  = { key = "yellow" },
-    [28]  = { key = "red" },
-    [31]  = { stay = true },                 -- D1 door: open and stay
-    [32]  = { stay = true, key = "blue" },
-    [33]  = { stay = true, key = "red" },
-    [34]  = { stay = true, key = "yellow" },
-    [117] = { blaze = true },                -- DR blazing
-    [118] = { stay = true, blaze = true },   -- D1 blazing
+    [1]   = { type = "normal" },
+    [26]  = { type = "normal", key = "blue" },
+    [27]  = { type = "normal", key = "yellow" },
+    [28]  = { type = "normal", key = "red" },
+    [31]  = { type = "open", one = true },
+    [32]  = { type = "open", one = true, key = "blue" },
+    [33]  = { type = "open", one = true, key = "red" },
+    [34]  = { type = "open", one = true, key = "yellow" },
+    [117] = { type = "blazeRaise" },
+    [118] = { type = "blazeOpen", one = true },
 }
+
+-- Walk-over (cross) line specials -> generic effect. once = W1 (fires one time,
+-- then the special clears); no once = WR (repeatable). mon = monsters may also
+-- trigger; monOnly = only monsters (a player passes with no effect).
+W.CROSS_KIND = {
+    [2]={ev="door",kind="open",once=true}, [3]={ev="door",kind="close",once=true},
+    [4]={ev="door",kind="normal",once=true,mon=true}, [5]={ev="floor",kind="raiseFloor",once=true},
+    [6]={ev="ceil",kind="fastCrushAndRaise",once=true}, [8]={ev="stairs",kind="build8",once=true},
+    [10]={ev="plat",kind="downWaitUpStay",once=true,mon=true}, [12]={ev="light",amount=0,once=true},
+    [13]={ev="light",amount=255,once=true}, [16]={ev="door",kind="close30",once=true},
+    [17]={ev="light",amount="strobe",once=true}, [19]={ev="floor",kind="lowerFloor",once=true},
+    [22]={ev="plat",kind="raiseToNearestAndChange",once=true}, [25]={ev="ceil",kind="crushAndRaise",once=true},
+    [30]={ev="floor",kind="raiseToTexture",once=true}, [35]={ev="light",amount=35,once=true},
+    [36]={ev="floor",kind="turboLower",once=true}, [37]={ev="floor",kind="lowerAndChange",once=true},
+    [38]={ev="floor",kind="lowerFloorToLowest",once=true}, [39]={ev="tele",once=true,mon=true},
+    [40]={ev="combo40",once=true}, [44]={ev="ceil",kind="lowerAndCrush",once=true},
+    [52]={ev="exit"}, [53]={ev="plat",kind="perpetualRaise",once=true},
+    [54]={ev="platstop",once=true}, [56]={ev="floor",kind="raiseFloorCrush",once=true},
+    [57]={ev="ceilstop",once=true}, [58]={ev="floor",kind="raiseFloor24",once=true},
+    [59]={ev="floor",kind="raiseFloor24AndChange",once=true}, [104]={ev="light",amount="off",once=true},
+    [108]={ev="door",kind="blazeRaise",once=true}, [109]={ev="door",kind="blazeOpen",once=true},
+    [100]={ev="stairs",kind="turbo16",once=true}, [110]={ev="door",kind="blazeClose",once=true},
+    [119]={ev="floor",kind="raiseFloorToNearest",once=true}, [121]={ev="plat",kind="blazeDWUS",once=true},
+    [124]={ev="secretexit"}, [125]={ev="tele",once=true,monOnly=true},
+    [130]={ev="floor",kind="raiseFloorTurbo",once=true}, [141]={ev="ceil",kind="silentCrushAndRaise",once=true},
+    [72]={ev="ceil",kind="lowerAndCrush"}, [73]={ev="ceil",kind="crushAndRaise"}, [74]={ev="ceilstop"},
+    [75]={ev="door",kind="close"}, [76]={ev="door",kind="close30"}, [77]={ev="ceil",kind="fastCrushAndRaise"},
+    [79]={ev="light",amount=35}, [80]={ev="light",amount=0}, [81]={ev="light",amount=255},
+    [82]={ev="floor",kind="lowerFloorToLowest"}, [83]={ev="floor",kind="lowerFloor"},
+    [84]={ev="floor",kind="lowerAndChange"}, [86]={ev="door",kind="open"}, [87]={ev="plat",kind="perpetualRaise"},
+    [88]={ev="plat",kind="downWaitUpStay",mon=true}, [89]={ev="platstop"}, [90]={ev="door",kind="normal"},
+    [91]={ev="floor",kind="raiseFloor"}, [92]={ev="floor",kind="raiseFloor24"},
+    [93]={ev="floor",kind="raiseFloor24AndChange"}, [94]={ev="floor",kind="raiseFloorCrush"},
+    [95]={ev="plat",kind="raiseToNearestAndChange"}, [96]={ev="floor",kind="raiseToTexture"},
+    [97]={ev="tele",mon=true}, [98]={ev="floor",kind="turboLower"}, [105]={ev="door",kind="blazeRaise"},
+    [106]={ev="door",kind="blazeOpen"}, [107]={ev="door",kind="blazeClose"}, [120]={ev="plat",kind="blazeDWUS"},
+    [126]={ev="tele",monOnly=true}, [128]={ev="floor",kind="raiseFloorToNearest"},
+    [129]={ev="floor",kind="raiseFloorTurbo"},
+}
+
+-- Switch/button (use-activated) line specials. again = SR/button (texture reverts
+-- after a delay, stays usable); no again = S1 (one-shot). lock = keycard colour.
+W.SWITCH_KIND = {
+    [7]={ev="stairs",kind="build8"}, [9]={ev="donut"}, [11]={ev="exit"},
+    [14]={ev="plat",kind="raiseAndChange",amount=32}, [15]={ev="plat",kind="raiseAndChange",amount=24},
+    [18]={ev="floor",kind="raiseFloorToNearest"}, [20]={ev="plat",kind="raiseToNearestAndChange"},
+    [21]={ev="plat",kind="downWaitUpStay"}, [23]={ev="floor",kind="lowerFloorToLowest"},
+    [29]={ev="door",kind="normal"}, [41]={ev="ceil",kind="lowerToFloor"}, [71]={ev="floor",kind="turboLower"},
+    [49]={ev="ceil",kind="crushAndRaise"}, [50]={ev="door",kind="close"}, [51]={ev="secretexit"},
+    [55]={ev="floor",kind="raiseFloorCrush"}, [101]={ev="floor",kind="raiseFloor"},
+    [102]={ev="floor",kind="lowerFloor"}, [103]={ev="door",kind="open"}, [111]={ev="door",kind="blazeRaise"},
+    [112]={ev="door",kind="blazeOpen"}, [113]={ev="door",kind="blazeClose"}, [122]={ev="plat",kind="blazeDWUS"},
+    [127]={ev="stairs",kind="turbo16"}, [131]={ev="floor",kind="raiseFloorTurbo"},
+    [133]={ev="lockeddoor",kind="blazeOpen",lock="blue"}, [135]={ev="lockeddoor",kind="blazeOpen",lock="red"},
+    [137]={ev="lockeddoor",kind="blazeOpen",lock="yellow"}, [140]={ev="floor",kind="raiseFloor512"},
+    [42]={ev="door",kind="close",again=true}, [43]={ev="ceil",kind="lowerToFloor",again=true},
+    [45]={ev="floor",kind="lowerFloor",again=true}, [60]={ev="floor",kind="lowerFloorToLowest",again=true},
+    [61]={ev="door",kind="open",again=true}, [62]={ev="plat",kind="downWaitUpStay",again=true},
+    [63]={ev="door",kind="normal",again=true}, [64]={ev="floor",kind="raiseFloor",again=true},
+    [66]={ev="plat",kind="raiseAndChange",amount=24,again=true}, [67]={ev="plat",kind="raiseAndChange",amount=32,again=true},
+    [65]={ev="floor",kind="raiseFloorCrush",again=true}, [68]={ev="plat",kind="raiseToNearestAndChange",again=true},
+    [69]={ev="floor",kind="raiseFloorToNearest",again=true}, [70]={ev="floor",kind="turboLower",again=true},
+    [114]={ev="door",kind="blazeRaise",again=true}, [115]={ev="door",kind="blazeOpen",again=true},
+    [116]={ev="door",kind="blazeClose",again=true}, [123]={ev="plat",kind="blazeDWUS",again=true},
+    [132]={ev="floor",kind="raiseFloorTurbo",again=true},
+    [99]={ev="lockeddoor",kind="blazeOpen",lock="blue",again=true},
+    [134]={ev="lockeddoor",kind="blazeOpen",lock="red",again=true},
+    [136]={ev="lockeddoor",kind="blazeOpen",lock="yellow",again=true},
+    [138]={ev="light",amount=255,again=true}, [139]={ev="light",amount=35,again=true},
+}
+
+-- Gun-triggered (impact) line specials.
+W.SHOOT_KIND = {
+    [24]={ev="floor",kind="raiseFloor"},
+    [46]={ev="door",kind="open",again=true},
+    [47]={ev="plat",kind="raiseToNearestAndChange"},
+}
+
+-- Wall switch texture pairs (SW1x <-> SW2x); flipping gives the pressed look.
+W.SWITCH_PAIR = {}
+W.SWITCH_NAMES = {
+    "SW1BRCOM","SW2BRCOM","SW1BRN1","SW2BRN1","SW1BRN2","SW2BRN2","SW1BRNGN","SW2BRNGN",
+    "SW1BROWN","SW2BROWN","SW1COMM","SW2COMM","SW1COMP","SW2COMP","SW1DIRT","SW2DIRT",
+    "SW1EXIT","SW2EXIT","SW1GRAY","SW2GRAY","SW1GRAY1","SW2GRAY1","SW1METAL","SW2METAL",
+    "SW1PIPE","SW2PIPE","SW1SLAD","SW2SLAD","SW1STARG","SW2STARG","SW1STON1","SW2STON1",
+    "SW1STON2","SW2STON2","SW1STONE","SW2STONE","SW1STRTN","SW2STRTN",
+    "SW1BLUE","SW2BLUE","SW1CMT","SW2CMT","SW1GARG","SW2GARG","SW1GSTON","SW2GSTON",
+    "SW1HOT","SW2HOT","SW1LION","SW2LION","SW1SATYR","SW2SATYR","SW1SKIN","SW2SKIN",
+    "SW1VINE","SW2VINE","SW1WOOD","SW2WOOD","SW1PANEL","SW2PANEL","SW1ROCK","SW2ROCK",
+    "SW1MET2","SW2MET2","SW1WDMET","SW2WDMET","SW1BRIK","SW2BRIK","SW1MOD1","SW2MOD1",
+    "SW1ZIM","SW2ZIM","SW1STON6","SW2STON6","SW1TEK","SW2TEK","SW1MARB","SW2MARB",
+    "SW1SKULL","SW2SKULL",
+}
+function W.initSwitchPairs()
+    local L = W.SWITCH_NAMES
+    for i = 1, #L, 2 do W.SWITCH_PAIR[L[i]] = L[i + 1]; W.SWITCH_PAIR[L[i + 1]] = L[i] end
+end
+W.initSwitchPairs()
+
+-- True for specials the forward "use" ray should prompt on and act on.
+function W.isUseSpecial(sp)
+    return (W.DOOR_SPECIALS[sp] ~= nil) or (W.SWITCH_KIND[sp] ~= nil)
+end
 
 -- Ray (x1,y1)->(x2,y2) vs segment (ax,ay)-(bx,by). Returns (t along ray, u along
 -- segment) at the crossing, or nil when parallel. Caller range-checks t,u in [0,1].
@@ -2369,24 +2485,99 @@ function W.raySeg(x1, y1, x2, y2, ax, ay, bx, by)
     return (qx * sy - qy * sx) / den, (qx * ry - qy * rx) / den
 end
 
--- Lowest ceiling among sectors sharing a two-sided line with sector index si.
--- This is the height a Doom door opens to (minus 4). nil if si has no neighbor.
-function W.lowestNeighborCeiling(si)
+-- Surrounding-sector height queries (DOOM p_spec.c). Each walks every two-sided
+-- linedef touching sector index si and inspects the sector on the far side.
+function W.eachNeighbor(si, fn)
     local LD, SD, SE = W.map.linedefs, W.map.sidedefs, W.map.sectors
-    local lo
     for _, ld in ipairs(LD) do
         if ld.front ~= NONE and ld.back ~= NONE then
             local fsd = SD[ld.front + 1]; local bsd = SD[ld.back + 1]
             local other
             if fsd and fsd.sector == si then other = bsd
             elseif bsd and bsd.sector == si then other = fsd end
-            if other then
-                local osec = SE[other.sector + 1]
-                if osec and (not lo or osec.ceil < lo) then lo = osec.ceil end
-            end
+            if other then local o = SE[other.sector + 1]; if o then fn(o, ld) end end
         end
     end
+end
+
+function W.findLowestFloor(si)
+    local lo = W.map.sectors[si + 1].floor
+    W.eachNeighbor(si, function(o) if o.floor < lo then lo = o.floor end end)
     return lo
+end
+function W.findHighestFloor(si)
+    local hi = -500
+    W.eachNeighbor(si, function(o) if o.floor > hi then hi = o.floor end end)
+    return hi
+end
+function W.findLowestCeil(si)
+    local lo = 32000
+    W.eachNeighbor(si, function(o) if o.ceil < lo then lo = o.ceil end end)
+    return lo
+end
+function W.findHighestCeil(si)
+    local hi = 0
+    W.eachNeighbor(si, function(o) if o.ceil > hi then hi = o.ceil end end)
+    return hi
+end
+-- Lowest neighbouring floor strictly above cur (P_FindNextHighestFloor).
+function W.findNextHighestFloor(si, cur)
+    local best
+    W.eachNeighbor(si, function(o)
+        if o.floor > cur and (not best or o.floor < best) then best = o.floor end
+    end)
+    return best or cur
+end
+function W.findMinLight(si, maxl)
+    local m = maxl
+    W.eachNeighbor(si, function(o) if o.light < m then m = o.light end end)
+    return m
+end
+
+-- Iterate every sector whose tag matches (remote specials). fn(si, sec) arms a
+-- mover; sectors already running one are skipped (one per sector, like DOOM's
+-- sec->specialdata). tag 0 is ignored so an untagged remote line does nothing.
+function W.forTagSectors(tag, fn)
+    if not tag or tag == 0 then return false end
+    local rtn = false
+    local SE = W.map.sectors
+    for i = 1, #SE do
+        if SE[i].tag == tag and not W.activeSectors[i - 1] then
+            fn(i - 1, SE[i]); rtn = true
+        end
+    end
+    return rtn
+end
+
+-- Would a plane closing to [nf, nc] crush the player standing in sector si?
+-- Approximates P_ChangeSector's thing-fit test for the one thing we track exactly.
+function W.thingBlocksPlane(si, nf, nc)
+    if (nc - nf) >= W.PHEIGHT then return false end
+    return W.playerInSector(si) and not W.playerDead
+end
+
+-- T_MovePlane: advance one plane of a sector one tic toward dest. Returns "ok",
+-- "pastdest" (reached dest), or "crushed" (a thing is in the way). isCeil selects
+-- the ceiling plane; dir is +1 up / -1 down. Crushers keep moving and hurt; other
+-- movers back off and report crushed so the caller can reverse or stall.
+function W.movePlane(sec, si, speed, dest, crush, isCeil, dir)
+    local cur = isCeil and sec.ceil or sec.floor
+    local compress = (isCeil and dir == -1) or ((not isCeil) and dir == 1)
+    local nh, past
+    if dir == -1 then
+        if cur - speed < dest then nh = dest; past = true else nh = cur - speed end
+    else
+        if cur + speed > dest then nh = dest; past = true else nh = cur + speed end
+    end
+    if compress and W.thingBlocksPlane(si, isCeil and sec.floor or nh, isCeil and nh or sec.ceil) then
+        if crush then
+            if (W.levelTime & 3) == 0 and W.playerInSector(si) then W.hurtPlayer(10) end
+        else
+            return "crushed"                 -- do not move; caller reverses/stalls
+        end
+    end
+    if isCeil then sec.ceil = nh else sec.floor = nh end
+    return past and "pastdest" or "ok"
 end
 
 function W.playerInSector(si)
@@ -2394,22 +2585,315 @@ function W.playerInSector(si)
     return sec ~= nil and W.sectorAt(W.viewX, W.viewY) == sec
 end
 
--- Start (or retrigger) a manual door on the back sector of the used line.
-function W.activateDoor(ld, meta)
+-- T_VerticalDoor: one tic of a door. dir: 1 up, 0 wait-at-top, -1 down, 2 initial wait.
+function W.doorThink(m)
+    local sec, si = m.sec, m.si
+    if m.dir == 0 then
+        m.topcountdown = m.topcountdown - 1
+        if m.topcountdown <= 0 then
+            if m.type == "blazeRaise" then m.dir = -1; pcall(W.playSfx, "DSBDCLS")
+            elseif m.type == "normal" then m.dir = -1; pcall(W.playSfx, "DSDORCLS")
+            elseif m.type == "close30" then m.dir = 1; pcall(W.playSfx, "DSDOROPN") end
+        end
+    elseif m.dir == 2 then
+        m.topcountdown = m.topcountdown - 1
+        if m.topcountdown <= 0 and m.type == "raiseIn5" then
+            m.dir = 1; m.type = "normal"; pcall(W.playSfx, "DSDOROPN")
+        end
+    elseif m.dir == -1 then
+        local res = W.movePlane(sec, si, m.speed, sec.floor, false, true, -1)
+        if res == "pastdest" then
+            if m.type == "blazeRaise" or m.type == "blazeClose" then
+                W.activeSectors[si] = nil; pcall(W.playSfx, "DSBDCLS")
+            elseif m.type == "normal" or m.type == "close" then
+                W.activeSectors[si] = nil
+            elseif m.type == "close30" then
+                m.dir = 0; m.topcountdown = 35 * 30
+            end
+        elseif res == "crushed" then
+            if m.type ~= "blazeClose" and m.type ~= "close" then
+                m.dir = 1; pcall(W.playSfx, "DSDOROPN")     -- reopen: never crush the player
+            end
+        end
+    elseif m.dir == 1 then
+        local res = W.movePlane(sec, si, m.speed, m.topheight, false, true, 1)
+        if res == "pastdest" then
+            if m.type == "blazeRaise" or m.type == "normal" then
+                m.dir = 0; m.topcountdown = m.topwait
+            else
+                W.activeSectors[si] = nil                     -- open / blazeOpen: stay open
+            end
+        end
+    end
+end
+
+-- EV_DoDoor: remote (tagged) door on every sector matching the line tag.
+function W.evDoDoor(ld, kind)
+    return W.forTagSectors(ld.tag, function(si, sec)
+        local m = { kind = "door", sec = sec, si = si, type = kind,
+            topwait = W.VDOORWAIT, speed = W.VDOORSPEED, topcountdown = 0, dir = 1 }
+        if kind == "blazeClose" then
+            m.topheight = W.findLowestCeil(si) - 4; m.dir = -1; m.speed = W.VDOORSPEED * 4
+            pcall(W.playSfx, "DSBDCLS")
+        elseif kind == "close" then
+            m.topheight = W.findLowestCeil(si) - 4; m.dir = -1; pcall(W.playSfx, "DSDORCLS")
+        elseif kind == "close30" then
+            m.topheight = sec.ceil; m.dir = -1; pcall(W.playSfx, "DSDORCLS")
+        elseif kind == "blazeRaise" or kind == "blazeOpen" then
+            m.topheight = W.findLowestCeil(si) - 4; m.speed = W.VDOORSPEED * 4
+            if m.topheight ~= sec.ceil then pcall(W.playSfx, "DSBDOPN") end
+        else -- normal / open
+            m.topheight = W.findLowestCeil(si) - 4
+            if m.topheight ~= sec.ceil then pcall(W.playSfx, "DSDOROPN") end
+        end
+        W.activeSectors[si] = m
+    end)
+end
+
+-- EV_DoLockedDoor: a remote door gated behind a keycard.
+function W.evDoLockedDoor(ld, kind, lock)
+    if lock and not (W.keys and W.keys[lock]) then
+        W.hudMsg = "You need a " .. lock .. " key."; W.hudMsgUntil = now() + 2.0
+        pcall(W.playSfx, "DSOOF"); return false
+    end
+    return W.evDoDoor(ld, kind)
+end
+
+-- EV_VerticalDoor: open (or toggle) a manual door on the sector behind the line.
+function W.evVerticalDoor(ld)
+    local d = W.DOOR_SPECIALS[ld.special]; if not d then return end
+    if d.key and not (W.keys and W.keys[d.key]) then
+        W.hudMsg = "You need a " .. d.key .. " key."; W.hudMsgUntil = now() + 2.0
+        pcall(W.playSfx, "DSOOF"); return
+    end
     if ld.back == NONE then return end
     local bsd = W.map.sidedefs[ld.back + 1]; if not bsd then return end
     local si = bsd.sector
     local sec = W.map.sectors[si + 1]; if not sec then return end
     local m = W.activeSectors[si]
-    if m and m.kind == "door" then                    -- already moving: DR toggles
-        if m.phase == "closing" then m.phase = "opening"
-        elseif (m.phase == "opening" or m.phase == "wait") and not m.stay then m.phase = "closing" end
+    if m and m.kind == "door" then                            -- already active: raise doors toggle
+        if m.type == "normal" or m.type == "blazeRaise" then
+            m.dir = (m.dir == -1) and 1 or -1
+        end
         return
     end
-    local top = (W.lowestNeighborCeiling(si) or sec.ceil) - 4
+    local blaze = (d.type == "blazeRaise" or d.type == "blazeOpen")
+    local top = W.findLowestCeil(si) - 4
     if top < sec.floor then top = sec.floor end
-    W.activeSectors[si] = { kind = "door", sec = sec, si = si, phase = "opening",
-        openTop = top, speed = (meta.blaze and 260) or 100, stay = meta.stay or false }
+    W.activeSectors[si] = { kind = "door", sec = sec, si = si, type = d.type,
+        topheight = top, speed = blaze and (W.VDOORSPEED * 4) or W.VDOORSPEED,
+        dir = 1, topwait = W.VDOORWAIT, topcountdown = 0 }
+    pcall(W.playSfx, blaze and "DSBDOPN" or "DSDOROPN")
+    if d.one then ld.special = 0 end                          -- D1 open: one-shot
+end
+
+-- T_MoveFloor: one tic of a floor mover; on arrival apply any texture/special change.
+function W.floorThink(m)
+    local res = W.movePlane(m.sec, m.si, m.speed, m.dest, m.crush, false, m.dir)
+    if res == "pastdest" then
+        if m.dir == -1 and m.type == "lowerAndChange" then
+            m.sec.special = m.newspecial or 0; m.sec.floorTex = m.texture
+        end
+        W.activeSectors[m.si] = nil; pcall(W.playSfx, "DSPSTOP")
+    end
+end
+
+-- EV_DoFloor: remote floor mover on tagged sectors.
+function W.evDoFloor(ld, kind)
+    local fsd = W.map.sidedefs[ld.front + 1]
+    local fsec = fsd and W.map.sectors[fsd.sector + 1]
+    return W.forTagSectors(ld.tag, function(si, sec)
+        local m = { kind = "floor", sec = sec, si = si, type = kind, crush = false, dir = 1, speed = W.FLOORSPEED }
+        if kind == "lowerFloor" then
+            m.dir = -1; m.dest = W.findHighestFloor(si)
+        elseif kind == "lowerFloorToLowest" then
+            m.dir = -1; m.dest = W.findLowestFloor(si)
+        elseif kind == "turboLower" then
+            m.dir = -1; m.speed = W.FLOORSPEED * 4; m.dest = W.findHighestFloor(si)
+            if m.dest ~= sec.floor then m.dest = m.dest + 8 end
+        elseif kind == "raiseFloorCrush" or kind == "raiseFloor" then
+            if kind == "raiseFloorCrush" then m.crush = true end
+            m.dest = W.findLowestCeil(si); if m.dest > sec.ceil then m.dest = sec.ceil end
+            if kind == "raiseFloorCrush" then m.dest = m.dest - 8 end
+        elseif kind == "raiseFloorTurbo" then
+            m.speed = W.FLOORSPEED * 4; m.dest = W.findNextHighestFloor(si, sec.floor)
+        elseif kind == "raiseFloorToNearest" or kind == "raiseToTexture" then
+            m.dest = W.findNextHighestFloor(si, sec.floor)   -- raiseToTexture lacks tex heights; nearest step
+        elseif kind == "raiseFloor24" then
+            m.dest = sec.floor + 24
+        elseif kind == "raiseFloor512" then
+            m.dest = sec.floor + 512
+        elseif kind == "raiseFloor24AndChange" then
+            m.dest = sec.floor + 24
+            if fsec then sec.floorTex = fsec.floorTex; sec.special = fsec.special end
+        elseif kind == "lowerAndChange" then
+            m.dir = -1; m.dest = W.findLowestFloor(si); m.texture = sec.floorTex; m.newspecial = 0
+            W.eachNeighbor(si, function(o) if o.floor == m.dest then m.texture = o.floorTex; m.newspecial = o.special end end)
+        else
+            m.dest = sec.floor
+        end
+        W.activeSectors[si] = m
+    end)
+end
+
+-- T_PlatRaise: one tic of a lift (down-wait-up, perpetual, raise-and-change).
+function W.platThink(m)
+    local sec, si = m.sec, m.si
+    if m.status == "up" then
+        local res = W.movePlane(sec, si, m.speed, m.high, m.crush, false, 1)
+        if (m.type == "raiseAndChange" or m.type == "raiseToNearestAndChange") and (W.levelTime % 8) == 0 then
+            pcall(W.playSfx, "DSSTNMOV")
+        end
+        if res == "crushed" and not m.crush then
+            m.count = m.wait; m.status = "down"; pcall(W.playSfx, "DSPSTART")
+        elseif res == "pastdest" then
+            m.count = m.wait; m.status = "waiting"; pcall(W.playSfx, "DSPSTOP")
+            if m.type == "blazeDWUS" or m.type == "downWaitUpStay"
+                or m.type == "raiseAndChange" or m.type == "raiseToNearestAndChange" then
+                W.activeSectors[si] = nil
+            end
+        end
+    elseif m.status == "down" then
+        local res = W.movePlane(sec, si, m.speed, m.low, false, false, -1)
+        if res == "pastdest" then m.count = m.wait; m.status = "waiting"; pcall(W.playSfx, "DSPSTOP") end
+    elseif m.status == "waiting" then
+        m.count = m.count - 1
+        if m.count <= 0 then
+            m.status = (sec.floor == m.low) and "up" or "down"
+            pcall(W.playSfx, "DSPSTART")
+        end
+    end
+end
+
+-- EV_DoPlat: remote lift on tagged sectors.
+function W.evDoPlat(ld, kind, amount)
+    if kind == "perpetualRaise" then                         -- resume any in-stasis lifts of this tag
+        for _, m in pairs(W.activeSectors) do
+            if m.kind == "plat" and m.tag == ld.tag and m.status == "in_stasis" then m.status = m.oldstatus or "up" end
+        end
+    end
+    local fsd = W.map.sidedefs[ld.front + 1]
+    local fsec = fsd and W.map.sectors[fsd.sector + 1]
+    return W.forTagSectors(ld.tag, function(si, sec)
+        local m = { kind = "plat", sec = sec, si = si, type = kind, crush = false, tag = ld.tag, count = 0 }
+        if kind == "raiseToNearestAndChange" then
+            m.speed = W.PLATSPEED / 2; if fsec then sec.floorTex = fsec.floorTex end
+            m.high = W.findNextHighestFloor(si, sec.floor); m.wait = 0; m.status = "up"; sec.special = 0
+            pcall(W.playSfx, "DSSTNMOV")
+        elseif kind == "raiseAndChange" then
+            m.speed = W.PLATSPEED / 2; if fsec then sec.floorTex = fsec.floorTex end
+            m.high = sec.floor + (amount or 0); m.wait = 0; m.status = "up"; pcall(W.playSfx, "DSSTNMOV")
+        elseif kind == "downWaitUpStay" or kind == "blazeDWUS" then
+            m.speed = (kind == "blazeDWUS") and (W.PLATSPEED * 8) or (W.PLATSPEED * 4)
+            m.low = W.findLowestFloor(si); if m.low > sec.floor then m.low = sec.floor end
+            m.high = sec.floor; m.wait = W.PLATWAIT; m.status = "down"; pcall(W.playSfx, "DSPSTART")
+        elseif kind == "perpetualRaise" then
+            m.speed = W.PLATSPEED; m.low = W.findLowestFloor(si)
+            if m.low > sec.floor then m.low = sec.floor end
+            m.high = W.findHighestFloor(si); if m.high < sec.floor then m.high = sec.floor end
+            m.wait = W.PLATWAIT; m.status = ((W.levelTime & 1) == 0) and "up" or "down"
+            pcall(W.playSfx, "DSPSTART")
+        else
+            m.speed = W.PLATSPEED; m.low = sec.floor; m.high = sec.floor; m.wait = W.PLATWAIT; m.status = "down"
+        end
+        W.activeSectors[si] = m
+    end)
+end
+
+function W.evStopPlat(ld)
+    for _, m in pairs(W.activeSectors) do
+        if m.kind == "plat" and m.tag == ld.tag and m.status ~= "in_stasis" then
+            m.oldstatus = m.status; m.status = "in_stasis"
+        end
+    end
+    return true
+end
+
+-- T_MoveCeiling: one tic of a ceiling mover / crusher.
+function W.ceilThink(m)
+    local sec, si = m.sec, m.si
+    if m.dir == 1 then
+        local res = W.movePlane(sec, si, m.speed, m.topheight, false, true, 1)
+        if res == "pastdest" then
+            if m.type == "raiseToHighest" then W.activeSectors[si] = nil
+            else m.dir = -1 end                              -- crushers reverse
+            if m.type == "silentCrushAndRaise" then pcall(W.playSfx, "DSPSTOP") end
+        end
+    elseif m.dir == -1 then
+        local res = W.movePlane(sec, si, m.speed, m.bottomheight, m.crush, true, -1)
+        if res == "pastdest" then
+            if m.type == "crushAndRaise" or m.type == "silentCrushAndRaise" then m.speed = W.CEILSPEED; m.dir = 1
+            elseif m.type == "fastCrushAndRaise" then m.dir = 1
+            else W.activeSectors[si] = nil end
+            if m.type == "silentCrushAndRaise" then pcall(W.playSfx, "DSPSTOP") end
+        elseif res == "crushed" then
+            if m.type == "crushAndRaise" or m.type == "silentCrushAndRaise" or m.type == "lowerAndCrush" then
+                m.speed = W.CEILSPEED / 8
+            end
+        end
+    end
+end
+
+-- EV_DoCeiling: remote ceiling mover / crusher on tagged sectors.
+function W.evDoCeiling(ld, kind)
+    return W.forTagSectors(ld.tag, function(si, sec)
+        local m = { kind = "ceil", sec = sec, si = si, type = kind, crush = false, tag = sec.tag }
+        if kind == "fastCrushAndRaise" then
+            m.crush = true; m.topheight = sec.ceil; m.bottomheight = sec.floor + 8; m.dir = -1; m.speed = W.CEILSPEED * 2
+        elseif kind == "crushAndRaise" or kind == "silentCrushAndRaise" then
+            m.crush = true; m.topheight = sec.ceil; m.bottomheight = sec.floor + 8; m.dir = -1; m.speed = W.CEILSPEED
+        elseif kind == "lowerAndCrush" then
+            m.bottomheight = sec.floor + 8; m.dir = -1; m.speed = W.CEILSPEED
+        elseif kind == "lowerToFloor" then
+            m.bottomheight = sec.floor; m.dir = -1; m.speed = W.CEILSPEED
+        elseif kind == "raiseToHighest" then
+            m.topheight = W.findHighestCeil(si); m.dir = 1; m.speed = W.CEILSPEED
+        end
+        W.activeSectors[si] = m
+    end)
+end
+
+function W.evCeilStop(ld)
+    for _, m in pairs(W.activeSectors) do
+        if m.kind == "ceil" and m.tag == ld.tag and m.dir ~= 0 then m.olddir = m.dir; m.dir = 0 end
+    end
+    return true
+end
+
+-- EV_BuildStairs: raise the tagged sector, then step up each same-floor-texture
+-- neighbour reached through a line whose front side is the current step.
+function W.evBuildStairs(ld, kind)
+    local size = (kind == "turbo16") and 16 or 8
+    local speed = (kind == "turbo16") and (W.FLOORSPEED * 4) or (W.FLOORSPEED / 4)
+    local LD, SD, SE = W.map.linedefs, W.map.sidedefs, W.map.sectors
+    return W.forTagSectors(ld.tag, function(si, sec)
+        local secnum = si
+        local height = sec.floor + size
+        local tex = sec.floorTex
+        W.activeSectors[secnum] = { kind = "floor", sec = SE[secnum + 1], si = secnum,
+            type = "stair", crush = false, dir = 1, speed = speed, dest = height }
+        local ok = true
+        while ok do
+            ok = false
+            for _, l in ipairs(LD) do
+                if l.front ~= NONE and l.back ~= NONE then
+                    local lfsd = SD[l.front + 1]; local lbsd = SD[l.back + 1]
+                    if lfsd and lbsd and lfsd.sector == secnum then
+                        local nn = lbsd.sector
+                        local tsec = SE[nn + 1]
+                        if tsec and tsec.floorTex == tex and not W.activeSectors[nn] then
+                            height = height + size
+                            secnum = nn
+                            W.activeSectors[nn] = { kind = "floor", sec = tsec, si = nn,
+                                type = "stair", crush = false, dir = 1, speed = speed, dest = height }
+                            ok = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end)
 end
 
 function W.exitLevel()
@@ -2425,19 +2909,153 @@ function W.exitLevel()
     end
 end
 
--- Dispatch a linedef special hit by the use ray.
-function W.useSpecial(ld)
-    local sp = ld.special
-    local door = W.DOOR_SPECIALS[sp]
-    if door then
-        if door.key and not (W.keys and W.keys[door.key]) then
-            W.hudMsg = "You need a " .. door.key .. " key."
-            W.hudMsgUntil = now() + 2.0
+-- EV_Teleport: move a player/monster to the MT_TELEPORTMAN (thing type 14) in a
+-- sector matching the line tag. side 1 (came from the back) does not teleport.
+function W.evTeleport(ld, side, isPlayer, th)
+    if side == 1 then return false end
+    if not ld.tag or ld.tag == 0 then return false end
+    for _, t in ipairs(W.map.things) do
+        if t.dtype == 14 then
+            local sec = W.sectorAt(t.x, t.y)
+            if sec and sec.tag == ld.tag then
+                if isPlayer then
+                    W.viewX = t.x; W.viewY = t.y; W.fallVel = 0
+                    W.viewZ = W.floorZAt(t.x, t.y) + W.EYE
+                    W.viewAngle = math.rad(t.angle)
+                elseif th then
+                    th.x = t.x; th.y = t.y; th.z = W.floorZFor(W.RADIUS, t.x, t.y)
+                    th.angle = t.angle; th.movecount = 0
+                end
+                pcall(W.playSfx, "DSTELEPT")
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- EV_LightTurnOn / TurnTagLightsOff / strobe-start on tagged sectors.
+function W.evLightTurnOn(ld, amount)
+    if not ld.tag or ld.tag == 0 then return end
+    for i = 1, #W.map.sectors do
+        local sec = W.map.sectors[i]
+        if sec.tag == ld.tag then
+            local si = i - 1
+            if amount == "off" then
+                sec.light = W.findMinLight(si, sec.light)
+            elseif amount == "strobe" then
+                W.spawnStrobe(si, sec, false)
+            elseif amount == 0 then
+                local hi = 0
+                W.eachNeighbor(si, function(o) if o.light > hi then hi = o.light end end)
+                sec.light = hi
+            else
+                sec.light = amount
+            end
+        end
+    end
+end
+
+-- P_ChangeSwitchTexture: flip a wall switch to its pressed variant; buttons (again)
+-- schedule a revert. Scans the front side's top/mid/bottom for a known switch face.
+function W.changeSwitch(ld, again)
+    local fsd = W.map.sidedefs[ld.front + 1]; if not fsd then return end
+    local snd = (ld.special == 11 or ld.special == 51) and "DSSWTCHX" or "DSSWTCHN"
+    if not again then ld.special = 0 end
+    for _, f in ipairs({ "upper", "mid", "lower" }) do
+        local opp = W.SWITCH_PAIR[fsd[f]]
+        if opp then
+            pcall(W.playSfx, snd)
+            if again then W.startButton(ld, fsd, f, fsd[f]) end
+            fsd[f] = opp
             return
         end
-        W.activateDoor(ld, door); return
     end
-    if sp == 11 or sp == 51 then W.exitLevel() end    -- S1 exit switch (normal / secret)
+end
+
+function W.startButton(ld, fsd, field, tex)
+    W.buttons = W.buttons or {}
+    for _, b in ipairs(W.buttons) do if b.ld == ld and b.field == field then return end end
+    W.buttons[#W.buttons + 1] = { ld = ld, sd = fsd, field = field, tex = tex, timer = W.BUTTONTIME }
+end
+
+-- P_CrossSpecialLine: a thing's centre crossed a walk-trigger line.
+function W.crossSpecialLine(ld, side, isPlayer, th)
+    local c = W.CROSS_KIND[ld.special]; if not c then return end
+    if not isPlayer then
+        if c.monOnly then if c.ev ~= "tele" then return end
+        elseif not c.mon then return end
+    elseif c.monOnly then
+        return
+    end
+    local ev = c.ev
+    if ev == "door" then W.evDoDoor(ld, c.kind)
+    elseif ev == "floor" then W.evDoFloor(ld, c.kind)
+    elseif ev == "plat" then W.evDoPlat(ld, c.kind, 0)
+    elseif ev == "ceil" then W.evDoCeiling(ld, c.kind)
+    elseif ev == "stairs" then W.evBuildStairs(ld, c.kind)
+    elseif ev == "tele" then W.evTeleport(ld, side, isPlayer, th)
+    elseif ev == "light" then W.evLightTurnOn(ld, c.amount)
+    elseif ev == "platstop" then W.evStopPlat(ld)
+    elseif ev == "ceilstop" then W.evCeilStop(ld)
+    elseif ev == "combo40" then W.evDoCeiling(ld, "raiseToHighest"); W.evDoFloor(ld, "lowerFloorToLowest")
+    elseif ev == "exit" or ev == "secretexit" then W.exitLevel()
+    end
+    if c.once then ld.special = 0 end
+end
+
+-- P_UseSpecialLine: the player pressed use on a special line. Returns true if the
+-- line responded (so the caller stops looking). Manual doors, switches, exits.
+function W.useSpecialLine(ld)
+    local sp = ld.special
+    if W.DOOR_SPECIALS[sp] then W.evVerticalDoor(ld); return true end
+    local s = W.SWITCH_KIND[sp]; if not s then return false end
+    local ev = s.ev
+    if ev == "exit" or ev == "secretexit" then W.changeSwitch(ld, false); W.exitLevel(); return true end
+    local ok = false
+    if ev == "floor" then ok = W.evDoFloor(ld, s.kind)
+    elseif ev == "plat" then ok = W.evDoPlat(ld, s.kind, s.amount or 0)
+    elseif ev == "door" then ok = W.evDoDoor(ld, s.kind)
+    elseif ev == "ceil" then ok = W.evDoCeiling(ld, s.kind)
+    elseif ev == "stairs" then ok = W.evBuildStairs(ld, s.kind)
+    elseif ev == "lockeddoor" then ok = W.evDoLockedDoor(ld, s.kind, s.lock)
+    elseif ev == "light" then W.evLightTurnOn(ld, s.amount); ok = true
+    elseif ev == "donut" then ok = false                     -- donut movers not implemented
+    end
+    if ok then W.changeSwitch(ld, s.again or false) end
+    return true
+end
+
+-- Called by the forward use ray when the player presses use on a special line.
+function W.useSpecial(ld)
+    if ld then W.useSpecialLine(ld) end
+end
+
+-- P_ShootSpecialLine: player gunfire impacts an impact-special line. Scans forward
+-- for the nearest such line not hidden behind a closer solid wall, then triggers it.
+function W.shootSpecialLine(x1, y1, ang, range)
+    local dx, dy = cos(ang), sin(ang)
+    local x2, y2 = x1 + dx * range, y1 + dy * range
+    local V, LD = W.map.vertexes, W.map.linedefs
+    local best, bestT, wallT = nil, 1e9, 1e9
+    for _, ld in ipairs(LD) do
+        local a = V[ld.v1 + 1]; local b = V[ld.v2 + 1]
+        if a and b then
+            local t, u = W.raySeg(x1, y1, x2, y2, a.x, a.y, b.x, b.y)
+            if t and t >= 0 and t <= 1 and u >= 0 and u <= 1 then
+                if W.SHOOT_KIND[ld.special] then
+                    if t < bestT then best, bestT = ld, t end
+                elseif ld.back == NONE and t < wallT then wallT = t end
+            end
+        end
+    end
+    if not best or bestT > wallT then return end
+    local s = W.SHOOT_KIND[best.special]
+    local ok = false
+    if s.ev == "floor" then ok = W.evDoFloor(best, s.kind)
+    elseif s.ev == "door" then ok = W.evDoDoor(best, s.kind)
+    elseif s.ev == "plat" then ok = W.evDoPlat(best, s.kind, 0) end
+    if ok then W.changeSwitch(best, s.again or false) end
 end
 
 -- Forward "use" ray (USERANGE 64): the nearest special line, unless a solid wall
@@ -2452,7 +3070,7 @@ function W.useLine()
         if a and b then
             local t, u = W.raySeg(x1, y1, x2, y2, a.x, a.y, b.x, b.y)
             if t and t >= 0 and t <= 1 and u >= 0 and u <= 1 then
-                if ld.special and ld.special ~= 0 then
+                if ld.special and ld.special ~= 0 and W.isUseSpecial(ld.special) then
                     if t < bestT then best, bestT = ld, t end
                 elseif ld.back == NONE and t < wallT then
                     wallT = t                          -- solid wall blocks the use ray
@@ -2464,26 +3082,143 @@ function W.useLine()
     return nil
 end
 
--- Advance every in-progress sector movement. Doors open, hold ~4s, then close;
--- a door will not shut while the player stands in it (reverses to open instead).
-function W.updateSectors(dt)
-    if not W.activeSectors then return end
-    for si, m in pairs(W.activeSectors) do
-        local sec = m.sec
-        if m.phase == "opening" then
-            sec.ceil = sec.ceil + m.speed * dt
-            if sec.ceil >= m.openTop then
-                sec.ceil = m.openTop
-                if m.stay then W.activeSectors[si] = nil
-                else m.phase = "wait"; m.waitAt = now() + 4.0 end
+-- Sector light effects (subset of DOOM p_lights.c). Each thinker toggles a sector
+-- light between a bright and a dark level on a tic timer. Cosmetic only.
+function W.spawnStrobe(si, sec, sync)
+    W.lightThinkers = W.lightThinkers or {}
+    local dark = W.findMinLight(si, sec.light)
+    if dark == sec.light then dark = 0 end
+    W.lightThinkers[#W.lightThinkers + 1] = { kind = "strobe", sec = sec,
+        bright = sec.light, dark = dark, brightT = 5, darkT = 15,
+        count = sync and 1 or (1 + (W.pRandom() & 7)) }
+end
+function W.spawnLightFlash(si, sec)
+    W.lightThinkers = W.lightThinkers or {}
+    W.lightThinkers[#W.lightThinkers + 1] = { kind = "flash", sec = sec,
+        bright = sec.light, dark = W.findMinLight(si, sec.light), count = 1 + (W.pRandom() & 7) }
+end
+function W.spawnGlow(si, sec)
+    W.lightThinkers = W.lightThinkers or {}
+    W.lightThinkers[#W.lightThinkers + 1] = { kind = "glow", sec = sec,
+        maxl = sec.light, minl = W.findMinLight(si, sec.light), val = sec.light, dir = -1 }
+end
+function W.lightTick(lt)
+    if lt.kind == "strobe" then
+        lt.count = lt.count - 1
+        if lt.count <= 0 then
+            if lt.sec.light == lt.dark then lt.sec.light = lt.bright; lt.count = lt.brightT
+            else lt.sec.light = lt.dark; lt.count = lt.darkT end
+        end
+    elseif lt.kind == "flash" then
+        lt.count = lt.count - 1
+        if lt.count <= 0 then
+            if lt.sec.light == lt.bright then lt.sec.light = lt.dark; lt.count = 1 + (W.pRandom() & 7)
+            else lt.sec.light = lt.bright; lt.count = 1 + (W.pRandom() & 31) end
+        end
+    elseif lt.kind == "glow" then
+        lt.val = lt.val + lt.dir * 4
+        if lt.val <= lt.minl then lt.val = lt.minl; lt.dir = 1
+        elseif lt.val >= lt.maxl then lt.val = lt.maxl; lt.dir = -1 end
+        lt.sec.light = lt.val
+    end
+end
+
+-- P_PlayerInSpecialSector: damage / secret floors, only while grounded (the player
+-- z equals the floor). radsuit (ironfeet) blocks nukage/slime damage.
+function W.playerInSpecialSector()
+    if W.playerDead then return end
+    local sec = W.sectorAt(W.viewX, W.viewY); if not sec then return end
+    local sp = sec.special or 0
+    if sp == 0 then return end
+    if (W.viewZ - W.EYE) - sec.floor > 1 then return end     -- airborne: no floor contact
+    local suit = W.powers and W.powers.radsuit
+    local due = (W.levelTime & 0x1f) == 0
+    if sp == 5 then
+        if not suit and due then W.hurtPlayer(10) end
+    elseif sp == 7 then
+        if not suit and due then W.hurtPlayer(5) end
+    elseif sp == 16 or sp == 4 then
+        if (not suit or W.pRandom() < 5) and due then W.hurtPlayer(20) end
+    elseif sp == 9 then
+        W.secretCount = (W.secretCount or 0) + 1; sec.special = 0
+        W.hudMsg = "A secret is revealed!"; W.hudMsgUntil = now() + 2.0
+    elseif sp == 11 then
+        if due then W.hurtPlayer(20) end
+        if (W.health or 0) <= 10 then W.exitLevel() end
+    end
+end
+
+-- One 35 Hz tic of every active special: movers, buttons, lights, damage floors.
+function W.tickSpecials()
+    for _, m in pairs(W.activeSectors) do
+        if m.kind == "door" then W.doorThink(m)
+        elseif m.kind == "floor" then W.floorThink(m)
+        elseif m.kind == "plat" then W.platThink(m)
+        elseif m.kind == "ceil" then W.ceilThink(m) end
+    end
+    if W.buttons then
+        for i = #W.buttons, 1, -1 do
+            local b = W.buttons[i]
+            b.timer = b.timer - 1
+            if b.timer <= 0 then
+                if b.sd then b.sd[b.field] = b.tex end
+                pcall(W.playSfx, "DSSWTCHN"); table.remove(W.buttons, i)
             end
-        elseif m.phase == "wait" then
-            if now() >= m.waitAt then m.phase = "closing" end
-        elseif m.phase == "closing" then
-            if W.playerInSector(si) then m.phase = "opening"    -- never crush the player
-            else
-                sec.ceil = sec.ceil - m.speed * dt
-                if sec.ceil <= sec.floor then sec.ceil = sec.floor; W.activeSectors[si] = nil end
+        end
+    end
+    if W.lightThinkers then for _, lt in ipairs(W.lightThinkers) do W.lightTick(lt) end end
+    W.playerInSpecialSector()
+end
+
+-- Accumulate real time into 35 Hz tics and run the specials clock. Bounded so a
+-- long stall cannot spend the frame running hundreds of catch-up tics.
+function W.runTics(dt)
+    if not W.activeSectors then return end
+    W.specAccum = (W.specAccum or 0) + dt
+    local steps = 0
+    while W.specAccum >= W.TIC and steps < 6 do
+        W.specAccum = W.specAccum - W.TIC
+        W.levelTime = (W.levelTime or 0) + 1
+        W.tickSpecials()
+        steps = steps + 1
+    end
+    if W.specAccum > W.TIC * 6 then W.specAccum = 0 end
+end
+
+-- P_SpawnSpecials: after a map loads, arm sector-special thinkers, count secrets,
+-- reset the tic clock, and cache the trigger-line list the movement code scans.
+function W.spawnSpecials(map)
+    W.levelTime = 0; W.specAccum = 0
+    W.buttons = {}; W.lightThinkers = {}
+    W.secretCount = 0; W.totalSecret = 0
+    for i = 1, #map.sectors do
+        local sec = map.sectors[i]; local si = i - 1
+        local sp = sec.special or 0
+        if sp == 1 then W.spawnLightFlash(si, sec)
+        elseif sp == 2 or sp == 3 or sp == 17 then W.spawnStrobe(si, sec, false)
+        elseif sp == 8 then W.spawnGlow(si, sec)
+        elseif sp == 9 then W.totalSecret = W.totalSecret + 1
+        elseif sp == 12 or sp == 13 then W.spawnStrobe(si, sec, true) end
+    end
+    local tl = {}
+    for _, ld in ipairs(map.linedefs) do if (ld.special or 0) ~= 0 then tl[#tl + 1] = ld end end
+    map.triggerLines = tl
+end
+
+-- Fire walk-over line specials whose linedef the actor's centre crossed (old->new).
+function W.crossLines(ox, oy, nx, ny, isPlayer, th)
+    if not (W.map and W.map.triggerLines) then return end
+    if ox == nx and oy == ny then return end
+    local V = W.map.vertexes
+    for _, ld in ipairs(W.map.triggerLines) do
+        if (ld.special or 0) ~= 0 and W.CROSS_KIND[ld.special] then
+            local a = V[ld.v1 + 1]; local b = V[ld.v2 + 1]
+            if a and b then
+                local t, u = W.raySeg(ox, oy, nx, ny, a.x, a.y, b.x, b.y)
+                if t and t >= 0 and t <= 1 and u >= 0 and u <= 1 then
+                    local sd = pointOnLineSide(ox, oy, a.x, a.y, b.x - a.x, b.y - a.y)
+                    W.crossSpecialLine(ld, sd, isPlayer, th)
+                end
             end
         end
     end
@@ -3006,6 +3741,7 @@ function W.monMove(th, dt)
     local ny = th.y + W.DIRY[th.movedir + 1] * sp
     local blk, fz = W.monBlocked(th, nx, ny)
     if not blk then
+        local ox, oy = th.x, th.y
         th.x = nx; th.y = ny
         if inf.float then
             local tz = W.viewZ - W.EYE
@@ -3015,6 +3751,7 @@ function W.monMove(th, dt)
         elseif fz then
             th.z = fz
         end
+        W.crossLines(ox, oy, th.x, th.y, false, th)   -- monster-triggerable specials (teleport etc.)
     else
         th.movecount = 0        -- blocked: re-pick a heading next tick
     end
@@ -3352,6 +4089,7 @@ function W.fireWeapon()
     pcall(W.playSfx, w.sfx)
     if w.melee then
         W.shootTrace(W.viewX, W.viewY, W.viewAngle, w.range, w.dmg())
+        W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, w.range)
         return
     end
     if w.proj then                                   -- rocket / plasma / bfg
@@ -3368,6 +4106,7 @@ function W.fireWeapon()
         if spread then ang = ang + W.hAngle() * (w.wide and 2 or 1) end
         W.shootTrace(W.viewX, W.viewY, ang, w.range, w.dmg())
     end
+    W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, w.range)   -- gun-triggered switch lines
 end
 
 -- Fire scheduler + ammo + auto-switch (P_FireWeapon / A_ReFire / P_CheckAmmo).
@@ -3515,7 +4254,7 @@ function W.update(dt, menuOpen)
         -- per frame so the HUD can prompt when something usable is in reach.
         W.useHint = W.useLine()
         if W.useHint and (kpressed(W.VK.SPACE) or kpressed(W.VK.E)) then W.useSpecial(W.useHint) end
-        W.updateSectors(dt)
+        W.runTics(dt)                        -- doors/lifts/floors/crushers/lights/damage floors (35 Hz)
         W.updateActors(dt)                   -- monster pain/death anim, barrels, fx
 
         -- floor follow with gravity. Stand on the highest floor the body overlaps
