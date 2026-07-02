@@ -6237,6 +6237,10 @@ function W.ensureCacheDir()
     return W.cacheDir ~= nil
 end
 
+-- Rolling stop-point window (ms) for the dead-man playback scheme below; also
+-- the worst-case time music keeps playing after a hard standalone uninject.
+W.MUS_WINDOW_MS = 3000
+
 -- Convert (if needed), cache, and start the music for a map. No-op if music is
 -- off or nothing suitable is found. Any prior track is closed first.
 function W.playMusic(mapName)
@@ -6283,7 +6287,18 @@ function W.playMusic(mapName)
     W.musAlias = W.musAlias or "doommus"
     W.mci('close ' .. W.musAlias)             -- clear any stale alias
     if not W.mci('open "' .. mp .. '" type sequencer alias ' .. W.musAlias) then return end
-    if not W.mci('play ' .. W.musAlias) then W.mci('close ' .. W.musAlias); return end
+    -- Dead-man playback window: a standalone uninject leaves NO context that can
+    -- reach MCI afterwards (every MciSendString on the unload thread returns
+    -- false), so never start an unbounded play. Play only to a stop point a few
+    -- seconds ahead and keep extending it from updateMusic while alive; if the
+    -- script dies, the sequencer runs into the stop point on its own and goes
+    -- silent. Plain unbounded play stays as the fallback if the driver rejects
+    -- the milliseconds time format.
+    W.musDeadman = W.mci('set ' .. W.musAlias .. ' time format milliseconds')
+    local playCmd = 'play ' .. W.musAlias
+    if W.musDeadman then playCmd = playCmd .. ' to ' .. W.MUS_WINDOW_MS end
+    if not W.mci(playCmd) then W.mci('close ' .. W.musAlias); return end
+    W.musWinEnd = W.MUS_WINDOW_MS
     W.musTrack = name
     W.musLen = secs or 0
     W.musStart = now()
@@ -6296,10 +6311,26 @@ end
 function W.updateMusic()
     if not W.musPlaying then return end
     if not W.musicOn then W.requestStop("musicoff"); return end
+    -- Extend the dead-man stop point while we are alive: top the runway back up
+    -- to MUS_WINDOW_MS ahead of the wall-clock position once half of it has been
+    -- consumed (one MCI string every ~1.5s). If an extend is missed across a
+    -- long hitch the sequencer stops at the old point and the next extend's
+    -- play resumes it from there.
+    if W.musDeadman then
+        local posMs = (now() - W.musStart) * 1000
+        if (W.musWinEnd or 0) - posMs < W.MUS_WINDOW_MS * 0.5 then
+            if W.mci('play ' .. W.musAlias .. ' to ' .. floor(posMs + W.MUS_WINDOW_MS)) then
+                W.musWinEnd = posMs + W.MUS_WINDOW_MS
+            end
+        end
+    end
     if W.musLen and W.musLen > 0.5 then
         if now() - W.musStart >= W.musLen - 0.15 then
             W.mci('seek ' .. W.musAlias .. ' to start')
-            W.mci('play ' .. W.musAlias)
+            local playCmd = 'play ' .. W.musAlias
+            if W.musDeadman then playCmd = playCmd .. ' to ' .. W.MUS_WINDOW_MS end
+            W.mci(playCmd)
+            W.musWinEnd = W.MUS_WINDOW_MS
             W.musStart = now()
         end
     end
@@ -7444,9 +7475,11 @@ end
 
 if EventMgr and EventMgr.RegisterHandler then
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_PRESENT) or 7, W.onPresent)
-    -- On unload (uninject), stop the MCI music + any SFX. The MCI sequencer is a
-    -- Windows system device that keeps playing after the script is gone otherwise.
-    -- No retry is possible after unload, so send the stop a few times.
+    -- On unload (uninject), best-effort stop of the MCI music + any SFX. Per the
+    -- in-game log every MciSendString from this thread returns false, so this is
+    -- NOT what silences a standalone uninject: the dead-man playback window (see
+    -- playMusic) guarantees the sequencer stops on its own within MUS_WINDOW_MS
+    -- even when all of these fail.
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_UNLOAD) or 11, function()
         -- The unload thread cannot reach the MCI device by our alias (stop/close
         -- <alias> return false here per the in-game log), so use the alias-free
