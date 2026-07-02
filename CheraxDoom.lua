@@ -1204,6 +1204,16 @@ function W.renderSeg(seg)
     -- is unchanged; this just stops a closed door rendering as an untextured slab.
     local solid = (bs == nil)
 
+    -- r_segs.c sky hack ("worldtop = worldhigh"): when BOTH ceilings are sky,
+    -- the front sector's SKY plane is captured all the way down to the BACK
+    -- ceiling edge, so the band over the portal fills with sky instead of an
+    -- upper wall. This is what lets outdoor areas change ceiling height freely.
+    local capCeil = fs.ceil
+    local bothSky = false
+    if bs and fs.ceilTex == "F_SKY1" and bs.ceilTex == "F_SKY1" then
+        bothSky = true; capCeil = bs.ceil
+    end
+
     -- Per-seg texture setup: resolve this seg's own sidedef, its x/y offsets and
     -- unpeg flags, and fetch the GPU textures ONCE (nil handle => shaded strip).
     local horizon, projScale, viewZ = W.horizon, W.projScale, W.viewZ
@@ -1270,7 +1280,7 @@ function W.renderSeg(seg)
                 -- this column leaves (OLD top/bot, before the clip update below).
                 -- Ceiling band = [top .. front ceiling projection]; floor band =
                 -- [front floor projection .. bot]. Solid and portal cases unify.
-                local yCeilFront  = horizon - (fs.ceil  - viewZ) * projScale * inv
+                local yCeilFront  = horizon - (capCeil  - viewZ) * projScale * inv
                 local yFloorFront = horizon - (fs.floor - viewZ) * projScale * inv
                 W.addPlaneCol(true,  fs.ceilTex,  fs.ceil,  fs.light, col, top, clamp(yCeilFront, top, bot))
                 W.addPlaneCol(false, fs.floorTex, fs.floor, fs.light, col, clamp(yFloorFront, top, bot), bot)
@@ -1300,9 +1310,12 @@ function W.renderSeg(seg)
                     local yFbot = horizon - (fs.floor - viewZ) * projScale * inv
                     local yBtop = horizon - (bs.ceil - viewZ) * projScale * inv
                     local yBbot = horizon - (bs.floor - viewZ) * projScale * inv
-                    -- Sky wins over the upper step: when the back sector's ceiling
-                    -- is F_SKY1, skip the upper wall so the sky backdrop shows through.
-                    if bs.ceil < fs.ceil and bs.ceilTex ~= "F_SKY1" then  -- upper step
+                    -- Upper wall: vanilla draws it unless BOTH ceilings are sky
+                    -- (the sky hack above already filled that band). A back-sky
+                    -- portal with NO upper texture assigned also skips: there is
+                    -- nothing to draw and vanilla would HOM there.
+                    if bs.ceil < fs.ceil and not bothSky
+                        and not (bs.ceilTex == "F_SKY1" and not (sd and sd.upper)) then  -- upper step
                         local a = clamp(yFtop, top, bot); local b2 = clamp(yBtop, top, bot)
                         if b2 > a then
                             if texUp and dUp then
@@ -1408,7 +1421,7 @@ end
 -- affine-mapped quad (ImGui.AddImageQuad) of a TILED flat, with a distance/light
 -- black-overlay shade. When a flat is not yet baked, or a run is wider than one
 -- tiled period (near-horizon LOD), the run degrades to one distance-shaded solid
--- rect. F_SKY1 ceilings are skipped so the cylindrical sky backdrop shows through.
+-- rect. F_SKY1 planes are drawn in SCREEN SPACE by W.drawSkyPlane (vanilla sky).
 ----------------------------------------------------------------------
 -- Map name -> sky wall-texture name. ExMy -> SKY<episode>; DOOM2 MAPxx banded.
 function W.skyTexName(mapName)
@@ -1425,8 +1438,12 @@ end
 -- Fetch (or make) the pooled visplane that owns this column for the given
 -- (isCeil, flat, height, light). Each column is written at most once per plane;
 -- a second subsector wanting the same key at the same column gets a sibling.
+-- F_SKY1 planes all map together regardless of side/height/light (R_FindPlane
+-- forces height=0, light=0 for the sky) and are drawn by W.drawSkyPlane.
 function W.getPlane(isCeil, flat, height, light, col)
-    local key = (isCeil and "C" or "F") .. flat .. "|" .. height .. "|" .. light
+    local key
+    if flat == "F_SKY1" then key = "SKY"
+    else key = (isCeil and "C" or "F") .. flat .. "|" .. height .. "|" .. light end
     local list = W.planeMap[key]
     if not list then list = {}; W.planeMap[key] = list end
     for i = 1, #list do
@@ -1442,18 +1459,19 @@ function W.getPlane(isCeil, flat, height, light, col)
         W.planePool[W.planeCount] = p
     end
     p.isCeil = isCeil; p.flat = flat; p.height = height; p.light = light
+    p.sky = (flat == "F_SKY1")
     p.minx = col; p.maxx = col
     p.tex = nil; p.texTried = false; p.avg = nil
     list[#list + 1] = p
     return p
 end
 
--- Record one column's [yTop,yBot] band into the matching visplane. Sky ceilings
--- and untextured ("-") flats are skipped (the backdrop/plane below shows through).
+-- Record one column's [yTop,yBot] band into the matching visplane. Untextured
+-- ("-") flats are skipped (the plane below shows through). F_SKY1 bands land in
+-- the shared SKY plane and are drawn in screen space (vanilla R_DrawPlanes).
 function W.addPlaneCol(isCeil, flat, height, light, col, yTop, yBot)
     if yBot <= yTop then return end
     if not flat then return end                       -- "-" ceil/floor: nothing to draw
-    if isCeil and flat == "F_SKY1" then return end    -- sky is a backdrop, not a plane
     local p = W.getPlane(isCeil, flat, height, light, col)
     p.top[col] = yTop; p.bot[col] = yBot; p.stamp[col] = W.frameSeq
     if col < p.minx then p.minx = col end
@@ -1637,49 +1655,121 @@ function W.drawPlanes()
     local STEP = W.ROWSTEP
     local BIG = 0x40000000                           -- empty-range top sentinel (> any row)
     for i = 1, W.planeCount do
-        if W.planeDraws >= W.PLANE_BUDGET then break end
         local p = W.planePool[i]
-        W.resolvePlaneTex(p)
-        -- Column sweep (classic DOOM R_MakeSpans): compare each column's row range
-        -- to the PREVIOUS column's ORIGINAL range. Empty range = top > bottom, with
-        -- top = BIG so the "open from top" arm runs. prevT/prevB keep the previous
-        -- column's unmodified range; the four while-loops mutate local copies only.
-        local prevT, prevB = BIG, -1
-        for c = p.minx, p.maxx + 1 do               -- +1 flushes any still-open spans
-            local curT, curB = BIG, -1
-            if c <= p.maxx and p.stamp[c] == W.frameSeq then
-                -- floor (not ceil) the top so the topmost band overlaps the wall
-                -- edge by <STEP px; walls are drawn first, planes over them, so this
-                -- covers the sub-STEP seam that otherwise leaks the background gradient.
-                local tt = floor(p.top[c] / STEP)
-                local bb = floor((p.bot[c] - 1e-3) / STEP)
-                if bb >= tt then curT, curB = tt, bb end
+        if p.sky then
+            -- Vanilla sky branch (R_DrawPlanes): screen-space strips, never
+            -- world-mapped spans. Exempt from the plane budget: a truncated
+            -- sky is a hole straight to the background gradient.
+            W.drawSkyPlane(p)
+        elseif W.planeDraws < W.PLANE_BUDGET then
+            W.resolvePlaneTex(p)
+            -- Column sweep (classic DOOM R_MakeSpans): compare each column's row range
+            -- to the PREVIOUS column's ORIGINAL range. Empty range = top > bottom, with
+            -- top = BIG so the "open from top" arm runs. prevT/prevB keep the previous
+            -- column's unmodified range; the four while-loops mutate local copies only.
+            local prevT, prevB = BIG, -1
+            for c = p.minx, p.maxx + 1 do               -- +1 flushes any still-open spans
+                local curT, curB = BIG, -1
+                if c <= p.maxx and p.stamp[c] == W.frameSeq then
+                    -- floor (not ceil) the top so the topmost band overlaps the wall
+                    -- edge by <STEP px; walls are drawn first, planes over them, so this
+                    -- covers the sub-STEP seam that otherwise leaks the background gradient.
+                    local tt = floor(p.top[c] / STEP)
+                    local bb = floor((p.bot[c] - 1e-3) / STEP)
+                    if bb >= tt then curT, curB = tt, bb end
+                end
+                local t1, b1, t2, b2 = prevT, prevB, curT, curB
+                while t1 < t2 and t1 <= b1 do W.drawSpan(p, t1, ss[t1], c - 1); t1 = t1 + 1 end
+                while b1 > b2 and b1 >= t1 do W.drawSpan(p, b1, ss[b1], c - 1); b1 = b1 - 1 end
+                while t2 < t1 and t2 <= b2 do ss[t2] = c; t2 = t2 + 1 end
+                while b2 > b1 and b2 >= t1 do ss[b2] = c; b2 = b2 - 1 end
+                prevT, prevB = curT, curB
+                if W.planeDraws >= W.PLANE_BUDGET then break end
             end
-            local t1, b1, t2, b2 = prevT, prevB, curT, curB
-            while t1 < t2 and t1 <= b1 do W.drawSpan(p, t1, ss[t1], c - 1); t1 = t1 + 1 end
-            while b1 > b2 and b1 >= t1 do W.drawSpan(p, b1, ss[b1], c - 1); b1 = b1 - 1 end
-            while t2 < t1 and t2 <= b2 do ss[t2] = c; t2 = t2 + 1 end
-            while b2 > b1 and b2 >= t1 do ss[b2] = c; b2 = b2 - 1 end
-            prevT, prevB = curT, curB
-            if W.planeDraws >= W.PLANE_BUDGET then break end
         end
     end
 end
 
--- Cylindrical sky backdrop over the ceiling region [0,horizon]. HFOV=90deg maps
--- exactly one sky-texture width across the screen, offset by view angle; two
--- axis-aligned AddImage pieces cover the single wrap boundary (2 draws total).
-function W.drawSky()
-    if not (W.map and W.map.skyName) then return end
-    local tex = W.getTex(W.map.skyName, false)      -- sky is a wall TEXTURE (patch path)
-    if not tex then return end                       -- backdrop gradient already drawn
-    local sw, horizon = W.viewW, W.horizon
-    local base = (W.viewAngle / (pi * 0.5)) * W.SKY_DIR
-    local u0 = base - floor(base)                    -- frac() into [0,1)
-    local xw = (1.0 - u0) * sw                        -- single wrap boundary on screen
-    local tint = 0xFFFFFFFF
-    ImGui.AddImage(tex, 0, 0, xw, horizon, u0, 0.0, 1.0, 1.0, tint)  -- piece A: u [u0..1]
-    ImGui.AddImage(tex, xw, 0, sw, horizon, 0.0, 0.0, u0, 1.0, tint) -- piece B: u [0..u0]
+-- Draw one SKY visplane exactly like vanilla R_DrawPlanes' sky branch: the
+-- captured columns are filled with SCREEN-SPACE strips of the sky wall texture,
+-- never world-mapped, so the texture's bottom edge can never show at the
+-- horizon (the old backdrop bug: mountains ending in the background gradient).
+-- u: vanilla ANGLETOSKYSHIFT semantics - a full 360 deg turn pans 1024 texels
+-- (90 deg of view = one 256-wide texture), per-column atan (xtoviewangle) so
+-- the sky tracks the wall geometry; W.SKY_DIR keeps the proven pan direction.
+-- v: r_sky.c/r_plane.c - dc_texturemid = 100, dc_iscale = 320/viewwidth, so
+-- texel row = 100 + (y - horizon) * 320/viewW, tiling past the texture height
+-- exactly like vanilla's column wrap. Adjacent columns with identical bands
+-- merge into one AddImage (u is atan-sampled at both ends, runs kept narrow).
+function W.drawSkyPlane(p)
+    local skyName = W.map and W.map.skyName
+    local tex = skyName and W.getTex(skyName, false)   -- sky is a wall TEXTURE (patch path)
+    if not tex then return end                          -- not baked yet: background shows
+    local d = W.texDefs and W.texDefs[skyName]
+    local texW = (d and d.w and d.w > 0) and d.w or 256
+    local texH = (d and d.h and d.h > 0) and d.h or 128
+    local colW, horizon, projScale, cx = W.colW, W.horizon, W.projScale, W.centerX
+    local vScale = 320 / W.viewW                        -- sky texels per screen pixel
+    local baseTexel = W.SKY_DIR * (W.viewAngle / TWO_PI) * 1024
+    local stamp, tops, bots = p.stamp, p.top, p.bot
+    local seq = W.frameSeq
+    local c = p.minx
+    while c <= p.maxx do
+        if stamp[c] == seq and bots[c] > tops[c] then
+            local t0, b0 = tops[c], bots[c]
+            local cE = c
+            while cE < p.maxx and (cE - c) < 23 do       -- merge equal bands
+                local n = cE + 1
+                if stamp[n] == seq and tops[n] == t0 and bots[n] == b0 then cE = n else break end
+            end
+            local x0, x1 = c * colW, (cE + 1) * colW + 0.8
+            local tx0 = baseTexel + (atan((x0 - cx) / projScale) / TWO_PI) * 1024
+            local tx1 = baseTexel + (atan((x1 - cx) / projScale) / TWO_PI) * 1024
+            W.skyStrip(tex, x0, x1, t0, b0, tx0, tx1, texW, texH, horizon, vScale)
+            c = cE + 1
+        else
+            c = c + 1
+        end
+    end
+end
+
+-- One sky quad [x0..x1] x [y0..y1]: split horizontally at texture wrap
+-- boundaries and vertically at texH tile boundaries (the sampler is CLAMP, so
+-- every AddImage must keep uv inside [0,1]). Full bright, no light shade
+-- (vanilla draws the sky with colormaps[0] always).
+function W.skyStrip(tex, x0, x1, y0, y1, tx0, tx1, texW, texH, horizon, vScale)
+    if x1 <= x0 or y1 <= y0 then return end
+    local v0 = 100 + (y0 - horizon) * vScale
+    local v1 = 100 + (y1 - horizon) * vScale
+    if v1 <= v0 then return end
+    local kS = floor(v0 / texH)
+    local kE = floor((v1 - 1e-4) / texH)
+    if kE - kS > 8 then kE = kS + 8 end                 -- vertical tile cap
+    local tw = tx1 - tx0
+    if tw <= 1e-3 then tw = 1e-3 end
+    local xA, txA = x0, tx0
+    while xA < x1 - 1e-3 do
+        local wrapEnd = (floor(txA / texW) + 1) * texW  -- next wrap boundary (texels)
+        local txB = min(tx1, wrapEnd)
+        local xB = (txB >= tx1) and x1 or (x0 + (txB - tx0) / tw * (x1 - x0))
+        if xB > xA + 1e-3 then
+            local u0 = (txA % texW) / texW
+            local u1 = u0 + (txB - txA) / texW
+            if u1 > 1 then u1 = 1 end
+            for k = kS, kE do
+                local lo = max(v0, k * texH)
+                local hi = min(v1, (k + 1) * texH)
+                if hi > lo then
+                    local yA = y0 + (lo - v0) / (v1 - v0) * (y1 - y0)
+                    local yB = y0 + (hi - v0) / (v1 - v0) * (y1 - y0)
+                    ImGui.AddImage(tex, xA, yA, xB, yB,
+                        u0, (lo - k * texH) / texH, u1, (hi - k * texH) / texH, 0xFFFFFFFF)
+                end
+            end
+        end
+        if txB >= tx1 then break end
+        xA, txA = xB, txB
+    end
 end
 
 ----------------------------------------------------------------------
@@ -1911,6 +2001,50 @@ W.MINFO = {
     BOSS = { hp=1000, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
         melee=true, missile=true,
         sight="DSBRSSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSBRSDTH" },
+    -- DOOM II roster + DOOM bosses (info.c mobjinfo, exact numbers).
+    -- mrVile/mrSkel/mrHalf/mrCyber = the per-species P_CheckMissileRange shaping.
+    BOS2 = { hp=500, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
+        melee=true, missile=true,
+        sight="DSKNTSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSKNTDTH" },
+    CPOS = { hp=70, speed=8, r=20, h=56, mass=100, pain=170, countkill=true,
+        melee=false, missile=true,
+        sight="DSPOSIT", sightN=3, act="DSPOSACT", psfx="DSPOPAIN", dsfx="DSPODTH", dsfxN=3 },
+    SSWV = { hp=50, speed=8, r=20, h=56, mass=100, pain=170, countkill=true,
+        melee=false, missile=true,
+        sight="DSSSSIT", act="DSPOSACT", psfx="DSPOPAIN", dsfx="DSSSDTH" },
+    SKUL = { hp=100, speed=8, r=16, h=56, mass=50, pain=256, countkill=false,
+        melee=false, missile=true, float=true, dmg=3, atksfx="DSSKLATK", mrHalf=true,
+        act="DSDMACT", psfx="DSDMPAIN", dsfx="DSFIRXPL" },
+    SKEL = { hp=300, speed=10, r=20, h=56, mass=500, pain=100, countkill=true,
+        melee=true, missile=true, mrSkel=true,
+        sight="DSSKESIT", act="DSSKEACT", psfx="DSPOPAIN", dsfx="DSSKEDTH" },
+    FATT = { hp=600, speed=8, r=48, h=64, mass=1000, pain=80, countkill=true,
+        melee=false, missile=true,
+        sight="DSMANSIT", act="DSPOSACT", psfx="DSMNPAIN", dsfx="DSMANDTH" },
+    BSPI = { hp=500, speed=12, r=64, h=64, mass=600, pain=128, countkill=true,
+        melee=false, missile=true,
+        sight="DSBSPSIT", act="DSBSPACT", psfx="DSDMPAIN", dsfx="DSBSPDTH" },
+    PAIN = { hp=400, speed=8, r=31, h=56, mass=400, pain=128, countkill=true,
+        melee=false, missile=true, float=true,
+        sight="DSPESIT", act="DSDMACT", psfx="DSPEPAIN", dsfx="DSPEDTH" },
+    VILE = { hp=700, speed=15, r=20, h=56, mass=500, pain=10, countkill=true,
+        melee=false, missile=true, mrVile=true,
+        sight="DSVILSIT", act="DSVILACT", psfx="DSVIPAIN", dsfx="DSVILDTH" },
+    SPID = { hp=3000, speed=12, r=128, h=100, mass=1000, pain=40, countkill=true,
+        melee=false, missile=true, mrHalf=true, noRadius=true,
+        sight="DSSPISIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSSPIDTH" },
+    CYBR = { hp=4000, speed=16, r=40, h=110, mass=1000, pain=20, countkill=true,
+        melee=false, missile=true, mrHalf=true, mrCyber=true, noRadius=true,
+        sight="DSCYBSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSCYBDTH" },
+    KEEN = { hp=100, speed=0, r=16, h=72, mass=10000000, pain=256, countkill=true,
+        melee=false, missile=false, psfx="DSKEENPN", dsfx="DSKEENDT" },
+    BBRN = { hp=250, speed=0, r=16, h=16, mass=10000000, pain=255, countkill=false,
+        melee=false, missile=false, psfx="DSBOSPN", dsfx="DSBOSDTH" },
+    -- The arch-vile flame (MT_FIRE): a stateful non-blocking, non-shootable fx
+    -- species; its THING_SPR entry has r=nil so hitscan/missiles/blocking all
+    -- ignore it, and only the "die" chain exists (S_FIRE1..30 ends removing it).
+    FIRE = { hp=1000, speed=0, r=20, h=16, mass=100, pain=0, countkill=false,
+        melee=false, missile=false },
     BAR1 = { hp=20, speed=0, r=10, h=42, mass=100, pain=0, noblood=true },
 }
 
@@ -1929,6 +2063,7 @@ POSS = {
  die={{f="H",t=5},{f="I",t=5,a="scream"},{f="J",t=5,a="fall"},{f="K",t=5},{f="L",t=-1}},
  xdie={{f="M",t=5},{f="N",t=5,a="xscream"},{f="O",t=5,a="fall"},{f="P",t=5},{f="Q",t=5},
        {f="R",t=5},{f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+ raise={{f="K",t=5},{f="J",t=5},{f="I",t=5},{f="H",t=5}},
 },
 SPOS = {
  stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
@@ -1939,6 +2074,7 @@ SPOS = {
  die={{f="H",t=5},{f="I",t=5,a="scream"},{f="J",t=5,a="fall"},{f="K",t=5},{f="L",t=-1}},
  xdie={{f="M",t=5},{f="N",t=5,a="xscream"},{f="O",t=5,a="fall"},{f="P",t=5},{f="Q",t=5},
        {f="R",t=5},{f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+ raise={{f="L",t=5},{f="K",t=5},{f="J",t=5},{f="I",t=5},{f="H",t=5}},
 },
 TROO = {
  stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
@@ -1949,6 +2085,7 @@ TROO = {
  die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=6},{f="L",t=6,a="fall"},{f="M",t=-1}},
  xdie={{f="N",t=5},{f="O",t=5,a="xscream"},{f="P",t=5},{f="Q",t=5,a="fall"},{f="R",t=5},
        {f="S",t=5},{f="T",t=5},{f="U",t=-1}},
+ raise={{f="M",t=8},{f="L",t=8},{f="K",t=6},{f="J",t=6},{f="I",t=6}},
 },
 SARG = {
  stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
@@ -1957,6 +2094,7 @@ SARG = {
  atk={{f="E",t=8,a="face"},{f="F",t=8,a="face"},{f="G",t=8,a="sargatk"}},
  pain={{f="H",t=2},{f="H",t=2,a="pain"}},
  die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=4},{f="L",t=4,a="fall"},{f="M",t=4},{f="N",t=-1}},
+ raise={{f="N",t=5},{f="M",t=5},{f="L",t=5},{f="K",t=5},{f="J",t=5},{f="I",t=5}},
 },
 HEAD = {
  stnd={{f="A",t=10,a="look"}},
@@ -1964,6 +2102,7 @@ HEAD = {
  atk={{f="B",t=5,a="face"},{f="C",t=5,a="face"},{f="D",t=5,a="headatk",b=true}},
  pain={{f="E",t=3},{f="E",t=3,a="pain"},{f="F",t=6}},
  die={{f="G",t=8},{f="H",t=8,a="scream"},{f="I",t=8},{f="J",t=8},{f="K",t=8,a="fall"},{f="L",t=-1}},
+ raise={{f="L",t=8},{f="K",t=8},{f="J",t=8},{f="I",t=8},{f="H",t=8},{f="G",t=8}},
 },
 BOSS = {
  stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
@@ -1973,6 +2112,161 @@ BOSS = {
  pain={{f="H",t=2},{f="H",t=2,a="pain"}},
  die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=8},{f="L",t=8,a="fall"},{f="M",t=8},
       {f="N",t=8},{f="O",t=-1,a="bossdeath"}},
+ raise={{f="O",t=8},{f="N",t=8},{f="M",t=8},{f="L",t=8},{f="K",t=8},{f="J",t=8},{f="I",t=8}},
+},
+BOS2 = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=8,a="face"},{f="F",t=8,a="face"},{f="G",t=8,a="bruisatk"}},
+ pain={{f="H",t=2},{f="H",t=2,a="pain"}},
+ die={{f="I",t=8},{f="J",t=8,a="scream"},{f="K",t=8},{f="L",t=8,a="fall"},{f="M",t=8},
+      {f="N",t=8},{f="O",t=-1}},
+ raise={{f="O",t=8},{f="N",t=8},{f="M",t=8},{f="L",t=8},{f="K",t=8},{f="J",t=8},{f="I",t=8}},
+},
+CPOS = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=10,a="face"},{f="F",t=4,a="cposatk",b=true},{f="E",t=4,a="cposatk",b=true},
+      {f="F",t=1,a="cposrefire",nx=2}},
+ pain={{f="G",t=3},{f="G",t=3,a="pain"}},
+ die={{f="H",t=5},{f="I",t=5,a="scream"},{f="J",t=5,a="fall"},{f="K",t=5},{f="L",t=5},
+      {f="M",t=5},{f="N",t=-1}},
+ xdie={{f="O",t=5},{f="P",t=5,a="xscream"},{f="Q",t=5,a="fall"},{f="R",t=5},{f="S",t=5},{f="T",t=-1}},
+ raise={{f="N",t=5},{f="M",t=5},{f="L",t=5},{f="K",t=5},{f="J",t=5},{f="I",t=5},{f="H",t=5}},
+},
+SSWV = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=10,a="face"},{f="F",t=10,a="face"},{f="G",t=4,a="cposatk",b=true},
+      {f="F",t=6,a="face"},{f="G",t=4,a="cposatk",b=true},{f="F",t=1,a="cposrefire",nx=2}},
+ pain={{f="H",t=3},{f="H",t=3,a="pain"}},
+ die={{f="I",t=5},{f="J",t=5,a="scream"},{f="K",t=5,a="fall"},{f="L",t=5},{f="M",t=-1}},
+ xdie={{f="N",t=5},{f="O",t=5,a="xscream"},{f="P",t=5,a="fall"},{f="Q",t=5},{f="R",t=5},
+       {f="S",t=5},{f="T",t=5},{f="U",t=5},{f="V",t=-1}},
+ raise={{f="M",t=5},{f="L",t=5},{f="K",t=5},{f="J",t=5},{f="I",t=5}},
+},
+SKUL = {
+ stnd={{f="A",t=10,a="look",b=true},{f="B",t=10,a="look",b=true}},
+ run={{f="A",t=6,a="chase",b=true},{f="B",t=6,a="chase",b=true}},
+ atk={{f="C",t=10,a="face",b=true},{f="D",t=4,a="skullatk",b=true},{f="C",t=4,b=true},
+      {f="D",t=4,b=true,nx=3}},
+ pain={{f="E",t=3,b=true},{f="E",t=3,a="pain",b=true}},
+ die={{f="F",t=6,b=true},{f="G",t=6,a="scream",b=true},{f="H",t=6,b=true},
+      {f="I",t=6,a="fall",b=true},{f="J",t=6},{f="K",t=6}},
+},
+SKEL = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=2,a="chase"},{f="A",t=2,a="chase"},{f="B",t=2,a="chase"},{f="B",t=2,a="chase"},
+      {f="C",t=2,a="chase"},{f="C",t=2,a="chase"},{f="D",t=2,a="chase"},{f="D",t=2,a="chase"},
+      {f="E",t=2,a="chase"},{f="E",t=2,a="chase"},{f="F",t=2,a="chase"},{f="F",t=2,a="chase"}},
+ matk={{f="G",t=0,a="face"},{f="G",t=6,a="skelwhoosh"},{f="H",t=6,a="face"},{f="I",t=6,a="skelfist"}},
+ atk={{f="J",t=0,a="face",b=true},{f="J",t=10,a="face",b=true},{f="K",t=10,a="skelmissile"},
+      {f="K",t=10,a="face"}},
+ pain={{f="L",t=5},{f="L",t=5,a="pain"}},
+ die={{f="L",t=7},{f="M",t=7},{f="N",t=7,a="scream"},{f="O",t=7,a="fall"},{f="P",t=7},{f="Q",t=-1}},
+ raise={{f="Q",t=5},{f="P",t=5},{f="O",t=5},{f="N",t=5},{f="M",t=5},{f="L",t=5}},
+},
+FATT = {
+ stnd={{f="A",t=15,a="look"},{f="B",t=15,a="look"}},
+ run={{f="A",t=4,a="chase"},{f="A",t=4,a="chase"},{f="B",t=4,a="chase"},{f="B",t=4,a="chase"},
+      {f="C",t=4,a="chase"},{f="C",t=4,a="chase"},{f="D",t=4,a="chase"},{f="D",t=4,a="chase"},
+      {f="E",t=4,a="chase"},{f="E",t=4,a="chase"},{f="F",t=4,a="chase"},{f="F",t=4,a="chase"}},
+ atk={{f="G",t=20,a="fatraise"},{f="H",t=10,a="fatatk1",b=true},{f="I",t=5,a="face"},
+      {f="G",t=5,a="face"},{f="H",t=10,a="fatatk2",b=true},{f="I",t=5,a="face"},
+      {f="G",t=5,a="face"},{f="H",t=10,a="fatatk3",b=true},{f="I",t=5,a="face"},{f="G",t=5,a="face"}},
+ pain={{f="J",t=3},{f="J",t=3,a="pain"}},
+ die={{f="K",t=6},{f="L",t=6,a="scream"},{f="M",t=6,a="fall"},{f="N",t=6},{f="O",t=6},
+      {f="P",t=6},{f="Q",t=6},{f="R",t=6},{f="S",t=6},{f="T",t=-1,a="bossdeath"}},
+ raise={{f="R",t=5},{f="Q",t=5},{f="P",t=5},{f="O",t=5},{f="N",t=5},{f="M",t=5},{f="L",t=5},{f="K",t=5}},
+},
+BSPI = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ -- run[1] is S_BSPI_SIGHT (a 20-tic freeze before the walk); the run loop
+ -- re-enters at 2 (ch.loop), exactly like vanilla RUN12 -> RUN1.
+ run={{f="A",t=20},{f="A",t=3,a="babymetal"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="B",t=3,a="chase"},{f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="babymetal"},
+      {f="D",t=3,a="chase"},{f="E",t=3,a="chase"},{f="E",t=3,a="chase"},{f="F",t=3,a="chase"},
+      {f="F",t=3,a="chase"},loop=2},
+ atk={{f="A",t=20,a="face",b=true},{f="G",t=4,a="bspiatk",b=true},{f="H",t=4,b=true},
+      {f="H",t=1,a="spidrefire",b=true,nx=2}},
+ pain={{f="I",t=3},{f="I",t=3,a="pain"}},
+ die={{f="J",t=20,a="scream"},{f="K",t=7,a="fall"},{f="L",t=7},{f="M",t=7},{f="N",t=7},
+      {f="O",t=7},{f="P",t=-1,a="bossdeath"}},
+ raise={{f="P",t=5},{f="O",t=5},{f="N",t=5},{f="M",t=5},{f="L",t=5},{f="K",t=5},{f="J",t=5}},
+},
+PAIN = {
+ stnd={{f="A",t=10,a="look"}},
+ run={{f="A",t=3,a="chase"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"}},
+ atk={{f="D",t=5,a="face"},{f="E",t=5,a="face"},{f="F",t=5,a="face",b=true},{f="F",t=0,a="painatk",b=true}},
+ pain={{f="G",t=6},{f="G",t=6,a="pain"}},
+ die={{f="H",t=8,b=true},{f="I",t=8,a="scream",b=true},{f="J",t=8,b=true},{f="K",t=8,b=true},
+      {f="L",t=8,a="paindie",b=true},{f="M",t=8,b=true}},
+ raise={{f="M",t=8},{f="L",t=8},{f="K",t=8},{f="J",t=8},{f="I",t=8},{f="H",t=8}},
+},
+VILE = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=2,a="vilechase"},{f="A",t=2,a="vilechase"},{f="B",t=2,a="vilechase"},
+      {f="B",t=2,a="vilechase"},{f="C",t=2,a="vilechase"},{f="C",t=2,a="vilechase"},
+      {f="D",t=2,a="vilechase"},{f="D",t=2,a="vilechase"},{f="E",t=2,a="vilechase"},
+      {f="E",t=2,a="vilechase"},{f="F",t=2,a="vilechase"},{f="F",t=2,a="vilechase"}},
+ atk={{f="G",t=0,a="vilestart",b=true},{f="G",t=10,a="face",b=true},{f="H",t=8,a="viletarget",b=true},
+      {f="I",t=8,a="face",b=true},{f="J",t=8,a="face",b=true},{f="K",t=8,a="face",b=true},
+      {f="L",t=8,a="face",b=true},{f="M",t=8,a="face",b=true},{f="N",t=8,a="face",b=true},
+      {f="O",t=8,a="vileattack",b=true},{f="P",t=20,b=true}},
+ heal={{f="[",t=10,b=true},{f="\\",t=10,b=true},{f="]",t=10,b=true}},
+ pain={{f="Q",t=5},{f="Q",t=5,a="pain"}},
+ die={{f="Q",t=7},{f="R",t=7,a="scream"},{f="S",t=7,a="fall"},{f="T",t=7},{f="U",t=7},
+      {f="V",t=7},{f="W",t=7},{f="X",t=5},{f="Y",t=5},{f="Z",t=-1}},
+},
+FIRE = {
+ -- S_FIRE1..30 (the arch-vile flame): 2-tic fullbright chain, ends removing the
+ -- thing (keyed "die" so the chain-end rule vanishes it like vanilla S_NULL).
+ die={{f="A",t=2,a="startfire",b=true},{f="B",t=2,a="fire",b=true},{f="A",t=2,a="fire",b=true},
+      {f="B",t=2,a="fire",b=true},{f="C",t=2,a="firecrackle",b=true},{f="B",t=2,a="fire",b=true},
+      {f="C",t=2,a="fire",b=true},{f="B",t=2,a="fire",b=true},{f="C",t=2,a="fire",b=true},
+      {f="D",t=2,a="fire",b=true},{f="C",t=2,a="fire",b=true},{f="D",t=2,a="fire",b=true},
+      {f="C",t=2,a="fire",b=true},{f="D",t=2,a="fire",b=true},{f="E",t=2,a="fire",b=true},
+      {f="D",t=2,a="fire",b=true},{f="E",t=2,a="fire",b=true},{f="D",t=2,a="fire",b=true},
+      {f="E",t=2,a="firecrackle",b=true},{f="F",t=2,a="fire",b=true},{f="E",t=2,a="fire",b=true},
+      {f="F",t=2,a="fire",b=true},{f="E",t=2,a="fire",b=true},{f="F",t=2,a="fire",b=true},
+      {f="G",t=2,a="fire",b=true},{f="H",t=2,a="fire",b=true},{f="G",t=2,a="fire",b=true},
+      {f="H",t=2,a="fire",b=true},{f="G",t=2,a="fire",b=true},{f="H",t=2,a="fire",b=true}},
+},
+SPID = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="metal"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="metal"},{f="C",t=3,a="chase"},{f="D",t=3,a="chase"},{f="D",t=3,a="chase"},
+      {f="E",t=3,a="metal"},{f="E",t=3,a="chase"},{f="F",t=3,a="chase"},{f="F",t=3,a="chase"}},
+ atk={{f="A",t=20,a="face",b=true},{f="G",t=4,a="sposatk",b=true},{f="H",t=4,a="sposatk",b=true},
+      {f="H",t=1,a="spidrefire",b=true,nx=2}},
+ pain={{f="I",t=3},{f="I",t=3,a="pain"}},
+ die={{f="J",t=20,a="scream"},{f="K",t=10,a="fall"},{f="L",t=10},{f="M",t=10},{f="N",t=10},
+      {f="O",t=10},{f="P",t=10},{f="Q",t=10},{f="R",t=10},{f="S",t=30},{f="S",t=-1,a="bossdeath"}},
+},
+CYBR = {
+ stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
+ run={{f="A",t=3,a="hoof"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},{f="B",t=3,a="chase"},
+      {f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="metal"},{f="D",t=3,a="chase"}},
+ atk={{f="E",t=6,a="face"},{f="F",t=12,a="cyberatk"},{f="E",t=12,a="face"},{f="F",t=12,a="cyberatk"},
+      {f="E",t=12,a="face"},{f="F",t=12,a="cyberatk"}},
+ pain={{f="G",t=10,a="pain"}},
+ die={{f="H",t=10},{f="I",t=10,a="scream"},{f="J",t=10},{f="K",t=10},{f="L",t=10},
+      {f="M",t=10,a="fall"},{f="N",t=10},{f="O",t=10},{f="P",t=30},{f="P",t=-1,a="bossdeath"}},
+},
+KEEN = {
+ stnd={{f="A",t=-1}},
+ pain={{f="M",t=4},{f="M",t=8,a="pain"}},
+ die={{f="A",t=6},{f="B",t=6},{f="C",t=6,a="scream"},{f="D",t=6},{f="E",t=6},{f="F",t=6},
+      {f="G",t=6},{f="H",t=6},{f="I",t=6},{f="J",t=6},{f="K",t=6,a="keendie"},{f="L",t=-1}},
+},
+BBRN = {
+ stnd={{f="A",t=-1}},
+ pain={{f="B",t=36,a="brainpain"}},
+ die={{f="A",t=100,a="brainscream"},{f="A",t=10},{f="A",t=10},{f="A",t=-1,a="braindie"}},
 },
 BAR1 = {
  stnd={{f="A",t=6},{f="B",t=6}},
@@ -2108,6 +2402,9 @@ W.WEAPONS = {
 -- Synthetic THING_SPR id (never in a WAD) for pooled fx + projectiles: r=nil so
 -- they never block movement; drawn via the normal sprite path (th.spr overrides).
 W.THING_SPR[30040] = { spr="MISL", seq="A", rot=false, kind="fx" }
+-- Arch-vile flame (MT_FIRE): spawned dynamically by A_VileTarget. r=nil keeps
+-- it out of blocking, hitscan, autoaim and radius damage entirely.
+W.THING_SPR[30041] = { spr="FIRE", seq="A", rot=false, kind="fx" }
 
 -- Missiles (info.c mobjinfo, exact). speed = units per TIC (fracunits/tic).
 -- dmg = the direct-hit multiplier ((P_Random%8+1)*dmg). splash = A_Explode
@@ -2127,6 +2424,16 @@ W.PROJ = {
         speed=10, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=5 },
     BRUISERSHOT = { flySpr="BAL7", fly="AB", flyT=4, boomSpr="BAL7", boom="CDE",    boomT=6,
         speed=15, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=8 },
+    -- MT_TRACER (revenant): homing (A_Tracer steers it every 4th tic toward
+    -- th.tracer); explodes with the barrel boom sound like vanilla.
+    TRACER      = { flySpr="FATB", fly="AB", flyT=2, boomSpr="FBXP", boom="ABC",    boomT={8,6,4},
+        speed=10, r=11, splash=0,   seesfx="DSSKEATK", dsfx="DSBAREXP", dmg=10, homing=true },
+    -- MT_FATSHOT (mancubus): flies as MANF, explodes with the ROCKET's MISL B-D.
+    FATSHOT     = { flySpr="MANF", fly="AB", flyT=4, boomSpr="MISL", boom="BCD",    boomT={8,6,4},
+        speed=20, r=6,  splash=0,   seesfx="DSFIRSHT", dsfx="DSFIRXPL", dmg=8 },
+    -- MT_ARACHPLAZ (arachnotron plasma).
+    ARACHPLAZ   = { flySpr="APLS", fly="AB", flyT=5, boomSpr="APBX", boom="ABCDE",  boomT=5,
+        speed=25, r=13, splash=0,   seesfx="DSPLASMA", dsfx="DSFIRXPL", dmg=5 },
 }
 
 -- H.2b: build an 8-slot frame/rotation index from the sprite namespace once.
@@ -4058,8 +4365,13 @@ function W.spawnActors(map)
                     th.states = W.SSTATES[e.spr]
                     th.hp = (th.info and th.info.hp) or W.MONHP[e.spr] or 60
                     th.z = W.floorZFor((th.info and th.info.r) or e.r or 20, th.x, th.y)
+                    if e.hang then                            -- MF_SPAWNCEILING (Keen)
+                        local hsec = W.sectorAt(th.x, th.y)
+                        if hsec then th.z = hsec.ceil - ((th.info and th.info.h) or 72) end
+                    end
                     th.dead = false
-                    th.momx = 0; th.momy = 0
+                    th.momx = 0; th.momy = 0; th.momz = 0
+                    th.skullfly = false; th.tracer = nil
                     th.movedir = 8; th.movecount = 0
                     th.reaction = (W.skill == 5) and 0 or 8   -- info reactiontime (0 on NM)
                     th.threshold = 0
@@ -4147,9 +4459,10 @@ function W.spawnProjectile(kind, x, y, z, ang, momz, owner)
     th.momx = cos(ang) * p.speed; th.momy = sin(ang) * p.speed; th.momz = momz or 0
     th.life = 20 * 35                                -- leak guard, tics (not vanilla)
     th.removed = false; th.dead = false; th.pk = nil; th._slot = idx
-    th.info = nil; th.states = nil
+    th.info = nil; th.states = nil; th.tracer = nil
     if p.seesfx then pcall(W.playSfx, p.seesfx) end
     W.thinkers[#W.thinkers + 1] = th
+    return th
 end
 
 -- P_ExplodeMissile: stop, enter the explosion frames (first tics shortened by
@@ -4211,6 +4524,33 @@ function W.projThink(th)
     end
     th.life = th.life - 1
     if th.life <= 0 then th.removed = true; return end
+    -- A_Tracer (revenant missile): every 4th tic leave a puff + smoke trail and
+    -- steer at most TRACEANGLE (16.875 deg) toward the tracer target; the climb
+    -- eases toward the aim slope by 1/8 unit per call (p_enemy.c).
+    if th.proj.homing and ((W.levelTime or 0) & 3) == 0 then
+        W.spawnFx("PUFF", "ABCD", 4, th.x, th.y, th.z, { bright = true })
+        W.spawnFx("PUFF", "BCBCD", 4, th.x - th.momx, th.y - th.momy, th.z, { momz = 1 })
+        local tgt = th.tracer
+        if tgt and W.tgtAlive(tgt) then
+            local tx, ty, tz = W.tgtPos(tgt)
+            local exact = atan(ty - th.y, tx - th.x)
+            local cur = (th.angle or 0) * (pi / 180)
+            local diff = angNorm(exact - cur)
+            local TRACE = 16.875 * (pi / 180)
+            if diff > TRACE then cur = cur + TRACE
+            elseif diff < -TRACE then cur = cur - TRACE
+            else cur = exact end
+            th.angle = cur * (180 / pi)
+            local sp = th.proj.speed
+            th.momx = cos(cur) * sp; th.momy = sin(cur) * sp
+            local ddx, ddy = tx - th.x, ty - th.y
+            local dist = sqrt(ddx * ddx + ddy * ddy) / sp
+            if dist < 1 then dist = 1 end
+            local slope = (tz + 40 - th.z) / dist
+            if slope < th.momz then th.momz = th.momz - 0.125
+            else th.momz = th.momz + 0.125 end
+        end
+    end
     local mx, my, mz = th.momx, th.momy, th.momz
     local hspeed = sqrt(mx * mx + my * my); if hspeed < 1 then hspeed = 1 end
     local steps = ceil(hspeed / 8)
@@ -4301,7 +4641,17 @@ function W.setMState(th, key, idx)
         local st = ch[idx]
         if not st then
             if key == "die" or key == "xdie" then th.removed = true; th.think = nil; return end
-            idx = 1; st = ch[1]
+            if key == "atk" or key == "matk" or key == "pain"
+                or key == "heal" or key == "raise" then
+                -- one-shot chains fall back into the hunt (or stand, for
+                -- run-less species like Keen and the boss brain)
+                key = chains.run and "run" or "stnd"
+                ch = chains[key]
+                if not ch then return end
+                idx = 1; st = ch[1]
+            else
+                idx = ch.loop or 1; st = ch[idx]   -- stnd/run loop (ch.loop: BSPI sight skip)
+            end
         end
         th.stkey = key; th.stidx = idx
         if st.f then th.frame = st.f end
@@ -4322,12 +4672,17 @@ end
 function W.advMState(th)
     local ch = th.states and th.states[th.stkey]
     if not ch then return end
-    local nidx = th.stidx + 1
+    local cur = ch[th.stidx]
+    -- nx = explicit in-chain jump (vanilla nextstate loops: chaingunner /
+    -- spider / arachnotron refire bursts, the lost soul's charge frames)
+    local nidx = (cur and cur.nx) or (th.stidx + 1)
     if not ch[nidx] then
         local k = th.stkey
-        if k == "atk" or k == "pain" then W.setMState(th, "run", 1); return end
+        if k == "atk" or k == "matk" or k == "pain" or k == "heal" or k == "raise" then
+            W.setMState(th, (th.states.run and "run") or "stnd", 1); return
+        end
         if k == "die" or k == "xdie" then th.removed = true; th.think = nil; return end
-        nidx = 1
+        nidx = ch.loop or 1
     end
     W.setMState(th, th.stkey, nidx)
 end
@@ -4444,9 +4799,20 @@ function W.checkMissileRange(th)
     if (th.reaction or 0) > 0 then return false end
     local dist = W.distToTarget(th) - 64
     if not (th.info and th.info.melee) then dist = dist - 128 end  -- no melee: fire more
-    local e = W.THING_SPR[th.dtype]
-    if e and e.spr == "HEAD" then dist = dist * 0.5 end
+    -- per-species shaping, exactly P_CheckMissileRange (p_enemy.c): the vile
+    -- refuses past 14*64; the revenant refuses INSIDE 196 (fist range) and
+    -- halves; cyberdemon/mastermind/lost soul halve; cyberdemon caps at 160.
+    local mi = th.info
+    if mi then
+        if mi.mrVile and dist > 14 * 64 then return false end
+        if mi.mrSkel then
+            if dist < 196 then return false end
+            dist = dist * 0.5
+        end
+        if mi.mrHalf then dist = dist * 0.5 end
+    end
     if dist > 200 then dist = 200 end
+    if mi and mi.mrCyber and dist > 160 then dist = 160 end
     if W.pRandom() < dist then return false end
     return true
 end
@@ -4646,7 +5012,21 @@ function W.spawnMonMissile(th, kind)
     local dx, dy = tx - th.x, ty - th.y
     local flight = sqrt(dx * dx + dy * dy) / p.speed
     if flight < 1 then flight = 1 end
-    W.spawnProjectile(kind, th.x, th.y, (th.z or 0) + 32, ang, (tz - (th.z or 0)) / flight, th)
+    return W.spawnProjectile(kind, th.x, th.y, (th.z or 0) + 32, ang, (tz - (th.z or 0)) / flight, th)
+end
+
+-- Mancubus volley half: P_SpawnMissile aims at the target, then the SECOND
+-- missile of each pair gets its angle skewed by offDeg with the horizontal
+-- momentum recomputed (A_FatAttack1/2/3 post-spawn adjustment). momz keeps the
+-- original aim solution, exactly like vanilla (only momx/momy are redone).
+function W.spawnMonMissileOff(th, kind, offDeg)
+    local mo = W.spawnMonMissile(th, kind)
+    if not mo then return end
+    local ang = (mo.angle + offDeg) * (pi / 180)
+    mo.angle = mo.angle + offDeg
+    local sp = mo.proj.speed
+    mo.momx = cos(ang) * sp; mo.momy = sin(ang) * sp
+    return mo
 end
 
 ----------------------------------------------------------------------
@@ -4698,7 +5078,9 @@ function W.actChase(th)
     end
     if mi.melee and W.checkMeleeRange(th) then
         if mi.atksfx then pcall(W.playSfx, mi.atksfx) end
-        W.setMState(th, "atk", 1)
+        -- species with a SEPARATE melee chain (revenant fist) use matk; the
+        -- rest share the atk chain and branch inside the attack action
+        W.setMState(th, (th.states and th.states.matk) and "matk" or "atk", 1)
         return
     end
     if mi.missile and (W.skill == 5 or (th.movecount or 0) <= 0) and W.checkMissileRange(th) then
@@ -4802,24 +5184,328 @@ function W.actExplode(th)
     W.radiusDamage(th.x, th.y, 128, 128, th, th.target)
 end
 
--- A_BossDeath: on E1M8, when the last Baron dies, floor tag 666 lowers to the
--- lowest neighbour (opens the exit yard). Other boss maps need species that are
--- not simulated yet, so only the E1 gate is armed.
+-- A_BossDeath (p_enemy.c, full port): per-map / per-species victory triggers.
+-- MAP07: mancubi -> floor 666 lowers, arachnotrons -> floor 667 raises.
+-- E1M8 barons / E4M8 spider -> floor 666 lowers; E4M6 cyberdemon -> blaze door
+-- 666 opens; E2M8 cyberdemon / E3M8 spider -> the level simply ends.
 function W.actBossDeath(th)
-    local nm = W.map and W.map.name or ""
-    local ep, mp = nm:match("^E(%d)M(%d)$")
-    if not (ep == "1" and mp == "8") then return end
     local e = W.THING_SPR[th.dtype]
-    if not (e and e.spr == "BOSS") then return end
-    if W.playerDead then return end
+    local spr = e and e.spr
+    if not spr then return end
+    local nm = W.map and W.map.name or ""
+    local commercial = (W.gameMode == "commercial")
+    local ep, mp
+    if commercial then
+        mp = tonumber(nm:match("^MAP(%d%d)$"))
+        if mp ~= 7 then return end
+        if spr ~= "FATT" and spr ~= "BSPI" then return end
+    else
+        ep, mp = nm:match("^E(%d)M(%d)$")
+        ep, mp = tonumber(ep), tonumber(mp)
+        if not (ep and mp) then return end
+        if ep == 1 then if mp ~= 8 or spr ~= "BOSS" then return end
+        elseif ep == 2 then if mp ~= 8 or spr ~= "CYBR" then return end
+        elseif ep == 3 then if mp ~= 8 or spr ~= "SPID" then return end
+        elseif ep == 4 then
+            if mp == 6 then if spr ~= "CYBR" then return end
+            elseif mp == 8 then if spr ~= "SPID" then return end
+            else return end
+        else
+            if mp ~= 8 then return end
+        end
+    end
+    if W.playerDead then return end                       -- no one alive: no victory
     for _, o in ipairs(W.thinkers) do
         if o ~= th and o.think == "monster" and not o.dead and not o.removed then
             local oe = W.THING_SPR[o.dtype]
-            if oe and oe.spr == "BOSS" then return end     -- a Baron still lives
+            if oe and oe.spr == spr then return end       -- another boss still lives
         end
     end
-    W.evDoFloor({ tag = 666, front = NONE, back = NONE }, "lowerFloorToLowest")
+    local junk = { tag = 666, front = NONE, back = NONE }
+    if commercial then
+        if spr == "FATT" then W.evDoFloor(junk, "lowerFloorToLowest"); return end
+        junk.tag = 667; W.evDoFloor(junk, "raiseToTexture"); return
+    end
+    if ep == 1 then W.evDoFloor(junk, "lowerFloorToLowest"); return end
+    if ep == 4 and mp == 6 then W.evDoDoor(junk, "blazeOpen"); return end
+    if ep == 4 and mp == 8 then W.evDoFloor(junk, "lowerFloorToLowest"); return end
+    W.exitLevel(false)
 end
+
+-- A_CPosAttack (chaingunner + SS burst): one aimed hitscan per call, spread
+-- (P_Random-P_Random)<<20 like A_PosAttack, shotgun bark per shot.
+function W.actCPosAttack(th)
+    if not th.target then return end
+    pcall(W.playSfx, "DSSHOTGN")
+    W.faceTarget(th)
+    local base = (th.angle or 0) * (pi / 180)
+    local sz = W.monShootZ(th)
+    local slope = W.aimLineAttack(th, th.x, th.y, sz, base, 2048)
+    local ang = base + (W.pRandom() - W.pRandom()) * (pi / 2048)
+    W.lineAttack(th, th.x, th.y, sz, ang, 2048, slope, (W.pRandom() % 5 + 1) * 3)
+end
+
+-- A_CPosRefire / A_SpidRefire: keep the burst rolling until the target is
+-- gone or out of sight (then back to the run chain).
+function W.actCPosRefire(th)
+    W.faceTarget(th)
+    if W.pRandom() < 40 then return end
+    if not th.target or not W.tgtAlive(th.target) or not W.monsterSees(th) then
+        W.setMState(th, "run", 1)
+    end
+end
+
+function W.actSpidRefire(th)
+    W.faceTarget(th)
+    if W.pRandom() < 10 then return end
+    if not th.target or not W.tgtAlive(th.target) or not W.monsterSees(th) then
+        W.setMState(th, "run", 1)
+    end
+end
+
+function W.actBspiAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.spawnMonMissile(th, "ARACHPLAZ")
+end
+
+function W.actCyberAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.spawnMonMissile(th, "ROCKET")
+end
+
+-- walk-noise wrappers: sound, then the normal A_Chase decision ladder
+function W.actHoof(th) pcall(W.playSfx, "DSHOOF"); W.actChase(th) end
+function W.actMetal(th) pcall(W.playSfx, "DSMETAL"); W.actChase(th) end
+function W.actBabyMetal(th) pcall(W.playSfx, "DSBSPWLK"); W.actChase(th) end
+
+-- A_SkullAttack: hurl the lost soul at its target (SKULLSPEED 20/tic); the
+-- charge itself is ticked by W.skullFlyMove until it slams.
+function W.actSkullAttack(th)
+    if not th.target then return end
+    th.skullfly = true
+    if th.info and th.info.atksfx then pcall(W.playSfx, th.info.atksfx) end
+    W.faceTarget(th)
+    local an = (th.angle or 0) * (pi / 180)
+    th.momx = cos(an) * 20; th.momy = sin(an) * 20
+    local _, _, tz, hh = W.tgtPos(th.target)
+    local dist = W.distToTarget(th) / 20
+    if dist < 1 then dist = 1 end
+    th.momz = (tz + hh * 0.5 - (th.z or 0)) / dist
+end
+
+-- A_PainShootSkull: spit a live lost soul prestep units along angleDeg. Vanilla
+-- refuses past 20 souls on the level; one spat into a wall dies on the spot.
+function W.actPainShootSkull(th, angleDeg)
+    local count = 0
+    for _, o in ipairs(W.thinkers) do
+        if o.think == "monster" and not o.removed then
+            local oe = W.THING_SPR[o.dtype]
+            if oe and oe.spr == "SKUL" then count = count + 1 end
+        end
+    end
+    if count > 20 then return end
+    local an = angleDeg * (pi / 180)
+    local prestep = 4 + 3 * (((th.info and th.info.r) or 31) + 16) / 2
+    local x = th.x + cos(an) * prestep
+    local y = th.y + sin(an) * prestep
+    local skull = W.spawnDynMonster(3006, x, y, (th.z or 0) + 8)
+    if not skull then return end
+    if W.monBlocked(skull, x, y) then
+        W.damageMobj(skull, 10000, th, th)
+        return
+    end
+    skull.target = th.target
+    W.actSkullAttack(skull)
+end
+
+function W.actPainAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.actPainShootSkull(th, th.angle or 0)
+end
+
+function W.actPainDie(th)
+    W.actFall(th)
+    local a = th.angle or 0
+    W.actPainShootSkull(th, a + 90)
+    W.actPainShootSkull(th, a + 180)
+    W.actPainShootSkull(th, a + 270)
+end
+
+function W.actSkelWhoosh(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    pcall(W.playSfx, "DSSKESWG")
+end
+
+function W.actSkelFist(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    if W.checkMeleeRange(th) then
+        pcall(W.playSfx, "DSSKEPCH")
+        W.damageMobj(th.target, (W.pRandom() % 10 + 1) * 6, th, th)
+    end
+end
+
+-- A_SkelMissile: launch the homing TRACER from 16 above the usual missile
+-- origin, advance it one tic, and hand it the target to steer toward.
+function W.actSkelMissile(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    th.z = (th.z or 0) + 16
+    local mo = W.spawnMonMissile(th, "TRACER")
+    th.z = th.z - 16
+    if mo then
+        mo.x = mo.x + mo.momx; mo.y = mo.y + mo.momy
+        mo.tracer = th.target
+    end
+end
+
+-- Mancubus: three 2-missile volleys walking a FATSPREAD (11.25 deg) fan.
+function W.actFatRaise(th)
+    W.faceTarget(th)
+    pcall(W.playSfx, "DSMANATK")
+end
+
+function W.actFatAttack1(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.spawnMonMissile(th, "FATSHOT")
+    W.spawnMonMissileOff(th, "FATSHOT", 90 / 8)
+end
+
+function W.actFatAttack2(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.spawnMonMissile(th, "FATSHOT")
+    W.spawnMonMissileOff(th, "FATSHOT", -2 * 90 / 8)
+end
+
+function W.actFatAttack3(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    W.spawnMonMissileOff(th, "FATSHOT", -90 / 16)
+    W.spawnMonMissileOff(th, "FATSHOT", 90 / 16)
+end
+
+-- A_VileChase: while walking, raise the first raisable corpse in the step
+-- direction (has a raise chain, lying still, fits where it lies), else chase.
+function W.actVileChase(th)
+    local md = th.movedir or 8
+    if md < 8 then
+        local sp = (th.info and th.info.speed) or 15
+        local vx = th.x + W.DIRX[md + 1] * sp
+        local vy = th.y + W.DIRY[md + 1] * sp
+        local vr = (th.info and th.info.r) or 20
+        for _, o in ipairs(W.thinkers) do
+            if o.think == "monster" and o.dead and not o.removed and o.tics == -1
+                and o.states and o.states.raise then
+                local oe = W.THING_SPR[o.dtype]
+                local mi = o.info or (oe and W.MINFO[oe.spr])
+                local maxdist = ((mi and mi.r) or (oe and oe.r) or 20) + vr
+                if abs(o.x - vx) <= maxdist and abs(o.y - vy) <= maxdist then
+                    o.momx, o.momy = 0, 0
+                    if not W.monBlocked(o, o.x, o.y) then     -- corpse must fit to stand
+                        local tmp = th.target
+                        th.target = o; W.faceTarget(th); th.target = tmp
+                        W.setMState(th, "heal", 1)
+                        pcall(W.playSfx, "DSSLOP")
+                        o.dead = false
+                        o.hp = (mi and mi.hp) or 100
+                        o.target = nil
+                        W.setMState(o, "raise", 1)
+                        return
+                    end
+                end
+            end
+        end
+    end
+    W.actChase(th)
+end
+
+function W.actVileStart(th) pcall(W.playSfx, "DSVILATK") end
+
+-- A_VileTarget: spawn the flame on the victim. Vanilla passes target->x for
+-- BOTH coordinates (kept: A_StartFire re-seats it in front of the victim on
+-- the same tic whenever the vile still has sight).
+function W.actVileTarget(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    local tx, _, tz = W.tgtPos(th.target)
+    local fire = W.spawnDynMonster(30041, tx, tx, tz)
+    if not fire then return end
+    th.tracer = fire
+    fire.target = th                    -- the vile
+    fire.tracer = th.target             -- the victim
+    W.setMState(fire, "die", 1)         -- S_FIRE1..30; entry action = A_StartFire
+end
+
+-- A_Fire: keep the flame 24 units in front of the victim's own facing while
+-- the vile still has line of sight to them.
+function W.actFire(th)
+    local dest = th.tracer
+    local vile = th.target
+    if not dest or type(vile) ~= "table" then return end
+    if not W.monsterSees(vile, dest) then return end
+    local tx, ty, tz = W.tgtPos(dest)
+    local an = (dest == "player") and W.viewAngle or ((dest.angle or 0) * (pi / 180))
+    th.x = tx + 24 * cos(an)
+    th.y = ty + 24 * sin(an)
+    th.z = tz
+end
+
+function W.actStartFire(th) pcall(W.playSfx, "DSFLAMST"); W.actFire(th) end
+function W.actFireCrackle(th) pcall(W.playSfx, "DSFLAME"); W.actFire(th) end
+
+-- A_VileAttack: 20 direct damage + the victim hurled upward + a 70/70 radius
+-- blast centered on the flame moved between the vile and the victim.
+function W.actVileAttack(th)
+    if not th.target then return end
+    W.faceTarget(th)
+    if not W.monsterSees(th, th.target) then return end
+    pcall(W.playSfx, "DSBAREXP")
+    W.damageMobj(th.target, 20, th, th)
+    if th.target == "player" then
+        W.momz = 1000 / 100             -- vanilla: momz = 1000*FRACUNIT/mass
+    end
+    -- (monster victims keep their feet: walkers have no vertical momentum here)
+    local an = (th.angle or 0) * (pi / 180)
+    local fire = th.tracer
+    if not fire then return end
+    local tx, ty = W.tgtPos(th.target)
+    fire.x = tx - 24 * cos(an)
+    fire.y = ty - 24 * sin(an)
+    W.radiusDamage(fire.x, fire.y, 70, 70, fire, th)
+end
+
+-- A_KeenDie: when the last Commander Keen dies, door tag 666 opens.
+function W.actKeenDie(th)
+    W.actFall(th)
+    for _, o in ipairs(W.thinkers) do
+        if o ~= th and o.think == "monster" and not o.dead and not o.removed then
+            local oe = W.THING_SPR[o.dtype]
+            if oe and oe.spr == "KEEN" then return end
+        end
+    end
+    W.evDoDoor({ tag = 666, front = NONE, back = NONE }, "open")
+end
+
+-- Boss brain (MAP30). The spitter/cube spawner machinery is not simulated;
+-- the brain itself is shootable, screams in a sweep of rocket bursts, and its
+-- death ends the level (A_BrainDie = G_ExitLevel).
+function W.actBrainPain(th) pcall(W.playSfx, "DSBOSPN") end
+
+function W.actBrainScream(th)
+    for x = th.x - 196, th.x + 320, 8 do
+        W.spawnFx("MISL", "BCD", { 8, 6, 4 }, x, th.y - 320,
+            128 + W.pRandom() * 2, { bright = true })
+    end
+    pcall(W.playSfx, "DSBOSDTH")
+end
+
+function W.actBrainDie(th) W.exitLevel(false) end
 
 W.MACT = {
     look = W.actLook, chase = W.actChase, face = W.faceTarget,
@@ -4827,12 +5513,89 @@ W.MACT = {
     sargatk = W.actSargAttack, headatk = W.actHeadAttack, bruisatk = W.actBruisAttack,
     scream = W.actScream, xscream = W.actXScream, pain = W.actPain, fall = W.actFall,
     explode = W.actExplode, bossdeath = W.actBossDeath,
+    cposatk = W.actCPosAttack, cposrefire = W.actCPosRefire, spidrefire = W.actSpidRefire,
+    bspiatk = W.actBspiAttack, cyberatk = W.actCyberAttack,
+    hoof = W.actHoof, metal = W.actMetal, babymetal = W.actBabyMetal,
+    skullatk = W.actSkullAttack, painatk = W.actPainAttack, paindie = W.actPainDie,
+    skelwhoosh = W.actSkelWhoosh, skelfist = W.actSkelFist, skelmissile = W.actSkelMissile,
+    fatraise = W.actFatRaise, fatatk1 = W.actFatAttack1, fatatk2 = W.actFatAttack2,
+    fatatk3 = W.actFatAttack3,
+    vilechase = W.actVileChase, vilestart = W.actVileStart, viletarget = W.actVileTarget,
+    vileattack = W.actVileAttack, fire = W.actFire, startfire = W.actStartFire,
+    firecrackle = W.actFireCrackle, keendie = W.actKeenDie,
+    brainpain = W.actBrainPain, brainscream = W.actBrainScream, braindie = W.actBrainDie,
 }
 
--- One monster tic: damage-thrust knockback (friction 0.90625, STOPSPEED 1/16),
--- then the state clock (t=-1 corpses never advance).
+-- MF_SKULLFLY charge, one tic: no friction ever (p_mobj.c), bounce momz off
+-- floor/ceiling (P_ZMovement), and the slam rules (PIT_CheckThing): hitting a
+-- shootable thing deals (P_Random%8+1)*damage, then the skull stops and drops
+-- back to its spawn state; a wall stops it the same way without damage.
+function W.skullFlyMove(th)
+    local mh = (th.info and th.info.h) or 56
+    th.z = (th.z or 0) + (th.momz or 0)
+    local sec0 = W.sectorAt(th.x, th.y)
+    if sec0 then
+        if th.z < sec0.floor then th.z = sec0.floor; th.momz = -(th.momz or 0) end
+        if th.z + mh > sec0.ceil then th.z = sec0.ceil - mh; th.momz = -(th.momz or 0) end
+    end
+    local mx, my = th.momx or 0, th.momy or 0
+    local sp = sqrt(mx * mx + my * my)
+    if sp < 0.01 then W.skullSlam(th, nil); return end
+    local steps = ceil(sp / 8)
+    local sdt = 1 / steps
+    local R = (th.info and th.info.r) or 16
+    for _ = 1, steps do
+        local ox, oy = th.x, th.y
+        local sx, sy = mx * sdt, my * sdt
+        local seglen = sqrt(sx * sx + sy * sy); if seglen < 1e-4 then seglen = 1e-4 end
+        local ndx, ndy = sx / seglen, sy / seglen
+        -- shootable things (and the player) along this substep
+        local hit, hitAlong = nil, seglen
+        for _, o in ipairs(W.map.things) do
+            if o ~= th and o.think == "monster" and not o.dead and not o.removed
+                and (o.flags & 0x0010) == 0 then
+                local oe = W.THING_SPR[o.dtype]
+                if oe and oe.r then
+                    local rx, ry = o.x - ox, o.y - oy
+                    local along = rx * ndx + ry * ndy
+                    if along > 0 and along < hitAlong then
+                        local perp = abs(rx * (-ndy) + ry * ndx)
+                        if perp <= oe.r + R then hit = o; hitAlong = along end
+                    end
+                end
+            end
+        end
+        local prx, pry = W.viewX - ox, W.viewY - oy
+        local palong = prx * ndx + pry * ndy
+        if not W.playerDead and palong > 0 and palong < hitAlong then
+            local perp = abs(prx * (-ndy) + pry * ndx)
+            if perp <= W.RADIUS + R then hit = "player"; hitAlong = palong end
+        end
+        if hit then
+            th.x = ox + ndx * hitAlong; th.y = oy + ndy * hitAlong
+            W.skullSlam(th, hit); return
+        end
+        if W.monBlocked(th, ox + sx, oy + sy) then W.skullSlam(th, nil); return end
+        th.x = ox + sx; th.y = oy + sy
+    end
+end
+
+function W.skullSlam(th, hit)
+    if hit then
+        local dmg = (W.pRandom() % 8 + 1) * ((th.info and th.info.dmg) or 3)
+        W.damageMobj(hit, dmg, th, th)
+    end
+    th.skullfly = false
+    th.momx = 0; th.momy = 0; th.momz = 0
+    W.setMState(th, "stnd", 1)      -- vanilla: back to spawnstate
+end
+
+-- One monster tic: skull charge OR damage-thrust knockback (friction 0.90625,
+-- STOPSPEED 1/16), then the state clock (t=-1 corpses never advance).
 function W.monsterThink(th)
-    if th.momx and (th.momx ~= 0 or th.momy ~= 0) then
+    if th.skullfly then
+        W.skullFlyMove(th)
+    elseif th.momx and (th.momx ~= 0 or th.momy ~= 0) then
         local nx, ny = th.x + th.momx, th.y + th.momy
         if not W.monBlocked(th, nx, ny) then th.x = nx; th.y = ny end
         th.momx = th.momx * 0.90625; th.momy = th.momy * 0.90625
@@ -4844,6 +5607,35 @@ function W.monsterThink(th)
     if th.tics == -1 then return end
     th.tics = (th.tics or 1) - 1
     if th.tics <= 0 then W.advMState(th) end
+end
+
+-- Dynamically spawn a live monster-species thing mid-level (the pain
+-- elemental's lost souls, the arch-vile flame). Reuses freed thing slots so it
+-- renders, blocks and takes damage like a map-spawned actor.
+function W.spawnDynMonster(dtype, x, y, z)
+    local e = W.THING_SPR[dtype]; if not e then return nil end
+    local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
+    local th = W.map.things[idx]
+    if not th then th = {}; W.map.things[idx] = th end
+    th.dtype = dtype; th.x = x; th.y = y; th.z = z; th.angle = 0; th.flags = 0
+    th.think = "monster"; th.proj = nil; th.pk = nil; th._slot = idx
+    th.info = W.MINFO[e.spr]; th.states = W.SSTATES[e.spr]
+    th.hp = (th.info and th.info.hp) or 100
+    th.dead = false; th.removed = false
+    th.momx = 0; th.momy = 0; th.momz = 0
+    th.movedir = 8; th.movecount = 0
+    th.reaction = (W.skill == 5) and 0 or 8
+    th.threshold = 0; th.justhit = false; th.justattacked = false
+    th.ambush = false; th.shadow = false; th.skullfly = false
+    th.target = nil; th.tracer = nil; th.spr = nil; th.bright = false
+    th.stkey = nil; th.stidx = 1; th.frame = e.seq:sub(1, 1); th.tics = -1
+    if th.states and th.states.stnd then
+        local st = th.states.stnd[1]
+        th.stkey = "stnd"; th.stidx = 1
+        th.frame = st.f; th.tics = st.t; th.bright = st.b or false
+    end
+    W.thinkers[#W.thinkers + 1] = th
+    return th
 end
 
 W.THINK = { monster = W.monsterThink, fx = W.fxThink, proj = W.projThink }
@@ -5115,6 +5907,7 @@ end
 -- corpse (a barrel's target is its killer, so A_Explode credits the chain).
 function W.killMobj(th, source)
     th.dead = true
+    th.skullfly = false                     -- vanilla P_KillMobj clears MF_SKULLFLY
     th.target = source
     local mi = th.info
     if mi and mi.countkill then W.killCount = (W.killCount or 0) + 1 end
@@ -5140,7 +5933,8 @@ function W.radiusDamage(x, y, dmg, rad, spot, source)
     for _, th in ipairs(W.map.things) do
         if th ~= spot and th.think == "monster" and not th.dead and not th.removed then
             local e = W.THING_SPR[th.dtype]
-            if e and e.r then
+            -- vanilla PIT_RadiusAttack: cyberdemon + mastermind take no blast
+            if e and e.r and not (th.info and th.info.noRadius) then
                 local dist = max(abs(th.x - x), abs(th.y - y)) - e.r
                 if dist < 0 then dist = 0 end
                 if dist < rad and reach(th.x, th.y, (th.z or 0) + 28) then
@@ -7235,7 +8029,6 @@ function W.renderBody(sw, sh)
     if gs == "play" then
         W.setupView(sw, sh)
         W.drawBackground()                                  -- safety fill under planes/sky
-        if W.map and W.map.usesSky then W.drawSky() end     -- sky over the ceiling region
         if W.map and W.map.rootNode then W.renderNode(W.map.rootNode) end  -- walls + plane capture
         W.drawPlanes()                                      -- fill the floor/ceiling gaps
         W.renderThings()                                    -- billboards over walls+planes (drawseg-clipped)
@@ -7253,7 +8046,6 @@ function W.renderBody(sw, sh)
             ImGui.AddRectFilled(0, 0, floor(sw), floor(sh), 8, 6, 10, 255)  -- opaque base (covers HUD strip)
             W.setupView(sw, sh)
             W.drawBackground()
-            if W.map.usesSky then W.drawSky() end
             W.renderNode(W.map.rootNode)
             W.drawPlanes()
             W.renderThings()
