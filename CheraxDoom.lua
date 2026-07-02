@@ -6283,16 +6283,16 @@ function W.playMusic(mapName)
     W.musAlias = W.musAlias or "doommus"
     W.mci('close ' .. W.musAlias)             -- clear any stale alias
     if not W.mci('open "' .. mp .. '" type sequencer alias ' .. W.musAlias) then return end
-    -- Unload protection: nothing can reach MCI from the unload thread (alias
-    -- commands return false; 'stop all'/'close all' return true against an empty
-    -- device view and silence nothing), and periodic keep-alive MCI commands are
-    -- NOT an option (each play command costs a lagspike and degrades playback,
-    -- per in-game testing). So the play is simply BOUNDED to the track length,
-    -- never unbounded: if the script dies, the sequencer runs out at the end of
-    -- the current track on its own. The bound rides on the same play command the
-    -- track start and each loop already issue, costing zero extra MCI traffic.
-    -- (When the host script is present it also stops the music instantly from
-    -- its own live state the moment our liveness feature leaves the registry.)
+    -- Unload protection, three layers (periodic keep-alive MCI commands are NOT
+    -- an option: each play command costs a lagspike and degrades playback, per
+    -- in-game testing): (1) PRIMARY - on unload, the teardown present frames
+    -- deliver the stop via serviceStop (see the ON_UNLOAD handler); (2) a host
+    -- script, when present, stops the music from its own present-thread tick
+    -- the moment our liveness feature leaves the registry; (3) last resort -
+    -- the play below is BOUNDED to the track length, never unbounded, so even a
+    -- fully orphaned sequencer runs out at the end of the current track. The
+    -- bound rides on the same play command the track start and each loop
+    -- already issue, costing zero extra MCI traffic.
     W.musBoundMs = nil
     if secs and secs > 0.5 and W.mci('set ' .. W.musAlias .. ' time format milliseconds') then
         -- The bound must stay INSIDE the media: 'play to' past the sequence
@@ -7482,35 +7482,28 @@ end
 
 if EventMgr and EventMgr.RegisterHandler then
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_PRESENT) or 7, W.onPresent)
-    -- On unload (uninject), best-effort stop of the MCI music + any SFX. Per the
-    -- in-game log alias commands return false from this thread and the 'all'
-    -- variants return true without silencing anything, so this is NOT what
-    -- silences an uninject: the track-length play bound (see playMusic) lets the
-    -- sequencer run out on its own, and the host script (when present) stops it
-    -- instantly from its own live state.
+    -- On unload (uninject), stop the music via the TEARDOWN PRESENT FRAMES.
+    -- The MCI device is only reachable from the thread that opened it (the
+    -- present thread); every direct attempt from this unload thread fails
+    -- (alias commands return false, 'stop all'/'close all' return true against
+    -- an empty device view and silence nothing). But ON_PRESENT keeps firing
+    -- for a few frames after this handler runs (verified in-game: an MCI stop
+    -- from one of those frames returns true and the music dies), and
+    -- W.serviceStop is the first thing onPresent does each frame. So arming
+    -- the retry counter here is the entire fix; the next present frame sends
+    -- stop+close from the right thread.
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_UNLOAD) or 11, function()
-        -- The unload thread cannot reach the MCI device by our alias (stop/close
-        -- <alias> return false here per the in-game log), so use the alias-free
-        -- 'stop all'/'close all', which close every MCI device this process owns.
-        local a = W.musAlias or "doommus"
-        local r1, r2, r3, r4
-        if Utils and Utils.MciSendString then
-            for _ = 1, 3 do
-                pcall(Utils.MciSendString, "stop " .. a)
-                pcall(Utils.MciSendString, "close " .. a)
-                local _, x1 = pcall(Utils.MciSendString, "stop all"); r3 = x1
-                local _, x2 = pcall(Utils.MciSendString, "close all"); r4 = x2
-            end
-        end
-        if Utils and Utils.StopSound then pcall(Utils.StopSound) end
         W.musPlaying = false; W.musTrack = nil
+        W.stopRetries = 60
+        if Utils and Utils.StopSound then pcall(Utils.StopSound) end
         -- Drop the hidden cross-script shutdown feature so no stale entry lingers
-        -- in the shared registry for the next launch.
+        -- in the shared registry for the next launch. (The host, if present, sees
+        -- it vanish and also stops the music from its own present-thread tick.)
         if FeatureMgr and FeatureMgr.RemoveFeature then
             pcall(FeatureMgr.RemoveFeature, SHUTDOWN_HASH)
         end
         if W.stopDiag and Logger and Logger.LogInfo then
-            pcall(Logger.LogInfo, ("[DOOMWAD] ON_UNLOAD: stopall=%s closeall=%s"):format(tostring(r3), tostring(r4)))
+            pcall(Logger.LogInfo, "[DOOMWAD] ON_UNLOAD: stop delegated to teardown present frames")
         end
     end)
 end
