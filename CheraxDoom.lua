@@ -6295,11 +6295,27 @@ function W.playMusic(mapName)
     -- its own live state the moment our liveness feature leaves the registry.)
     W.musBoundMs = nil
     if secs and secs > 0.5 and W.mci('set ' .. W.musAlias .. ' time format milliseconds') then
-        W.musBoundMs = floor(secs * 1000 + 1000)
+        -- The bound must stay INSIDE the media: 'play to' past the sequence
+        -- length fails with MCIERR_OUTOFRANGE (verified against winmm; a +1000
+        -- overshoot here was the silent-music bug). Undershoot by 500ms; the
+        -- wall-clock loop reseek replays from the start anyway.
+        local b = floor(secs * 1000) - 500
+        if b > 1000 then W.musBoundMs = b end
     end
     local playCmd = 'play ' .. W.musAlias
     if W.musBoundMs then playCmd = playCmd .. ' to ' .. W.musBoundMs end
-    if not W.mci(playCmd) then W.mci('close ' .. W.musAlias); return end
+    local played = W.mci(playCmd)
+    if not played and W.musBoundMs then
+        -- Never let the bound break playback: fall back to an unbounded play
+        -- (the host watchdog still stops it on unload).
+        W.musBoundMs = nil
+        played = W.mci('play ' .. W.musAlias)
+    end
+    if W.stopDiag and Logger and Logger.LogInfo then
+        pcall(Logger.LogInfo, ("[DOOMWAD] playMusic(%s): lump=%s secs=%s bound=%s played=%s"):format(
+            tostring(mapName), tostring(name), tostring(secs), tostring(W.musBoundMs), tostring(played)))
+    end
+    if not played then W.mci('close ' .. W.musAlias); return end
     W.musTrack = name
     W.musLen = secs or 0
     W.musStart = now()
