@@ -1113,9 +1113,12 @@ function W.renderSeg(seg)
                 local flags = ld.flags or 0
                 PEGTOP = (flags & 0x0008) ~= 0
                 PEGBOT = (flags & 0x0010) ~= 0
-                if solid then
-                    texMid = W.getTex(sd.mid, false); dMid = sd.mid and W.texDefs[sd.mid]
-                else
+                -- A two-sided line's mid is a MASKED texture (grate/fence): it
+                -- is not drawn inline here but recorded on the drawseg and drawn
+                -- in the sorted masked pass (W.drawMaskedSeg), like vanilla's
+                -- R_RenderMaskedSegRange, so sprites sort correctly against it.
+                texMid = W.getTex(sd.mid, false); dMid = sd.mid and W.texDefs[sd.mid]
+                if not solid then
                     texUp = W.getTex(sd.upper, false); dUp = sd.upper and W.texDefs[sd.upper]
                     texLo = W.getTex(sd.lower, false); dLo = sd.lower and W.texDefs[sd.lower]
                 end
@@ -1134,6 +1137,7 @@ function W.renderSeg(seg)
         W.dsCount = W.dsCount + 1
         dsi = W.dsPool[W.dsCount]
         if not dsi then dsi = { top = {}, bot = {} }; W.dsPool[W.dsCount] = dsi end
+        dsi.mid = nil                 -- pooled record: clear stale masked-mid flag
         dsTop, dsBot = dsi.top, dsi.bot
     end
     local dsInvL = invA + (invB - invA) * clamp(((colL + 0.5) * W.colW - sxA) / (sxB - sxA), 0, 1)
@@ -1244,6 +1248,26 @@ function W.renderSeg(seg)
     elseif dsi then
         dsi.colL = colL; dsi.colR = colR
         dsi.invL = dsInvL; dsi.invR = dsInvR
+        if (not solid) and texMid and dMid then
+            -- Masked mid texture (grate/fence): flag this drawseg for the sorted
+            -- masked pass. The per-column top/bot snapshot above is exactly the
+            -- opening window folded with every nearer occluder, so drawMaskedSeg
+            -- only needs the projection + texture-mapping constants of this seg.
+            dsi.mid = texMid; dsi.midW = dMid.w; dsi.midH = dMid.h
+            dsi.midSxA = sxA; dsi.midSxB = sxB
+            dsi.midInvA = invA; dsi.midInvB = invB
+            dsi.midUozA = uozA; dsi.midUozB = uozB
+            dsi.midUOff = xoff + segoff
+            dsi.midFs = fs; dsi.midSeg = seg
+            dsi.midDepth = 2 / (dsInvL + dsInvR)   -- seg-center depth, for the far->near sort
+            -- Vanilla pegging (r_segs.c): the texture hangs one texH from the
+            -- opening top, or sits on the opening bottom when lower-unpegged;
+            -- rowoffset shifts it. Never tiled vertically (masked = one band).
+            local openTop = (bs.ceil < fs.ceil) and bs.ceil or fs.ceil
+            local openBot = (bs.floor > fs.floor) and bs.floor or fs.floor
+            dsi.midHTop = (PEGBOT and (openBot + dMid.h) or openTop) + yoff
+            dsi.midHBot = dsi.midHTop - dMid.h
+        end
     end
 end
 
@@ -2268,9 +2292,53 @@ function W.drawThing(th, e, depth)
     flush(cR)
 end
 
+-- Draw one masked mid texture (a two-sided line's middle texture: grates,
+-- fences, cage bars). Deferred from the wall pass and drawn here in the sorted
+-- masked pass so sprites BEHIND it were already painted (they show through the
+-- texture's transparent holes) and sprites in front paint over it. Per column:
+-- project the one-texture-tall band (masked mids never tile vertically), clip
+-- to the drawseg's recorded opening snapshot (which already folds in every
+-- nearer occluder), and emit a single CLAMP-safe AddImage (v stays in [0,1]).
+function W.drawMaskedSeg(d)
+    local tex, texW = d.mid, d.midW
+    local colL = d.colL
+    local dsTop, dsBot = d.top, d.bot
+    local sxA, sxB = d.midSxA, d.midSxB
+    local invA, invB = d.midInvA, d.midInvB
+    local uozA, uozB = d.midUozA, d.midUozB
+    local hTop, hBot = d.midHTop, d.midHBot
+    local fs, seg = d.midFs, d.midSeg
+    local horizon, projScale, viewZ, colW = W.horizon, W.projScale, W.viewZ, W.colW
+    local sxSpan = sxB - sxA
+    if sxSpan <= 0 then return end
+    for col = colL, d.colR do
+        local ct = dsTop[col - colL]
+        if ct and ct >= 0 then
+            local cb = dsBot[col - colL]
+            if cb > ct then
+                local t = clamp(((col + 0.5) * colW - sxA) / sxSpan, 0, 1)
+                local inv = invA + (invB - invA) * t
+                local yT = horizon - (hTop - viewZ) * projScale * inv
+                local yB = horizon - (hBot - viewZ) * projScale * inv
+                local y0 = (yT > ct) and yT or ct        -- max(band top, window top)
+                local y1 = (yB < cb) and yB or cb        -- min(band bot, window bot)
+                if y1 > y0 and yB > yT then
+                    local distU = (uozA + (uozB - uozA) * t) / inv
+                    local u = (floor((d.midUOff + distU) % texW) + 0.5) / texW
+                    local x0 = col * colW
+                    ImGui.AddImage(tex, x0, y0, x0 + colW + 0.8, y1,
+                        u, (y0 - yT) / (yB - yT), u, (y1 - yT) / (yB - yT),
+                        W.greyTint(W.wallLight(fs, 1 / inv, seg)))
+                end
+            end
+        end
+    end
+end
+
 -- H.6: collect visible/in-range things, depth-sort far->near, draw the nearest
 -- SPRITE_MAX under the per-frame SPRITE_BUDGET. Scratch is reused (no per-frame
--- alloc for the collect list; the sort view is small and bounded).
+-- alloc for the collect list; the sort view is small and bounded). Masked mid
+-- walls (see W.drawMaskedSeg) are merged into the same far->near paint order.
 function W.renderThings()
     if not (W.map and W.map.things and W.pal) then return end
     W.spriteDraws = 0
@@ -2294,9 +2362,29 @@ function W.renderThings()
     table.sort(view, function(a, b) return a.depth > b.depth end)
     local startI = 1
     if n > W.SPRITE_MAX then startI = n - W.SPRITE_MAX + 1 end
-    for i = startI, n do
-        if W.spriteDraws >= W.SPRITE_BUDGET then break end
-        W.drawThing(view[i].th, view[i].e, view[i].depth)
+    -- Collect this frame's masked mid walls and sort them far->near too.
+    local ms = W.msScratch or {}; W.msScratch = ms
+    local mn = 0
+    for di = 1, W.dsCount do
+        local d = W.dsPool[di]
+        if d.mid then mn = mn + 1; ms[mn] = d end
+    end
+    for i = mn + 1, #ms do ms[i] = nil end
+    if mn > 1 then table.sort(ms, function(a, b) return a.midDepth > b.midDepth end) end
+    -- Merge-walk both far->near streams so nearer items always paint later.
+    -- Masked walls ignore the sprite budget (they are world geometry): once the
+    -- budget is gone sprites are skipped but the walls still draw.
+    local si, mi = startI, 1
+    while si <= n or mi <= mn do
+        local sv = (si <= n) and view[si] or nil
+        if mi <= mn and (not sv or ms[mi].midDepth >= sv.depth) then
+            W.drawMaskedSeg(ms[mi]); mi = mi + 1
+        else
+            if W.spriteDraws < W.SPRITE_BUDGET then
+                W.drawThing(sv.th, sv.e, sv.depth)
+            end
+            si = si + 1
+        end
     end
 end
 
@@ -5481,6 +5569,13 @@ function W.update(dt, menuOpen)
             if W.attractOn then W.updateAttractCam(dt) end
         end
         W.updateFrontend(dt)
+    elseif not menuOpen and not BLAD_MODE
+        and (W.gameState == "nowad" or W.gameState == "error" or W.gameState == "menu") then
+        -- These screens have no DOOM menu to quit from; ESC/Backspace closes
+        -- the overlay (the Play Doom button reopens it).
+        if kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then
+            W.playOn = false; W.active = false
+        end
     end
 end
 
@@ -5716,9 +5811,15 @@ function W.drawHUD(sw, sh)
             or W.DOOR_SPECIALS[sp] and "SPACE: OPEN" or "SPACE: USE"
         ImGui.AddText(W.centerX - 34, W.horizon + 16, label, 245, 230, 140, 255)
     end
-    -- pickup / locked-door message, vanilla top-left
+    -- pickup / locked-door message, vanilla top-left in the hu_font (ImGui text
+    -- only while the glyphs bake or if the WAD lacks the STCFN lumps)
     local m = (W.hudMsgUntil and now() < W.hudMsgUntil) and W.hudMsg or nil
-    if m then ImGui.AddText(4, 2, m, 245, 235, 150, 255) end
+    if m then
+        local mS = sh / 200
+        local fw = W.fontLineWidth(m, mS)
+        if fw then W.drawFontLine(m, floor(2 * mS), floor(2 * mS), mS, 255)
+        else ImGui.AddText(4, 2, m, 245, 235, 150, 255) end
+    end
     if W.playerDead then
         ImGui.AddText(floor(W.centerX - 78), floor(W.viewH * 0.46), "press USE to restart", 210, 190, 120, 255)
     end
@@ -6690,8 +6791,8 @@ function W.drawFrontend(sw, sh)
         W.drawPatch("M_SKILL", "Choose Skill:", 54, 38, S, xbase, false)
         W.drawMenuList(W.SKILL_ITEMS, 48, 63, 16, S, xbase)
         if W.menu.nmConfirm then
-            ImGui.AddRectFilled(0, floor(sh * 0.40), floor(sw), floor(sh * 0.60), 8, 6, 10, 235)
-            W.drawMsgLines(W.STR.NIGHTMARE, sw * 0.5, sh * 0.43, 16 * S, 235, 120, 90, 255)
+            ImGui.AddRectFilled(0, floor(sh * 0.40), floor(sw), floor(sh * 0.68), 8, 6, 10, 235)
+            W.drawMsgLines(W.STR.NIGHTMARE, sw * 0.5, sh * 0.43, 12 * S, 235, 120, 90, 255)
         end
     elseif scr == "options" then
         W.drawOptions(sw, sh, S, xbase)
@@ -6699,7 +6800,7 @@ function W.drawFrontend(sw, sh)
         W.drawPatchFS("HELP1", sw, sh)
     elseif scr == "quit" then
         local msg = (W.QUITMSGS[W.quitMsgIdx or 1] or W.QUITMSGS[1]) .. "\n\n" .. W.STR.DOSY
-        W.drawMsgLines(msg, sw * 0.5, sh * 0.42, 16 * S, 235, 210, 120, 255)
+        W.drawMsgLines(msg, sw * 0.5, sh * 0.42, 12 * S, 235, 210, 120, 255)
     end
 end
 
@@ -6724,15 +6825,72 @@ function W.bigText(text, cx, cy, scale, r, g, b, a)
     pcall(ImGui.SetWindowFontScale, 1.0)
 end
 
+-- hu_font (STCFNxxx) glyph lump name for a character byte, or nil for space and
+-- anything the font lacks. The WAD font covers ASCII 33..95 (caps + punctuation)
+-- only, so lowercase is uppercased first - exactly vanilla M_WriteText.
+function W.fontLumpName(b)
+    if b >= 97 and b <= 122 then b = b - 32 end
+    if b < 33 or b > 95 then return nil end
+    return string.format("STCFN%03d", b)
+end
+
+-- Screen-pixel width of one line in the hu_font at scale S (space/unknown glyph
+-- advances 4 units, matching vanilla). Calling this also kicks the glyph bakes;
+-- returns nil while any needed glyph is not yet GPU-ready so the caller can fall
+-- back to plain ImGui text for the frame instead of drawing a gap-toothed line.
+function W.fontLineWidth(line, S)
+    local w, ready = 0, true
+    for i = 1, #line do
+        local nm = W.fontLumpName(line:byte(i))
+        local pw = nm and W.patchSize(nm)
+        if pw then
+            w = w + pw
+            if not W.menuTex(nm) then ready = false end
+        else
+            w = w + 4
+        end
+    end
+    if not ready then return nil end
+    return w * S
+end
+
+-- Draw one line in the hu_font, top-left anchored at (x,y), scale S, alpha a.
+-- Glyph patches carry their own (red) palette colors, so no color tint applies.
+function W.drawFontLine(line, x, y, S, a)
+    local tint = (((a or 255) & 0xFF) << 24) | 0xFFFFFF
+    for i = 1, #line do
+        local nm = W.fontLumpName(line:byte(i))
+        local pw, ph, plo, pto = nil, nil, nil, nil
+        if nm then pw, ph, plo, pto = W.patchSize(nm) end
+        local handle = pw and W.menuTex(nm)
+        if handle then
+            local gx = x - (plo or 0) * S; local gy = y - (pto or 0) * S
+            ImGui.AddImage(handle, floor(gx), floor(gy),
+                floor(gx + pw * S), floor(gy + ph * S), 0, 0, 1, 1, tint)
+            x = x + pw * S
+        else
+            x = x + (pw or 4) * S
+        end
+    end
+end
+
 -- Draw a possibly multi-line string (\n separated) centered on cx, lines stacked
 -- downward from y0. Used for the verbatim DOOM prompts (NIGHTMARE / quit taunts).
+-- Rendered with the WAD's own hu_font like vanilla; the r/g/b ImGui text is only
+-- the fallback while the glyphs bake or when the WAD lacks the STCFN lumps.
 function W.drawMsgLines(text, cx, y0, lh, r, g, b, a)
+    local S = lh / 12                       -- vanilla steps 12 doom-units per line
     local y = y0
     for line in (text .. "\n"):gmatch("(.-)\n") do
-        local w = #line * 7                       -- default-font width estimate
-        local cok, a1 = pcall(ImGui.CalcTextSize, line)
-        if cok then if type(a1) == "number" then w = a1 elseif type(a1) == "table" then w = a1.x or w end end
-        ImGui.AddText(floor(cx - w / 2), floor(y), line, r, g, b, a)
+        local fw = (#line > 0) and W.fontLineWidth(line, S) or 0
+        if fw then
+            if fw > 0 then W.drawFontLine(line, floor(cx - fw / 2), floor(y), S, a) end
+        else
+            local w = #line * 7                       -- default-font width estimate
+            local cok, a1 = pcall(ImGui.CalcTextSize, line)
+            if cok then if type(a1) == "number" then w = a1 elseif type(a1) == "table" then w = a1.x or w end end
+            ImGui.AddText(floor(cx - w / 2), floor(y), line, r, g, b, a)
+        end
         y = y + lh
     end
 end
@@ -6841,9 +6999,14 @@ function W.updateFrontend(dt)
     if scr == "quit" then
         if kpressed(W.VK.Y) then
             -- Host mode: Quit fully unloads CheraxDoom back to GTA (same path the
-            -- host's Stop button drives). Standalone keeps returning to the title.
+            -- host's Stop button drives). Standalone closes the overlay too; the
+            -- next Play Doom click reopens on the title screen.
             if BLAD_MODE then W.hostShutdown()
-            else m.screen = "title"; m.fromPlay = false; W.attractOn = false; pcall(W.requestStop, "quit"); pcall(W.playSfx, "DSSWTCHX") end
+            else
+                W.playOn = false; W.active = false
+                m.screen = "title"; m.fromPlay = false; W.attractOn = false
+                pcall(W.requestStop, "quit"); pcall(W.playSfx, "DSSWTCHX")
+            end
         elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; pcall(W.playSfx, "DSSWTCHX") end
         return
     end
@@ -6993,9 +7156,10 @@ function W.renderBody(sw, sh)
         ImGui.AddText(12, 12, "Loading " .. tostring(W.pendingMap or "") .. "...", 235, 220, 120, 255)
     elseif gs == "error" then
         ImGui.AddText(12, 12, "ERROR: " .. tostring(W.status), 235, 80, 70, 255)
+        ImGui.AddText(12, 30, "Pick another wad or map in the DOOM WAD tab. ESC closes DOOM.", 200, 200, 205, 255)
     else
-        ImGui.AddText(12, 12, "No WAD loaded. Put a .wad in Cherax/Lua (or Lua/DoomWad),", 200, 200, 205, 255)
-        ImGui.AddText(12, 30, "then open the DOOM WAD tab and press Scan.", 200, 200, 205, 255)
+        ImGui.AddText(12, 12, "No WAD loaded. Open the DOOM WAD tab and use Download DOOM1.WAD,", 200, 200, 205, 255)
+        ImGui.AddText(12, 30, "or drop a .wad in Cherax/Lua/DoomWad and press Scan. ESC closes DOOM.", 200, 200, 205, 255)
     end
 
     W.drawWipe(sw, sh)                           -- screen-melt overlay (over the live play frame)
@@ -7012,36 +7176,67 @@ end
 function W.scanWads()
     local out, seen = {}, {}
     local function add(p)
-        if p and p ~= "" and not seen[p] then seen[p] = true; out[#out + 1] = p end
+        local k = p and p:lower()
+        if p and p ~= "" and not seen[k] then seen[k] = true; out[#out + 1] = p end
     end
+    -- Last-resort probe names for when FindFiles is unavailable or empty. This
+    -- is NOT a filter: any .wad FindFiles returns is listed, whatever its name
+    -- (openWad validates the IWAD/PWAD magic).
     local names = { "DOOM1.WAD", "DOOM.WAD", "DOOM2.WAD", "freedoom1.wad", "freedoom2.wad" }
+    -- FindFiles' extension matching is finicky (dot-prefixed, case-sensitive;
+    -- "" = every file), so query each spelling PLUS "" and keep anything that
+    -- ends in .wad, case-insensitive, regardless of which query surfaced it.
+    local exts = { ".wad", ".WAD", "" }
     local dirs = {}
     local rok, root = pcall(FileMgr.GetMenuRootPath)
     if rok and root and root ~= "" then
-        root = tostring(root)
+        -- Known-good FindFiles callers pass all-backslash directories with a
+        -- trailing separator; a mixed-separator path can enumerate nothing.
+        root = tostring(root):gsub("/", "\\")
+        if root:sub(-1) == "\\" then root = root:sub(1, -2) end
         -- The Cherax root folder is cleared on update, so persistent user files
         -- live under Lua/. Prefer Lua/DoomWad, then Lua, before the volatile root.
-        dirs[#dirs + 1] = root .. "/Lua/DoomWad/"
-        dirs[#dirs + 1] = root .. "/Lua/"
-        dirs[#dirs + 1] = root .. "/DoomWad/"
-        dirs[#dirs + 1] = root .. "/"
-        pcall(FileMgr.CreateDir, root .. "/Lua/DoomWad")   -- ensure a home for the wad + future cache
+        dirs[#dirs + 1] = root .. "\\Lua\\DoomWad\\"
+        dirs[#dirs + 1] = root .. "\\Lua\\"
+        dirs[#dirs + 1] = root .. "\\DoomWad\\"
+        dirs[#dirs + 1] = root .. "\\"
+        pcall(FileMgr.CreateDir, root .. "\\Lua\\DoomWad")   -- ensure a home for the wad + future cache
     end
-    dirs[#dirs + 1] = ""   -- current working dir, last-resort fallback
+    dirs[#dirs + 1] = ""   -- current working dir: name probes only (FindFiles chokes on ".")
+    local hits = 0         -- FindFiles results seen (scan diagnostic, shown in the tab)
+    local calls = 0        -- FindFiles calls that returned a usable container
+    local function accept(f, d)
+        f = tostring(f or "")
+        if f:lower():sub(-4) ~= ".wad" then return end
+        -- FindFiles may return bare names or full paths; accept whichever
+        -- form actually exists so we never list an unopenable candidate.
+        local full = d .. f
+        local aok, ex = pcall(FileMgr.DoesFileExist, full)
+        if aok and ex then add(full)
+        else
+            local bok, bex = pcall(FileMgr.DoesFileExist, f)
+            if bok and bex then add(f) end
+        end
+    end
     for _, d in ipairs(dirs) do
-        if FileMgr and FileMgr.FindFiles then
-            local fok, list = pcall(FileMgr.FindFiles, (d == "") and "." or d, "wad", false)
-            if fok and type(list) == "table" then
-                -- FindFiles may return bare names or full paths; accept whichever
-                -- form actually exists so we never list an unopenable candidate.
-                for _, f in ipairs(list) do
-                    f = tostring(f)
-                    local full = d .. f
-                    local aok, ex = pcall(FileMgr.DoesFileExist, full)
-                    if aok and ex then add(full)
+        if FileMgr and FileMgr.FindFiles and d ~= "" then
+            for _, ext in ipairs(exts) do
+                local fok, list = pcall(FileMgr.FindFiles, d, ext, false)
+                if fok and list ~= nil then
+                    if type(list) == "table" then
+                        calls = calls + 1
+                        for _, f in ipairs(list) do hits = hits + 1; accept(f, d) end
                     else
-                        local bok, bex = pcall(FileMgr.DoesFileExist, f)
-                        if bok and bex then add(f) end
+                        -- sol2 may hand back a userdata container: length and
+                        -- indexing go through metamethods, so probe via pcall.
+                        local lok, ln = pcall(function() return #list end)
+                        if lok and type(ln) == "number" then
+                            calls = calls + 1
+                            for i = 1, ln do
+                                local gok, f = pcall(function() return list[i] end)
+                                if gok and f then hits = hits + 1; accept(f, d) end
+                            end
+                        end
                     end
                 end
             end
@@ -7051,8 +7246,19 @@ function W.scanWads()
             if dok and ex then add(d .. n) end
         end
     end
+    W.scanNote = string.format("FindFiles: %d usable calls, %d entries, %d wads listed", calls, hits, #out)
     W.wadCandidates = out
     return out
+end
+
+-- Put one wad path straight into the tab's candidate list (no folder scan),
+-- deduped case-insensitively. Used by the shareware download button.
+function W.addWadCandidate(p)
+    if not p or p == "" then return end
+    W.wadCandidates = W.wadCandidates or {}
+    local k = p:lower()
+    for _, q in ipairs(W.wadCandidates) do if q:lower() == k then return end end
+    W.wadCandidates[#W.wadCandidates + 1] = p
 end
 
 -- Auto-load a wad + a starting map on first enable so the user can just walk.
@@ -7069,7 +7275,9 @@ function W.autoLoad()
     W.gameState = "frontend"                 -- land on the Doom title screen, not straight into a map
 end
 
--- Host-mode only: fetch DOOM1.WAD (shareware IWAD) into Lua/DoomWad on first run.
+-- Fetch DOOM1.WAD (shareware IWAD) into Lua/DoomWad: the host-mode first-run
+-- flow, and the standalone tab's download button (W.dlForce, which skips the
+-- "some other wad already exists" early-out so DOOM1.WAD itself is fetched).
 -- Async, driven from onPresent: returns "busy" while the transfer is in flight,
 -- "done" once a wad is on disk (downloaded now OR already present), "failed" on a
 -- hard error. Cherax's libcurl exposes no FOLLOWLOCATION, so we hit the final
@@ -7089,8 +7297,12 @@ function W.ensureWadDownload()
         W.dlChecked = true
         local dok, de = pcall(FileMgr.DoesFileExist, W.dlTarget)
         if dok and de then W.dlDone = true; return "done" end
-        local cands = W.scanWads()
-        if cands and cands[1] then W.dlDone = true; return "done" end
+        if not W.dlForce then
+            -- Host boot flow only: any wad already on disk counts as done. The
+            -- tab button (dlForce) always fetches DOOM1.WAD itself, no scan.
+            local cands = W.scanWads()
+            if cands and cands[1] then W.dlDone = true; return "done" end
+        end
     end
     -- Download sources. HTTPS host first; a plain-HTTP mirror is the fallback.
     -- Cherax's curl exposes NO TLS options (no verify/revoke/CAINFO), so a broken
@@ -7234,6 +7446,7 @@ function W.init()
     -- camera / view state
     W.viewX = 0; W.viewY = 0; W.viewZ = W.EYE; W.viewAngle = 0
     W.active = false
+    W.playOn = false          -- standalone launch flag (Play Doom button / Quit Game)
     W.mouseLook = false
     -- audio / music state (Section M). musicOn is a user toggle (default on);
     -- looping is duration-driven off now() since MCI cannot report position.
@@ -7280,13 +7493,29 @@ function W.onPresent()
         end
         return
     end
-    -- Host mode runs unconditionally (no toggle to find); standalone honors the
-    -- DOOM WAD feature toggle as before.
-    local enabled = BLAD_MODE
-    if not enabled then
-        local eok, e = pcall(FeatureMgr.IsFeatureEnabled, FEATURE_HASH)
-        if eok then enabled = e end
+    -- Standalone: service the tab's shareware-download button even while DOOM
+    -- itself is closed (the click only arms it; the curl transfer polls here,
+    -- and the finished wad goes straight onto the candidate list - no scan).
+    if W.dlWanted then
+        local st = W.ensureWadDownload()
+        if st ~= "busy" then
+            W.dlWanted = false
+            if st == "done" and W.dlTarget then
+                W.addWadCandidate(W.dlTarget)
+                -- Nothing loaded yet: open the fresh wad right away so the
+                -- overlay (open now or on the next Play click) lands on the
+                -- title screen instead of the no-wad help text.
+                if not W.wad and W.openWad(W.dlTarget) then
+                    W.mapList = W.listMaps()
+                    W.menu.screen = "title"; W.menu.cursor = 1
+                    W.gameState = "frontend"
+                end
+            end
+        end
     end
+    -- Host mode runs unconditionally; standalone runs while the Play Doom
+    -- button has it open (DOOM's own Quit Game closes it again).
+    local enabled = BLAD_MODE or W.playOn or false
     if not enabled then
         -- Feature toggled off: request a stop with retries. Trigger only on the
         -- transition (musPlaying or active still set) so we do not spam forever.
@@ -7376,15 +7605,26 @@ function W.renderTab()
     if ClickGUI.RenderFeature then pcall(ClickGUI.RenderFeature, FEATURE_HASH) end
     if ImGui.Separator then ImGui.Separator() end
     if not ImGui.Text then return end
-    ImGui.Text("Load a DOOM/DOOM2 .wad, pick a map, then close the menu to walk.")
-    ImGui.Text("Put your .wad in the Cherax/Lua folder (or Cherax/Lua/DoomWad).")
-    ImGui.Text("The Cherax root folder is cleared, so it must go under Lua.")
+    ImGui.Text("Click Play Doom, then close the Cherax menu. Quit Game inside DOOM returns to GTA.")
+    ImGui.Text("Plays any DOOM-format .wad (DOOM/DOOM2/TNT/Plutonia/FreeDoom).")
+    ImGui.Text("Drop wads in Cherax/Lua/DoomWad (or Cherax/Lua), or use the download button below.")
     ImGui.Text("State: " .. tostring(W.gameState) .. "    " .. tostring(W.status or ""))
     if ImGui.Separator then ImGui.Separator() end
 
     -- WAD picker
     ImGui.Text("WAD: " .. tostring(W.wadPath or "(none)"))
     if W.uiRow("Scan for WAD files") then W.scanWads() end
+    if W.uiRow("Download DOOM1.WAD (shareware, 4 MB)") then
+        -- Arm/re-arm the async download; onPresent polls it and puts the wad
+        -- straight onto the list below on success (no folder scan involved).
+        W.dlWanted = true; W.dlForce = true
+        W.dlDone = false; W.dlChecked = false; W.dlFailed = false
+        W.dlTries = 0; W.dlIdx = 1; W.dlNextTry = 0
+    end
+    if W.dlWanted then ImGui.Text("Downloading DOOM1.WAD...")
+    elseif W.dlForce and W.dlFailed then
+        ImGui.Text("Download failed. Check your connection and click again.")
+    end
     if W.wadCandidates and #W.wadCandidates > 0 then
         for _, p in ipairs(W.wadCandidates) do
             if W.uiRow("Load: " .. p) then
@@ -7444,21 +7684,15 @@ W.init()
 -- Cherax never sets this global, so this is a no-op in production.
 if rawget(_G, "__DOOMWAD_TEST") then _G.__DOOMWAD = W end
 
--- Standalone only: the DOOM WAD toggle is the enable switch and lives in the tab.
--- In host mode we auto-run, so neither the toggle nor the tab are registered; the
--- only UI is the fullscreen DOOM overlay window (with DOOM's own front-end menu).
+-- Standalone only: the Play Doom button is the launch switch and lives in the
+-- tab; quitting from DOOM's own menu (or ESC on the no-wad/error screens) closes
+-- it again. In host mode we auto-run, so neither the button nor the tab are
+-- registered; the only UI is the fullscreen DOOM overlay window.
 if (not BLAD_MODE) and FeatureMgr and FeatureMgr.AddFeature then
-    pcall(FeatureMgr.AddFeature, FEATURE_HASH, "DOOM WAD",
-        (eFeatureType and eFeatureType.Toggle) or 1,
-        "Load and walk a DOOM/DOOM2 .wad map in the overlay (flat-shaded BSP renderer). Enable, then close the menu to walk.",
-        function(f)
-            local on = true
-            local cok, cr = pcall(function() return f:IsToggled() end)
-            if cok then on = cr end
-            -- Runs on the menu thread (the context where the manual disable
-            -- worked); request a retried stop so it also survives onPresent.
-            if not on then W.active = false; pcall(W.requestStop, "toggle-cb") end
-        end)
+    pcall(FeatureMgr.AddFeature, FEATURE_HASH, "Play Doom",
+        (eFeatureType and eFeatureType.Button) or 0,
+        "Play DOOM in the overlay: click, then close the Cherax menu. Quit Game inside DOOM returns to GTA.",
+        function() W.playOn = true end)
 end
 
 -- Register the hidden cross-script shutdown feature in ALL modes (was host-only).
