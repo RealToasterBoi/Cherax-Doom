@@ -27,6 +27,15 @@ local FEATURE_HASH = (Utils and Utils.Joaat) and Utils.Joaat("LUA_DoomWad_MainTo
 local BLAD_MODE = rawget(_G, "BladscriptLoaded") == true
 local SHUTDOWN_HASH = (Utils and Utils.Joaat) and Utils.Joaat("CheraxDoom_Shutdown") or 0
 local WAD_URL = "https://raw.githubusercontent.com/nneonneo/universal-doom/main/DOOM1.WAD"
+-- The only file the downloader will ever accept: DOOM1.WAD shareware 1.9
+-- (canonical release, MD5 f0cefca49926d00903cf57551d901abe). Both download
+-- sources serve this byte-identical file. One of them is plain HTTP (see
+-- ensureWadDownload for why it must stay), so the body is unauthenticated in
+-- transit; anything that does not match the exact size AND this SHA-256 -
+-- mirror rot, a captive portal, a tampered response - is rejected before it
+-- is written to disk or fed to the parser.
+local WAD_SIZE = 4196020
+local WAD_SHA256 = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771"
 local floor = math.floor
 
 -- math aliases + tiny helpers (file scope; keep the main-chunk local count low)
@@ -172,6 +181,10 @@ function W.reset()
     W.texW = nil        -- KEY -> source width
     W.texH = nil        -- KEY -> source height
     W.texCache = nil    -- KEY -> { id, tex, w, h, state } async GPU load state
+    -- The DISK cache is per-wad too: drop the resolved dir + fingerprint so the
+    -- next wad recomputes them (stale = it would serve the old wad's baked PNGs).
+    W.cacheDir = nil
+    W.wadFp = nil
 end
 
 -- Return the raw bytes of lump at 1-based ordinal i, bounds-checked. Missing,
@@ -212,6 +225,31 @@ function W.parseDirectory()
     end
 end
 
+-- Fingerprint a wad for the on-disk cache: "<size>-<crc32 hex>" over the header,
+-- the whole lump directory, and up to ~64 evenly spaced 256-byte content samples.
+-- Cached assets (baked PNGs, converted MIDs/WAVs) are keyed by LUMP NAME, and
+-- different wads reuse the same names (DOOM1 vs FreeDoom vs any PWAD), so each
+-- wad must get its own cache subdirectory or a wad switch silently serves the
+-- previous wad's art and audio. The directory covers name/pos/size of every
+-- lump; the sparse content samples additionally catch in-place lump edits that
+-- leave the directory byte-identical. Called only after parseDirectory accepted
+-- the header, so the unpack and directory slice below are already validated.
+function W.wadFingerprint(data)
+    W.initCRC()
+    local _, numLumps, dirOfs = string.unpack("<c4i4i4", data, 1)
+    local parts = { string.sub(data, 1, 12),
+                    string.sub(data, dirOfs + 1, dirOfs + numLumps * 16) }
+    local n = #data
+    local step = floor(n / 64)
+    if step < 4096 then step = 4096 end
+    local i = 1
+    while i <= n do
+        parts[#parts + 1] = string.sub(data, i, min(i + 255, n))
+        i = i + step
+    end
+    return string.format("%d-%08x", n, W.crc32(table.concat(parts)))
+end
+
 -- Read a file as RAW BYTES. A WAD is binary and full of NUL / 0x1A / CRLF bytes,
 -- so it must be read in binary mode. FileMgr.ReadFileContent is text-mode on this
 -- build (it truncates/mangles binary), so use io.open(path, "rb") first and only
@@ -247,6 +285,8 @@ function W.openWad(path)
         W.wad = nil
         return false, W.status
     end
+    local fok, fp = pcall(W.wadFingerprint, data)
+    W.wadFp = (fok and fp) or nil       -- selects this wad's cache subdirectory
     W.state = "ready"
     W.status = string.format("%s: %d lumps, %d maps", W.wadId, #W.lumps, #W.listMaps())
     pcall(W.loadGraphics)   -- best-effort palette/pnames/texture defs (Phase 3)
@@ -651,6 +691,82 @@ function W.adler32(s)
     return ((b << 16) | a) & 0xFFFFFFFF
 end
 
+-- Pure-Lua SHA-256 (FIPS 180-4), incremental. Used only to verify the
+-- downloaded shareware IWAD against its pinned digest: sha256New() makes a
+-- state, sha256Feed(st, slice) may be called with slices of any size (the
+-- ~4 MB body is fed ~96 KB per present frame so hashing never stalls a frame),
+-- sha256Done(st) pads and returns the digest as lowercase hex.
+W.SHA_K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+
+function W.sha256New()
+    return { h = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 },
+             len = 0, tail = "", w = {} }
+end
+
+-- Compress every full 64-byte block of (st.tail .. s); any remainder carries
+-- over in st.tail for the next call. All words stay masked to 32 bits (Lua
+-- integers are 64-bit, so sums never overflow before the mask).
+function W.sha256Feed(st, s)
+    st.len = st.len + #s
+    if #st.tail > 0 then s = st.tail .. s; st.tail = "" end
+    local K, w, h = W.SHA_K, st.w, st.h
+    local h1, h2, h3, h4, h5, h6, h7, h8 =
+        h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]
+    local n = #s
+    local pos = 1
+    while pos + 63 <= n do
+        w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8],
+        w[9], w[10], w[11], w[12], w[13], w[14], w[15], w[16], pos =
+            string.unpack(">I4I4I4I4I4I4I4I4I4I4I4I4I4I4I4I4", s, pos)
+        for i = 17, 64 do
+            local x, y = w[i - 15], w[i - 2]
+            local s0 = (((x >> 7) | (x << 25)) ~ ((x >> 18) | (x << 14)) ~ (x >> 3)) & 0xFFFFFFFF
+            local s1 = (((y >> 17) | (y << 15)) ~ ((y >> 19) | (y << 13)) ~ (y >> 10)) & 0xFFFFFFFF
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xFFFFFFFF
+        end
+        local a, b, c, d, e, f, g, hh = h1, h2, h3, h4, h5, h6, h7, h8
+        for i = 1, 64 do
+            local S1 = (((e >> 6) | (e << 26)) ~ ((e >> 11) | (e << 21)) ~ ((e >> 25) | (e << 7))) & 0xFFFFFFFF
+            local ch = (e & f) ~ ((~e) & g)
+            local t1 = (hh + S1 + ch + K[i] + w[i]) & 0xFFFFFFFF
+            local S0 = (((a >> 2) | (a << 30)) ~ ((a >> 13) | (a << 19)) ~ ((a >> 22) | (a << 10))) & 0xFFFFFFFF
+            local maj = (a & b) ~ (a & c) ~ (b & c)
+            local t2 = (S0 + maj) & 0xFFFFFFFF
+            hh = g; g = f; f = e; e = (d + t1) & 0xFFFFFFFF
+            d = c; c = b; b = a; a = (t1 + t2) & 0xFFFFFFFF
+        end
+        h1 = (h1 + a) & 0xFFFFFFFF; h2 = (h2 + b) & 0xFFFFFFFF
+        h3 = (h3 + c) & 0xFFFFFFFF; h4 = (h4 + d) & 0xFFFFFFFF
+        h5 = (h5 + e) & 0xFFFFFFFF; h6 = (h6 + f) & 0xFFFFFFFF
+        h7 = (h7 + g) & 0xFFFFFFFF; h8 = (h8 + hh) & 0xFFFFFFFF
+    end
+    h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8] =
+        h1, h2, h3, h4, h5, h6, h7, h8
+    if pos <= n then st.tail = string.sub(s, pos) end
+end
+
+-- Append the FIPS padding (0x80, zeros, 64-bit big-endian BIT length), compress
+-- the final block(s), and return the 64-char lowercase hex digest.
+function W.sha256Done(st)
+    local msgLen = st.len
+    local padLen = 55 - (msgLen % 64)
+    if padLen < 0 then padLen = padLen + 64 end
+    W.sha256Feed(st, "\128" .. string.rep("\0", padLen) .. string.pack(">I8", msgLen * 8))
+    local h = st.h
+    return string.format("%08x%08x%08x%08x%08x%08x%08x%08x",
+        h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8])
+end
+
 -- rgba = w*h*4 row-major top-first RGBA -> a valid RGBA8 PNG byte string.
 function W.encodePNG(rgba, w, h)
     W.initCRC()
@@ -799,15 +915,7 @@ function W.loadGraphics()
         W.loadTextureDefs()
     end)
     if ok and W.pal then W.texturesOk = true end
-    if not W.cacheDir then
-        local rok, root = pcall(FileMgr.GetMenuRootPath)
-        if rok and root and root ~= "" then
-            root = tostring(root)
-            W.cacheDir = root .. "/Lua/DoomWad/cache"
-            pcall(FileMgr.CreateDir, root .. "/Lua/DoomWad")
-            pcall(FileMgr.CreateDir, W.cacheDir)
-        end
-    end
+    W.ensureCacheDir()      -- per-wad dir; W.wadFp was set by openWad before this
 end
 
 -- Get a live ImTextureID for a wall texture (isFlat=false) or flat (true), or
@@ -6324,16 +6432,21 @@ function W.saveSettings()
     pcall(f.write, f, body); pcall(f.close, f)
 end
 
--- Ensure the on-disk cache directory exists (shared with the texture cache).
--- Returns true if a cache path is available, false if music must stay silent.
+-- Ensure the on-disk cache directory exists (textures, music and sfx share it).
+-- The directory is PER-WAD: cache/<size>-<crc> from W.wadFingerprint, because
+-- every cached file is named after its lump and different wads reuse the same
+-- lump names; a shared directory would serve the previous wad's baked assets
+-- after a wad switch. Returns true if a cache path is available.
 function W.ensureCacheDir()
     if W.cacheDir then return true end
     local rok, root = pcall(FileMgr.GetMenuRootPath)
     if rok and root and root ~= "" then
         root = tostring(root)
-        W.cacheDir = root .. "/Lua/DoomWad/cache"
+        local dir = root .. "/Lua/DoomWad/cache/" .. (W.wadFp or "shared")
         pcall(FileMgr.CreateDir, root .. "/Lua/DoomWad")
-        pcall(FileMgr.CreateDir, W.cacheDir)
+        pcall(FileMgr.CreateDir, root .. "/Lua/DoomWad/cache")
+        pcall(FileMgr.CreateDir, dir)
+        W.cacheDir = dir
     end
     return W.cacheDir ~= nil
 end
@@ -7304,12 +7417,35 @@ function W.ensureWadDownload()
             if cands and cands[1] then W.dlDone = true; return "done" end
         end
     end
+    -- A finished transfer passed the cheap checks: pump the pinned-SHA-256
+    -- verification, one ~96 KB slice per frame (hashing all 4.2 MB of pure Lua
+    -- in one go would stall the present thread for a second or more). Accept the
+    -- body only on an exact digest match; anything else counts as a failed
+    -- attempt and rotates to the next source.
+    if W.dlVerify then
+        local v = W.dlVerify
+        local ok = pcall(function()
+            local stop = min(v.pos + 98303, #v.body)   -- 96 KB, 64-byte aligned
+            W.sha256Feed(v.st, string.sub(v.body, v.pos, stop))
+            v.pos = stop + 1
+        end)
+        if not ok then W.dlVerify = nil; return W.wadRetry() end
+        if v.pos <= #v.body then return "busy" end
+        local dok, digest = pcall(W.sha256Done, v.st)
+        local body = v.body
+        W.dlVerify = nil
+        if dok and digest == WAD_SHA256 then
+            if W.writeBytes(W.dlTarget, body) then W.dlDone = true; return "done" end
+        end
+        return W.wadRetry()   -- digest mismatch (or disk write failed)
+    end
     -- Download sources. HTTPS host first; a plain-HTTP mirror is the fallback.
     -- Cherax's curl exposes NO TLS options (no verify/revoke/CAINFO), so a broken
     -- Windows schannel ("AcquireCredentialsHandle failed / Local Security Authority
     -- cannot be contacted") sinks EVERY HTTPS attempt - an HTTP URL skips the TLS
-    -- handshake entirely and works anyway. Both serve the same 4.2 MB shareware
-    -- IWAD; the body is validated by magic + size before it is trusted.
+    -- handshake entirely and works anyway. Both serve the byte-identical 4.2 MB
+    -- shareware IWAD; because HTTP is unauthenticated the body is only trusted
+    -- after it matches the pinned exact size + SHA-256 (see WAD_SHA256).
     W.WAD_URLS = W.WAD_URLS or { WAD_URL, "http://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad" }
     W.dlIdx = W.dlIdx or 1
     W.dlTries = W.dlTries or 0
@@ -7339,9 +7475,11 @@ function W.ensureWadDownload()
     pcall(function() code, body = W.dlHandle:GetResponse() end)
     W.dlHandle = nil
     local magic = (type(body) == "string") and body:sub(1, 4) or ""
-    if code == eCurlCode.CURLE_OK and type(body) == "string" and #body > 100000
-        and (magic == "IWAD" or magic == "PWAD") then
-        if W.writeBytes(W.dlTarget, body) then W.dlDone = true; return "done" end
+    if code == eCurlCode.CURLE_OK and type(body) == "string" and #body == WAD_SIZE
+        and magic == "IWAD" then
+        -- Cheap checks pass; hand the body to the sliced SHA-256 verify above.
+        W.dlVerify = { body = body, pos = 1, st = W.sha256New() }
+        return "busy"
     end
     return W.wadRetry()
 end
@@ -7374,9 +7512,15 @@ function W.drawBootProgress(st)
             ImGui.AddText(cx, cy + 18, "Check your connection, or drop DOOM1.WAD in", 200, 200, 205, 255)
             ImGui.AddText(cx, cy + 34, "Cherax/Lua/DoomWad and reopen DOOM.", 200, 200, 205, 255)
         else
-            local n = W.dlTries or 0
-            ImGui.AddText(cx, cy, "Downloading DOOM1.WAD..." .. ((n > 0) and (" (retry " .. n .. ")") or ""),
-                235, 220, 120, 255)
+            local txt
+            if W.dlVerify then
+                local pct = floor(100 * (W.dlVerify.pos - 1) / max(1, #W.dlVerify.body))
+                txt = "Verifying DOOM1.WAD... " .. pct .. "%"
+            else
+                local n = W.dlTries or 0
+                txt = "Downloading DOOM1.WAD..." .. ((n > 0) and (" (retry " .. n .. ")") or "")
+            end
+            ImGui.AddText(cx, cy, txt, 235, 220, 120, 255)
         end
     end)
     ImGui.End()
@@ -7619,9 +7763,10 @@ function W.renderTab()
         -- straight onto the list below on success (no folder scan involved).
         W.dlWanted = true; W.dlForce = true
         W.dlDone = false; W.dlChecked = false; W.dlFailed = false
-        W.dlTries = 0; W.dlIdx = 1; W.dlNextTry = 0
+        W.dlTries = 0; W.dlIdx = 1; W.dlNextTry = 0; W.dlVerify = nil
     end
-    if W.dlWanted then ImGui.Text("Downloading DOOM1.WAD...")
+    if W.dlWanted then
+        ImGui.Text(W.dlVerify and "Verifying DOOM1.WAD..." or "Downloading DOOM1.WAD...")
     elseif W.dlForce and W.dlFailed then
         ImGui.Text("Download failed. Check your connection and click again.")
     end
