@@ -1,12 +1,12 @@
 -- CheraxDoom.lua
--- A WAD reader, map-geometry parser and flat-shaded BSP renderer for
--- DOOM / DOOM2 style .wad files, running inside the Cherax Lua overlay.
--- Phase 1: load a .wad as raw bytes, parse the header + lump directory, and
--- decode a level's geometry lumps (VERTEXES, LINEDEFS, SIDEDEFS, SECTORS,
--- THINGS, and when present SEGS, SSECTORS, NODES) into Lua tables. Phase 2:
--- a BSP front-to-back wall renderer (flat-shaded, no textures) with player
--- spawn from THING type-1, floor-follow, and radius-based collision. Draws
--- inside one fullscreen overlay window.
+-- A self-contained DOOM engine that runs inside the Cherax Lua overlay: it
+-- loads a DOOM/DOOM2-format .wad from disk and plays it, rendering into one
+-- fullscreen overlay window. Covers WAD parsing, a textured BSP renderer
+-- (walls, visplane floors/ceilings, screen-space sky, billboard sprites),
+-- the 35 Hz game simulation (player movement/collision, weapons and hitscan,
+-- the full monster roster and AI ported from the original source), MIDI music
+-- via the Windows MCI sequencer, and the front-end menu / intermission / screen
+-- wipe. Faithful to vanilla DOOM behaviour (see the DoomSrc reference).
 --
 -- All state lives on the upvalue table W to stay under Lua's 200 local limit
 -- and avoid colliding with a second script. Binary parsing uses string.unpack

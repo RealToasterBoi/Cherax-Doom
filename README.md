@@ -18,8 +18,9 @@ own `.wad`.
 - **Renderer**: front-to-back BSP wall renderer with textured walls, textured
   floor/ceiling flats, sky, and distance shading. Billboard THING sprites are
   drawseg-silhouette clipped against the walls.
-- **Gameplay**: player spawn from the THING type-1 start, floor-follow, radius
-  collision, doors/lifts, a view weapon, and basic monster AI.
+- **Gameplay**: a 35 Hz simulation with player movement/collision, doors and
+  lifts, the DOOM weapon set with hitscan and projectile combat, item/ammo
+  pickups, and the full monster roster with AI ported from the original source.
 - **Front-end**: the WAD's own menu patch lumps (M_DOOM, M_SKULL, skill icons)
   baked to textures, with a text fallback; skill select and a screen-melt wipe.
 - **Music**: level music (MUS lumps converted to MIDI) played through the
@@ -37,8 +38,12 @@ own `.wad`.
 1. Put `CheraxDoom.lua` in your Cherax `Lua` folder and run it from the Lua tab.
 2. Put your `.wad` in `Cherax/Lua/DoomWad` (or `Cherax/Lua`). The Cherax root
    folder is wiped on update, so keep persistent files under `Lua`.
-3. Enable the **DOOM WAD** feature, open the **DOOM WAD** tab, press **Scan**,
-   pick a wad and a map, then close the menu to play.
+3. Enable the **DOOM WAD** feature and open the **DOOM WAD** tab. It scans for
+   wads on its own; pick one, then press the centered **Play** button to launch,
+   or pick a specific level from the map list. The top **Menu** entry is selected
+   by default, so leaving it alone starts you on DOOM's own title screen. Close
+   the menu to play. The **Scan** button re-checks the folders for wads you add
+   later.
 
 ### Controls
 
