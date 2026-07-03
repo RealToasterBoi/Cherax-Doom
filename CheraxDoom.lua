@@ -1,39 +1,31 @@
 -- CheraxDoom.lua
--- A WAD file reader, map-geometry parser and flat-shaded BSP renderer for
--- DOOM / DOOM2 style .wad files, built to run inside the Cherax Lua overlay.
--- PHASE 1 loads a .wad from disk as raw bytes (via FileMgr), parses the 12-byte
--- header and the lump directory, and decodes a level's geometry lumps
--- (VERTEXES, LINEDEFS, SIDEDEFS, SECTORS, THINGS, and when present SEGS,
--- SSECTORS, NODES) into plain Lua tables. PHASE 2 sits on top of that data
--- layer: a BSP front-to-back wall renderer (flat-shaded, no textures) with
--- player spawn from the THING type-1 start, floor-follow, and radius-based
--- free-walk collision. All of it draws inside one fullscreen overlay window.
+-- A WAD reader, map-geometry parser and flat-shaded BSP renderer for
+-- DOOM / DOOM2 style .wad files, running inside the Cherax Lua overlay.
+-- Phase 1: load a .wad as raw bytes, parse the header + lump directory, and
+-- decode a level's geometry lumps (VERTEXES, LINEDEFS, SIDEDEFS, SECTORS,
+-- THINGS, and when present SEGS, SSECTORS, NODES) into Lua tables. Phase 2:
+-- a BSP front-to-back wall renderer (flat-shaded, no textures) with player
+-- spawn from THING type-1, floor-follow, and radius-based collision. Draws
+-- inside one fullscreen overlay window.
 --
--- Everything lives on the single upvalue table W so the main chunk stays well
--- under Lua's 200 local limit and so a second script cannot collide with it.
--- Binary parsing uses string.unpack with little-endian ('<') formats. All WAD
--- indices are 0-based as stored on disk; add 1 when indexing a Lua array. The
--- value 0xFFFF (65535) is the "no sidedef" sentinel; the 0x8000 bit on a node
--- child marks a subsector reference.
+-- All state lives on the upvalue table W to stay under Lua's 200 local limit
+-- and avoid colliding with a second script. Binary parsing uses string.unpack
+-- with little-endian ('<') formats. WAD indices are 0-based on disk; add 1 when
+-- indexing a Lua array. 0xFFFF (65535) is the "no sidedef" sentinel; the 0x8000
+-- bit on a node child marks a subsector reference.
 
 local W = {}
 local FEATURE_HASH = (Utils and Utils.Joaat) and Utils.Joaat("LUA_DoomWad_MainToggle") or 0
--- Host-launch mode: the host script (bladscript) prepends a `BladscriptLoaded=true`
--- line ahead of this chunk before ExecuteScript'ing it. In that mode we auto-run
--- (no manual toggle), fetch the shareware IWAD on the first frame, and register a
--- hidden shutdown feature the host can OnClick() from the shared registry to
--- unload us. Run standalone the global is nil and none of this engages: the user
--- enables the DOOM WAD toggle by hand and supplies their own .wad.
+-- Host-launch mode: the host script prepends a `BladscriptLoaded=true` line ahead
+-- of this chunk. In that mode we auto-run, fetch the shareware IWAD on the first
+-- frame, and register a hidden shutdown feature the host can OnClick() to unload
+-- us. Standalone the global is nil: the user enables the toggle and supplies a .wad.
 local BLAD_MODE = rawget(_G, "BladscriptLoaded") == true
 local SHUTDOWN_HASH = (Utils and Utils.Joaat) and Utils.Joaat("CheraxDoom_Shutdown") or 0
 local WAD_URL = "https://raw.githubusercontent.com/nneonneo/universal-doom/main/DOOM1.WAD"
--- The only file the downloader will ever accept: DOOM1.WAD shareware 1.9
--- (canonical release, MD5 f0cefca49926d00903cf57551d901abe). Both download
--- sources serve this byte-identical file. One of them is plain HTTP (see
--- ensureWadDownload for why it must stay), so the body is unauthenticated in
--- transit; anything that does not match the exact size AND this SHA-256 -
--- mirror rot, a captive portal, a tampered response - is rejected before it
--- is written to disk or fed to the parser.
+-- The only accepted file: DOOM1.WAD shareware 1.9. One download source is plain
+-- HTTP (see ensureWadDownload), so the body is unauthenticated; anything not
+-- matching this exact size AND SHA-256 is rejected before it hits disk or parser.
 local WAD_SIZE = 4196020
 local WAD_SHA256 = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771"
 local floor = math.floor
@@ -86,9 +78,8 @@ end
 ----------------------------------------------------------------------
 -- lump-name helpers
 ----------------------------------------------------------------------
--- A WAD name is an 8-byte field. It is either a full 8 characters with no
--- terminator, or a shorter name NUL-terminated with trailing garbage. Cut at
--- the first NUL and upper-case before any comparison.
+-- A WAD name is an 8-byte field: either a full 8 chars, or a shorter name
+-- NUL-terminated with trailing garbage. Cut at the first NUL and upper-case.
 local function trimName(raw)
     if type(raw) ~= "string" then return "" end
     local z = string.find(raw, "\0", 1, true)
@@ -113,8 +104,7 @@ W.MAP_LUMPS = {
     REJECT = true, BLOCKMAP = true,
 }
 
--- DOOM2 uses MAPxx markers whose music lump name is NOT derivable from the map
--- name (ExMy maps use D_ExMy). This lookup maps each DOOM2 slot to its lump.
+-- DOOM2 MAPxx markers whose music lump is not derivable from the map name.
 W.MUS_DOOM2 = {
     MAP01 = "D_RUNNIN", MAP02 = "D_STALKS", MAP03 = "D_COUNTD", MAP04 = "D_BETWEE",
     MAP05 = "D_DOOM",   MAP06 = "D_THE_DA", MAP07 = "D_SHAWN",  MAP08 = "D_DDTBLU",
@@ -126,8 +116,7 @@ W.MUS_DOOM2 = {
     MAP29 = "D_SHAWN3", MAP30 = "D_OPENIN", MAP31 = "D_EVIL",   MAP32 = "D_ULTIMA",
 }
 
--- Verbatim DOOM strings (d_englsh.h / dstrings.c) so the front-end prompts read
--- exactly like the game instead of paraphrases. \n = line break.
+-- Verbatim DOOM strings so the front-end prompts match the game. \n = line break.
 W.STR = {
     NIGHTMARE  = "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.",
     DOSY       = "(press y to quit)",
@@ -135,7 +124,7 @@ W.STR = {
     PD_YELLOWK = "You need a yellow key to open this door",
     PD_REDK    = "You need a red key to open this door",
 }
--- Quit taunts (endmsg[], DOOM1 set); one is picked per quit-screen open.
+-- Quit taunts (DOOM1 set); one is picked per quit-screen open.
 W.QUITMSGS = {
     "are you sure you want to\nquit this great game?",
     "please don't leave, there's more\ndemons to toast!",
@@ -151,9 +140,8 @@ W.QUITMSGS = {
 -- SECTION A: WAD container
 ----------------------------------------------------------------------
 function W.reset()
-    -- Stop any playing music before dropping wad state (openWad -> reset runs on
-    -- every wad change). Guarded: reset can be reached before the audio section
-    -- is defined at load, so only call once the function exists.
+    -- Stop music before dropping wad state. Guarded: reset can run before the
+    -- audio section is defined at load, so only call once the function exists.
     if W.stopMusic then W.stopMusic() end
     W.musPlaying = false
     W.musTrack = nil
@@ -181,8 +169,8 @@ function W.reset()
     W.texW = nil        -- KEY -> source width
     W.texH = nil        -- KEY -> source height
     W.texCache = nil    -- KEY -> { id, tex, w, h, state } async GPU load state
-    -- The DISK cache is per-wad too: drop the resolved dir + fingerprint so the
-    -- next wad recomputes them (stale = it would serve the old wad's baked PNGs).
+    -- Disk cache is per-wad: drop the resolved dir + fingerprint so the next wad
+    -- recomputes them (stale = it would serve the old wad's baked PNGs).
     W.cacheDir = nil
     W.wadFp = nil
 end
@@ -227,13 +215,10 @@ end
 
 -- Fingerprint a wad for the on-disk cache: "<size>-<crc32 hex>" over the header,
 -- the whole lump directory, and up to ~64 evenly spaced 256-byte content samples.
--- Cached assets (baked PNGs, converted MIDs/WAVs) are keyed by LUMP NAME, and
--- different wads reuse the same names (DOOM1 vs FreeDoom vs any PWAD), so each
--- wad must get its own cache subdirectory or a wad switch silently serves the
--- previous wad's art and audio. The directory covers name/pos/size of every
--- lump; the sparse content samples additionally catch in-place lump edits that
--- leave the directory byte-identical. Called only after parseDirectory accepted
--- the header, so the unpack and directory slice below are already validated.
+-- Cached assets are keyed by LUMP NAME and different wads reuse the same names, so
+-- each wad must get its own cache subdirectory or a switch serves stale art/audio.
+-- The sparse content samples catch in-place lump edits that leave the directory
+-- byte-identical. Called only after parseDirectory accepted the header.
 function W.wadFingerprint(data)
     W.initCRC()
     local _, numLumps, dirOfs = string.unpack("<c4i4i4", data, 1)
@@ -250,10 +235,9 @@ function W.wadFingerprint(data)
     return string.format("%d-%08x", n, W.crc32(table.concat(parts)))
 end
 
--- Read a file as RAW BYTES. A WAD is binary and full of NUL / 0x1A / CRLF bytes,
--- so it must be read in binary mode. FileMgr.ReadFileContent is text-mode on this
--- build (it truncates/mangles binary), so use io.open(path, "rb") first and only
--- fall back to FileMgr if the Lua io library is unavailable.
+-- Read a file as RAW BYTES (a WAD is binary, full of NUL / 0x1A / CRLF bytes).
+-- FileMgr.ReadFileContent is text-mode on this build and mangles binary, so use
+-- io.open(path, "rb") first and fall back to FileMgr only if io is unavailable.
 function W.readFileBytes(path)
     local ook, f = pcall(io.open, path, "rb")
     if ook and f then
@@ -413,10 +397,10 @@ function W.parseNodes(bytes)
     return out
 end
 
--- Resolve each seg's front/back sector once, at load time, so the per-frame
--- path does no indirection. A seg points at a linedef and a side (dir): dir 0
--- uses the linedef's front (right) sidedef as the seg front, dir 1 uses the
--- back (left) sidedef. backSector stays nil for a one-sided line (solid wall).
+-- Resolve each seg's front/back sector once at load time. A seg points at a
+-- linedef and a side (dir): dir 0 uses the linedef's front (right) sidedef as
+-- the seg front, dir 1 uses the back (left). backSector stays nil for a
+-- one-sided line (solid wall).
 function W.resolveSegSectors(map)
     local lds, sds = map.linedefs, map.sidedefs
     for _, seg in ipairs(map.segs) do
@@ -501,8 +485,8 @@ function W.loadMap(name)
         return nil, W.status
     end
 
-    -- Sky pre-compute: whether any sector uses the F_SKY1 pseudo-flat (so the
-    -- sky backdrop is drawn) and which sky wall-texture this map wants.
+    -- Sky pre-compute: whether any sector uses the F_SKY1 pseudo-flat, and which
+    -- sky wall-texture this map wants.
     map.usesSky = false
     for _, s in ipairs(map.sectors) do
         if s.ceilTex == "F_SKY1" then map.usesSky = true; break end
@@ -691,11 +675,10 @@ function W.adler32(s)
     return ((b << 16) | a) & 0xFFFFFFFF
 end
 
--- Pure-Lua SHA-256 (FIPS 180-4), incremental. Used only to verify the
--- downloaded shareware IWAD against its pinned digest: sha256New() makes a
--- state, sha256Feed(st, slice) may be called with slices of any size (the
--- ~4 MB body is fed ~96 KB per present frame so hashing never stalls a frame),
--- sha256Done(st) pads and returns the digest as lowercase hex.
+-- Pure-Lua SHA-256 (FIPS 180-4), incremental. Verifies the downloaded shareware
+-- IWAD against its pinned digest: sha256New() makes a state, sha256Feed(st, slice)
+-- takes slices of any size (the ~4 MB body is fed ~96 KB per frame so hashing
+-- never stalls a frame), sha256Done(st) pads and returns lowercase hex.
 W.SHA_K = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -713,9 +696,8 @@ function W.sha256New()
              len = 0, tail = "", w = {} }
 end
 
--- Compress every full 64-byte block of (st.tail .. s); any remainder carries
--- over in st.tail for the next call. All words stay masked to 32 bits (Lua
--- integers are 64-bit, so sums never overflow before the mask).
+-- Compress every full 64-byte block of (st.tail .. s); any remainder carries over
+-- in st.tail. All words stay masked to 32 bits.
 function W.sha256Feed(st, s)
     st.len = st.len + #s
     if #st.tail > 0 then s = st.tail .. s; st.tail = "" end
@@ -755,8 +737,8 @@ function W.sha256Feed(st, s)
     if pos <= n then st.tail = string.sub(s, pos) end
 end
 
--- Append the FIPS padding (0x80, zeros, 64-bit big-endian BIT length), compress
--- the final block(s), and return the 64-char lowercase hex digest.
+-- Append FIPS padding (0x80, zeros, 64-bit big-endian BIT length), compress the
+-- final block(s), and return the 64-char lowercase hex digest.
 function W.sha256Done(st)
     local msgLen = st.len
     local padLen = 55 - (msgLen % 64)
@@ -918,6 +900,69 @@ function W.loadGraphics()
     W.ensureCacheDir()      -- per-wad dir; W.wadFp was set by openWad before this
 end
 
+-- Shared texture-load state stepper with SELF-HEALING. Cherax's async
+-- Texture.LoadTexture can fail or silently drop a load; without a retry the
+-- cache entry is poisoned and that surface stays flat-shaded forever. A load
+-- stuck invalid, or a failed LoadTexture that still has its PNG on disk
+-- (c.path), is retried with a fresh id after a cooldown, budget-gated.
+-- Returns the live ImGui handle or nil.
+function W.texStep(c)
+    if c.state == "fail" then
+        -- decode/encode failures have no path and are deterministic: permanent
+        if not c.path then return nil end
+        c.wait = (c.wait or 0) + 1
+        if c.wait > 300 and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
+            W.bakeUsed = (W.bakeUsed or 0) + 1
+            c.wait = 0
+            local lok, lid = pcall(Texture.LoadTexture, c.path)
+            if lok and lid then
+                c.id = lid; c.state = "pending"
+                W.texRetries = (W.texRetries or 0) + 1
+            end
+        end
+        return nil
+    end
+    if c.state == "pending" then
+        local vok, valid = pcall(Texture.IsTextureValid, c.id)
+        if not (vok and valid) then
+            -- still uploading, or the load was dropped: retry stuck ids
+            c.wait = (c.wait or 0) + 1
+            if c.wait > 300 and c.path and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
+                W.bakeUsed = (W.bakeUsed or 0) + 1
+                c.wait = 0
+                local lok, lid = pcall(Texture.LoadTexture, c.path)
+                if lok and lid then
+                    c.id = lid
+                    W.texRetries = (W.texRetries or 0) + 1
+                end
+            end
+            return nil
+        end
+        local tok, tex = pcall(Texture.GetTexture, c.id)
+        if not (tok and tex) then return nil end
+        c.tex = tex; c.state = "ready"; c.wait = nil
+    end
+    if c.state == "ready" and c.tex then
+        local gok, handle = pcall(function() return c.tex:GetCurrent() end)
+        if gok and handle then c.deadN = nil; return handle end
+        -- READY BUT DEAD: cache says loaded yet the live handle is gone
+        -- (evicted/freed on the Cherax side). Invisible to every state check.
+        -- Count it, and after a couple seconds of continuous death reload the PNG.
+        c.deadN = (c.deadN or 0) + 1
+        W.texDeadHits = (W.texDeadHits or 0) + 1
+        if c.deadN > 120 and c.path and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
+            W.bakeUsed = (W.bakeUsed or 0) + 1
+            c.deadN = 0
+            local lok, lid = pcall(Texture.LoadTexture, c.path)
+            if lok and lid then
+                c.id = lid; c.tex = nil; c.state = "pending"
+                W.texRevives = (W.texRevives or 0) + 1
+            end
+        end
+    end
+    return nil
+end
+
 -- Get a live ImTextureID for a wall texture (isFlat=false) or flat (true), or
 -- nil (caller falls back to a shaded strip). Call ONCE per seg per frame. Bakes
 -- lazily to a disk PNG then LoadTexture's it async; polls IsTextureValid.
@@ -961,36 +1006,19 @@ function W.getTex(name, isFlat)
         local id
         local lok, lid = pcall(Texture.LoadTexture, path)
         if lok then id = lid end
-        if not id then W.texCache[key] = { state = "fail" }; return nil end
-        W.texCache[key] = { id = id, state = "pending", w = sw, h = sh }
+        if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
+        W.texCache[key] = { id = id, state = "pending", w = sw, h = sh, path = path }
         return nil
     end
-    if c.state == "fail" then return nil end
-    if c.state == "pending" then
-        local vok, valid = pcall(Texture.IsTextureValid, c.id)
-        if not (vok and valid) then return nil end
-        local tok, tex = pcall(Texture.GetTexture, c.id)
-        if not (tok and tex) then return nil end
-        c.tex = tex
-        c.state = "ready"
-    end
-    if c.state == "ready" and c.tex then
-        local gok, handle = pcall(function() return c.tex:GetCurrent() end)
-        if gok and handle then return handle end
-    end
-    return nil
+    return W.texStep(c)
 end
 
 ----------------------------------------------------------------------
 -- SECTION F: BSP traversal + flat-shaded wall renderer
 --
--- DOOM world convention (mirrored here): map units, x grows east, y grows
--- north. Camera W.viewAngle is in RADIANS, 0 = +x (east), increasing
--- counter-clockwise, so viewAngle = rad(thing.angle) needs no remap. Forward
--- world vector = (cos,sin); right world vector = (sin,-cos). View space:
--- translate by -view then rotate by -viewAngle so depth = +forward and
--- lateral = +right. 1/depth is linear in screen-x, so inverse depth is what
--- we interpolate per column (never depth itself).
+-- Map units; x east, y north. W.viewAngle in radians, 0 = +x, CCW.
+-- View space: depth = +forward, lateral = +right. 1/depth is linear in
+-- screen-x, so inverse depth is interpolated per column (never depth).
 ----------------------------------------------------------------------
 W.BASECOL = { wall = { 170, 150, 120 }, upper = { 150, 155, 175 }, lower = { 185, 150, 118 } }
 
@@ -1003,19 +1031,17 @@ function W.setupView(sw, sh)
     W.centerY = W.viewH * 0.5
     W.horizon = W.centerY
     W.projScale = (W.viewW * 0.5) / tan(W.HFOV * 0.5)
-    W.RW = clamp(floor(sw / 8), 80, 200)   -- internal render columns (perf cap)
+    W.RW = clamp(floor(sw / 8), 80, 160)   -- internal render columns (perf +
+                                           -- draw-list vertex-limit cap)
     W.colW = W.viewW / W.RW
     W.sinA = sin(W.viewAngle); W.cosA = cos(W.viewAngle)
     W.ceilclip = W.ceilclip or {}
     W.floorclip = W.floorclip or {}
     W.colClosed = W.colClosed or {}
-    -- Drawseg silhouette pool (Doom-faithful sprite masking). Each occluding seg
-    -- records, for every column it spans, a snapshot of the cumulative clip window
-    -- (top = ceilclip, bottom = floorclip) plus its per-column depth. The BSP walk
-    -- is near-child-first, so ceilclip/floorclip already fold in every nearer seg;
-    -- the snapshot is therefore cumulative, and drawThing rebuilds each sprite's
-    -- clip from the farthest in-front seg per column (far->near, first real writer
-    -- wins). Pools are reused across frames (no per-frame allocation).
+    -- Drawseg silhouette pool for sprite masking. Each occluding seg snapshots,
+    -- per spanned column, the cumulative clip window (top = ceilclip, bot =
+    -- floorclip) + its depth. Near-child-first walk makes the snapshot cumulative;
+    -- drawThing rebuilds each sprite's clip far->near (first real writer wins).
     W.dsPool = W.dsPool or {}       -- reused drawseg records {colL,colR,invL,invR,top[],bot[]}
     W.clipTop = W.clipTop or {}     -- per-sprite scratch (drawThing inits its own range)
     W.clipBot = W.clipBot or {}
@@ -1024,9 +1050,10 @@ function W.setupView(sw, sh)
     end
     W.dsCount = 0                   -- drawsegs recorded this frame
     W.closedCount = 0
+    W.frameQuads = 0                -- emitted quads (vertex-budget accounting)
     W.bakeUsed = 0                         -- per-frame texture-bake budget counter
-    -- Visplane per-frame reset: bump the stamp (a plane column is "live" iff its
-    -- stamp == frameSeq), drop the plane-key map (pooled planes are never wiped).
+    -- Visplane per-frame reset: bump the stamp (column live iff stamp == frameSeq),
+    -- drop the plane-key map (pooled planes are never wiped).
     W.frameSeq = (W.frameSeq or 0) + 1
     W.planeCount = 0
     W.planeMap = W.planeMap or {}
@@ -1072,12 +1099,12 @@ function W.strip(col, y0, y1, r, g, b)
     if y1 <= y0 then return end
     local x0 = col * W.colW
     rectf(x0, y0, x0 + W.colW + 0.8, y1, r, g, b, 255)
+    W.frameQuads = (W.frameQuads or 0) + 1
 end
 
--- Brightness scalar = sector light x distance diminish, with vanilla fake
--- contrast (r_segs.c): exactly-E-W walls one light level (16) darker, exactly-
--- N-S walls one brighter. Muzzle flashes add W.extralight. Shared by the
--- flat-shaded path (as a color multiplier) and the textured path (as a tint).
+-- Brightness scalar = sector light x distance diminish, with fake contrast:
+-- exactly-E-W walls one light level (16) darker, exactly-N-S one brighter.
+-- Muzzle flashes add W.extralight. Shared by flat-shaded and textured paths.
 function W.wallLight(sector, depth, seg)
     local light = sector.light + (W.extralight or 0)
     local v1 = W.map.vertexes[seg.v1 + 1]
@@ -1106,10 +1133,9 @@ function W.greyTint(br)
 end
 
 -- Draw one perspective-correct textured column as CLAMP-safe vertical bands.
--- The sampler is CLAMP, so a wall taller than texH is one AddImage per texel
--- band (each band keeps uv v inside [0,1]). yTopFull/yBotFull are the UNCLAMPED
--- projected screen y of the wall's top/bottom (V is affine in screen y between
--- them); [yDrawTop,yDrawBot] is the clip-clamped visible range for this column.
+-- Sampler is CLAMP, so a wall taller than texH is one AddImage per texel band
+-- (v kept in [0,1]). yTopFull/yBotFull = unclamped projected screen y of the
+-- wall top/bottom (V affine in screen y); [yDrawTop,yDrawBot] = visible range.
 function W.stripTex(col, yDrawTop, yDrawBot, yTopFull, yBotFull, vTop, vBot, tex, u, texH, tint)
     if yDrawBot <= yDrawTop then return end
     local span = yBotFull - yTopFull
@@ -1133,6 +1159,7 @@ function W.stripTex(col, yDrawTop, yDrawBot, yTopFull, yBotFull, vTop, vBot, tex
             local v0 = (vLo - bandLo) / texH
             local v1 = (vHi - bandLo) / texH
             ImGui.AddImage(tex, x0, yLo, x1, yHi, u, v0, u, v1, tint)
+            W.frameQuads = (W.frameQuads or 0) + 1
         end
     end
 end
@@ -1198,16 +1225,14 @@ function W.renderSeg(seg)
     if not fs then return end
     local bs = seg.backSector and W.map.sectors[seg.backSector + 1] or nil
     -- Only a genuine one-sided line is a solid (middle-textured) wall. A two-sided
-    -- line always draws its upper/lower parts, even when the back sector is closed
-    -- (a shut door: the leaf is the UPPER texture, not the middle). The portal path
-    -- collapses the column to fully occlude when the opening is zero, so occlusion
-    -- is unchanged; this just stops a closed door rendering as an untextured slab.
+    -- line always draws its upper/lower parts even when the back sector is closed
+    -- (a shut door leaf is the UPPER texture). The portal path still fully occludes
+    -- a zero opening, so this only stops a closed door drawing as an untextured slab.
     local solid = (bs == nil)
 
-    -- r_segs.c sky hack ("worldtop = worldhigh"): when BOTH ceilings are sky,
-    -- the front sector's SKY plane is captured all the way down to the BACK
-    -- ceiling edge, so the band over the portal fills with sky instead of an
-    -- upper wall. This is what lets outdoor areas change ceiling height freely.
+    -- Sky hack: when BOTH ceilings are sky, capture the front SKY plane down to
+    -- the back ceiling edge so the portal band fills with sky, not an upper wall.
+    -- This lets outdoor areas change ceiling height freely.
     local capCeil = fs.ceil
     local bothSky = false
     if bs and fs.ceilTex == "F_SKY1" and bs.ceilTex == "F_SKY1" then
@@ -1231,10 +1256,9 @@ function W.renderSeg(seg)
                 local flags = ld.flags or 0
                 PEGTOP = (flags & 0x0008) ~= 0
                 PEGBOT = (flags & 0x0010) ~= 0
-                -- A two-sided line's mid is a MASKED texture (grate/fence): it
-                -- is not drawn inline here but recorded on the drawseg and drawn
-                -- in the sorted masked pass (W.drawMaskedSeg), like vanilla's
-                -- R_RenderMaskedSegRange, so sprites sort correctly against it.
+                -- A two-sided line's mid is a MASKED texture (grate/fence):
+                -- recorded on the drawseg and drawn in the sorted masked pass
+                -- (W.drawMaskedSeg) so sprites sort correctly against it.
                 texMid = W.getTex(sd.mid, false); dMid = sd.mid and W.texDefs[sd.mid]
                 if not solid then
                     texUp = W.getTex(sd.upper, false); dUp = sd.upper and W.texDefs[sd.upper]
@@ -1247,9 +1271,9 @@ function W.renderSeg(seg)
 
     local colL = clamp(floor(sxA / W.colW), 0, W.RW - 1)
     local colR = clamp(floor(sxB / W.colW), 0, W.RW - 1)
-    -- Grab a pooled drawseg silhouette record: per-column top/bot snapshot arrays
-    -- (indexed col-colL) plus 1/depth at both end columns for the per-column depth
-    -- test in drawThing. Degrades (records nothing) past the seg cap.
+    -- Pooled drawseg silhouette record: per-column top/bot snapshots (indexed
+    -- col-colL) + 1/depth at both end columns for drawThing's depth test.
+    -- Records nothing past the seg cap.
     local dsi, dsTop, dsBot = nil, nil, nil
     if W.dsCount < W.DS_MAXSEGS then
         W.dsCount = W.dsCount + 1
@@ -1269,21 +1293,27 @@ function W.renderSeg(seg)
                 local t = clamp(((col + 0.5) * W.colW - sxA) / (sxB - sxA), 0, 1)
                 local inv = invA + (invB - invA) * t
                 local depth = 1 / inv
-                -- Grey light tint + world dist along the wall are shared by all
-                -- textured parts of this column; only computed when texturing.
+                -- Grey light tint + world dist along the wall, shared by all
+                -- textured parts of this column; only when texturing.
                 local tint, distU
                 if texMid or texUp or texLo then
                     tint = W.greyTint(W.wallLight(fs, depth, seg))
                     distU = (uozA + (uozB - uozA) * t) / inv
                 end
-                -- VISPLANE CAPTURE: the front sector's floor + ceiling gaps that
-                -- this column leaves (OLD top/bot, before the clip update below).
-                -- Ceiling band = [top .. front ceiling projection]; floor band =
-                -- [front floor projection .. bot]. Solid and portal cases unify.
+                -- VISPLANE CAPTURE: the front sector's floor + ceiling gaps this
+                -- column leaves (OLD top/bot, before the clip update below).
+                -- Ceiling band = [top .. front ceiling proj]; floor band =
+                -- [front floor proj .. bot]. Visibility guards: floor plane only
+                -- when floor is below the eye, ceiling plane only when ceiling is
+                -- above the eye (or sky) - else the flat bleeds across the horizon.
                 local yCeilFront  = horizon - (capCeil  - viewZ) * projScale * inv
                 local yFloorFront = horizon - (fs.floor - viewZ) * projScale * inv
-                W.addPlaneCol(true,  fs.ceilTex,  fs.ceil,  fs.light, col, top, clamp(yCeilFront, top, bot))
-                W.addPlaneCol(false, fs.floorTex, fs.floor, fs.light, col, clamp(yFloorFront, top, bot), bot)
+                if capCeil > viewZ or fs.ceilTex == "F_SKY1" then
+                    W.addPlaneCol(true,  fs.ceilTex,  fs.ceil,  fs.light, col, top, clamp(yCeilFront, top, bot))
+                end
+                if fs.floor < viewZ then
+                    W.addPlaneCol(false, fs.floorTex, fs.floor, fs.light, col, clamp(yFloorFront, top, bot), bot)
+                end
                 if solid then
                     local yCeilFull = horizon - (fs.ceil - viewZ) * projScale * inv
                     local yFloorFull = horizon - (fs.floor - viewZ) * projScale * inv
@@ -1301,7 +1331,7 @@ function W.renderSeg(seg)
                         end
                     end
                     W.colClosed[col] = true; W.closedCount = W.closedCount + 1
-                    if dsi then                 -- full wall: closed window (top>=bot hides sprites)
+                    if dsi then                 -- full wall: closed window hides sprites
                         dsTop[col - colL] = W.viewH; dsBot[col - colL] = 0
                         dsWrote = true
                     end
@@ -1310,10 +1340,9 @@ function W.renderSeg(seg)
                     local yFbot = horizon - (fs.floor - viewZ) * projScale * inv
                     local yBtop = horizon - (bs.ceil - viewZ) * projScale * inv
                     local yBbot = horizon - (bs.floor - viewZ) * projScale * inv
-                    -- Upper wall: vanilla draws it unless BOTH ceilings are sky
-                    -- (the sky hack above already filled that band). A back-sky
-                    -- portal with NO upper texture assigned also skips: there is
-                    -- nothing to draw and vanilla would HOM there.
+                    -- Upper wall: drawn unless BOTH ceilings are sky (sky hack
+                    -- above filled that band), or a back-sky portal has no upper
+                    -- texture (nothing to draw).
                     if bs.ceil < fs.ceil and not bothSky
                         and not (bs.ceilTex == "F_SKY1" and not (sd and sd.upper)) then  -- upper step
                         local a = clamp(yFtop, top, bot); local b2 = clamp(yBtop, top, bot)
@@ -1355,8 +1384,8 @@ function W.renderSeg(seg)
                             dsWrote = true
                         end
                     elseif dsi then
-                        -- open portal: snapshot the cumulative clip window. A sprite
-                        -- behind is bounded by this opening (steps AND clear doorways).
+                        -- open portal: snapshot the cumulative clip window; a sprite
+                        -- behind is bounded by this opening.
                         dsTop[col - colL] = nTop; dsBot[col - colL] = nBot
                         dsWrote = true
                     end
@@ -1371,9 +1400,8 @@ function W.renderSeg(seg)
         dsi.invL = dsInvL; dsi.invR = dsInvR
         if (not solid) and texMid and dMid then
             -- Masked mid texture (grate/fence): flag this drawseg for the sorted
-            -- masked pass. The per-column top/bot snapshot above is exactly the
-            -- opening window folded with every nearer occluder, so drawMaskedSeg
-            -- only needs the projection + texture-mapping constants of this seg.
+            -- masked pass. The snapshot above is the opening folded with every
+            -- nearer occluder, so drawMaskedSeg needs only this seg's constants.
             dsi.mid = texMid; dsi.midW = dMid.w; dsi.midH = dMid.h
             dsi.midSxA = sxA; dsi.midSxB = sxB
             dsi.midInvA = invA; dsi.midInvB = invB
@@ -1381,9 +1409,8 @@ function W.renderSeg(seg)
             dsi.midUOff = xoff + segoff
             dsi.midFs = fs; dsi.midSeg = seg
             dsi.midDepth = 2 / (dsInvL + dsInvR)   -- seg-center depth, for the far->near sort
-            -- Vanilla pegging (r_segs.c): the texture hangs one texH from the
-            -- opening top, or sits on the opening bottom when lower-unpegged;
-            -- rowoffset shifts it. Never tiled vertically (masked = one band).
+            -- Pegging: hangs one texH from the opening top, or sits on the opening
+            -- bottom when lower-unpegged; rowoffset shifts it. Never tiled (one band).
             local openTop = (bs.ceil < fs.ceil) and bs.ceil or fs.ceil
             local openBot = (bs.floor > fs.floor) and bs.floor or fs.floor
             dsi.midHTop = (PEGBOT and (openBot + dMid.h) or openTop) + yoff
@@ -1415,13 +1442,11 @@ end
 -- SECTION G: visplanes (textured floors + ceilings) + sky
 --
 -- Floors/ceilings are the exact gaps the wall pass leaves, captured per column
--- during the front-to-back BSP walk (W.addPlaneCol) into pooled, stamp-validated
--- visplanes, then filled after the walk (W.drawPlanes). A plane's horizontal runs
--- are extracted with the classic column-sweep (O(perimeter)) and each run is one
--- affine-mapped quad (ImGui.AddImageQuad) of a TILED flat, with a distance/light
--- black-overlay shade. When a flat is not yet baked, or a run is wider than one
--- tiled period (near-horizon LOD), the run degrades to one distance-shaded solid
--- rect. F_SKY1 planes are drawn in SCREEN SPACE by W.drawSkyPlane (vanilla sky).
+-- during the BSP walk (W.addPlaneCol) into pooled stamp-validated visplanes,
+-- then filled after (W.drawPlanes). Horizontal runs come from a column-sweep;
+-- each run is one affine quad (AddImageQuad) of a TILED flat with a distance/
+-- light shade. Not-baked flats or runs wider than one tiled period degrade to a
+-- distance-shaded solid rect. F_SKY1 planes draw in SCREEN SPACE (W.drawSkyPlane).
 ----------------------------------------------------------------------
 -- Map name -> sky wall-texture name. ExMy -> SKY<episode>; DOOM2 MAPxx banded.
 function W.skyTexName(mapName)
@@ -1437,9 +1462,8 @@ end
 
 -- Fetch (or make) the pooled visplane that owns this column for the given
 -- (isCeil, flat, height, light). Each column is written at most once per plane;
--- a second subsector wanting the same key at the same column gets a sibling.
--- F_SKY1 planes all map together regardless of side/height/light (R_FindPlane
--- forces height=0, light=0 for the sky) and are drawn by W.drawSkyPlane.
+-- a second subsector wanting the same key/column gets a sibling. F_SKY1 planes
+-- all map together regardless of side/height/light and draw via W.drawSkyPlane.
 function W.getPlane(isCeil, flat, height, light, col)
     local key
     if flat == "F_SKY1" then key = "SKY"
@@ -1467,8 +1491,8 @@ function W.getPlane(isCeil, flat, height, light, col)
 end
 
 -- Record one column's [yTop,yBot] band into the matching visplane. Untextured
--- ("-") flats are skipped (the plane below shows through). F_SKY1 bands land in
--- the shared SKY plane and are drawn in screen space (vanilla R_DrawPlanes).
+-- ("-") flats are skipped (plane below shows through). F_SKY1 bands land in the
+-- shared SKY plane and are drawn in screen space.
 function W.addPlaneCol(isCeil, flat, height, light, col, yTop, yBot)
     if yBot <= yTop then return end
     if not flat then return end                       -- "-" ceil/floor: nothing to draw
@@ -1497,9 +1521,8 @@ function W.flatAvg(name)
     return a
 end
 
--- A flat replicated FLAT_TILE x FLAT_TILE into an (64*N) square RGBA buffer, so
--- one uv unit [0,1] spans FLAT_TILE repeats = 64*FLAT_TILE world units. Reuses
--- the wall/flat pipeline; returns rgba, S, S (or nil).
+-- A flat replicated FLAT_TILE x FLAT_TILE into a 64*N square RGBA buffer, so one
+-- uv unit spans FLAT_TILE repeats = 64*FLAT_TILE world units. Returns rgba,S,S or nil.
 function W.flatTiledRGBA(name)
     local src = W.flatToRGBA(name); if not src then return nil end   -- 64x64x4 bytes
     local N = W.FLAT_TILE; local S = 64 * N
@@ -1512,9 +1535,8 @@ function W.flatTiledRGBA(name)
     return band:rep(N), S, S                                         -- N tiles down
 end
 
--- Get a live ImTextureID for a TILED flat (keyed "FT:" so it never collides with
--- the wall/flat keys). Clone of W.getTex(true) with the tiled bake; nil until the
--- async upload validates (callers fall back to solid).
+-- Get a live ImTextureID for a TILED flat (keyed "FT:" to avoid wall/flat key
+-- collisions). Tiled bake; nil until the async upload validates (fall back to solid).
 function W.getTexTiled(name)
     if not name or not W.pal or not W.cacheDir then return nil end
     local key = "FT:" .. name
@@ -1537,31 +1559,18 @@ function W.getTexTiled(name)
             local pok, png = pcall(W.encodePNG, rgba, w, h)
             if not pok or not png then W.texCache[key] = { state = "fail" }; return nil end
             if not W.writeBytes(path, png) then W.texCache[key] = { state = "fail" }; return nil end
-            -- A 512x512 tiled-flat encode is ~58ms (pure-Lua crc32/adler32 over ~1MB),
-            -- vs ~1-4ms for a wall. Charge it heavily so at most ~1 happens per frame,
-            -- spreading the first-visit bakes instead of freezing for ~1.4s on map entry.
+            -- A 512x512 tiled-flat encode is ~58ms (pure-Lua crc/adler over ~1MB)
+            -- vs ~1-4ms for a wall. Charge it heavily so at most ~1 bakes per frame.
             W.bakeUsed = (W.bakeUsed or 0) + 3
         end
         local id
         local lok, lid = pcall(Texture.LoadTexture, path)
         if lok then id = lid end
-        if not id then W.texCache[key] = { state = "fail" }; return nil end
-        W.texCache[key] = { id = id, state = "pending", w = S, h = S }
+        if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
+        W.texCache[key] = { id = id, state = "pending", w = S, h = S, path = path }
         return nil
     end
-    if c.state == "fail" then return nil end
-    if c.state == "pending" then
-        local vok, valid = pcall(Texture.IsTextureValid, c.id)
-        if not (vok and valid) then return nil end
-        local tok, tex = pcall(Texture.GetTexture, c.id)
-        if not (tok and tex) then return nil end
-        c.tex = tex; c.state = "ready"
-    end
-    if c.state == "ready" and c.tex then
-        local gok, handle = pcall(function() return c.tex:GetCurrent() end)
-        if gok and handle then return handle end
-    end
-    return nil
+    return W.texStep(c)
 end
 
 -- Resolve a plane's tiled texture (lazy) + average colour, once per frame.
@@ -1575,8 +1584,8 @@ function W.resolvePlaneTex(p)
     p.avg = W.flatAvg(p.flat)
 end
 
--- Brightness scalar for a plane row: sector light x distance diminish (mirrors
--- W.wallLight minus the fake contrast). Muzzle flashes add W.extralight.
+-- Brightness scalar for a plane row: sector light x distance diminish (like
+-- W.wallLight minus fake contrast). Muzzle flashes add W.extralight.
 function W.planeLight(light, rowDist)
     local lf = 0.22 + 0.78 * (clamp(light + (W.extralight or 0), 0, 255) / 255)
     local fog = clamp(1.0 - rowDist * W.PLANE_FOG, 0.26, 1.0)
@@ -1584,10 +1593,9 @@ function W.planeLight(light, rowDist)
 end
 
 -- Draw one merged horizontal run of a plane: rows [rq*STEP .. +STEP], columns
--- [cS..cE]. rowDist (perpendicular depth) is constant across a row, so the run is
--- an affine quad; when the run spans more than one tiled period (near-horizon LOD)
--- or the flat is not ready, it degrades to one distance-shaded solid rect.
-function W.drawSpan(p, rq, cS, cE)
+-- [cS..cE]. rowDist is constant across a row, so the run is an affine quad; a
+-- run wider than one tiled period or a not-ready flat degrades to a solid rect.
+function W.drawSpan(p, rq, cS, cE, depth)
     local STEP = W.ROWSTEP
     local horizon, projScale, viewZ = W.horizon, W.projScale, W.viewZ
     local colW = W.colW
@@ -1610,6 +1618,9 @@ function W.drawSpan(p, rq, cS, cE)
     local wRbx = viewX + rdB * (cosA + sR * sinA); local wRby = viewY + rdB * (sinA - sR * cosA) -- BR
     local wLbx = viewX + rdB * (cosA + sL * sinA); local wLby = viewY + rdB * (sinA - sL * cosA) -- BL
 
+    -- Overload valve: near the ImGui 16-bit index wrap (whole-frame corruption),
+    -- drop remaining plane spans (small far slivers) - degrades gracefully.
+    if (W.frameQuads or 0) > 13000 then return end
     W.planeDraws = W.planeDraws + 1
     local texWorld = 64 * W.FLAT_TILE               -- one uv unit spans this many world units
     if p.tex and W.quadOk then
@@ -1619,16 +1630,52 @@ function W.drawSpan(p, rq, cS, cE)
         local uBL, vBL = wLbx / texWorld, wLby / texWorld
         local umin = min(uTL, uTR, uBR, uBL); local umax = max(uTL, uTR, uBR, uBL)
         local vmin = min(vTL, vTR, vBR, vBL); local vmax = max(vTL, vTR, vBR, vBL)
-        if (umax - umin) <= 1.0 and (vmax - vmin) <= 1.0 then
-            local ou, ov = floor(umin), floor(vmin) -- shift the near corner into [0,1)
+        local ou, ov = floor(umin), floor(vmin)     -- shift the near corner into [0,1)
+        if (umax - ou) <= 1.0 and (vmax - ov) <= 1.0 then
             local qp, qt = W.qp, W.qt
             qp[1].x = xL; qp[1].y = yT; qp[2].x = xR; qp[2].y = yT
             qp[3].x = xR; qp[3].y = yB; qp[4].x = xL; qp[4].y = yB
             qt[1].x = uTL - ou; qt[1].y = vTL - ov; qt[2].x = uTR - ou; qt[2].y = vTR - ov
             qt[3].x = uBR - ou; qt[3].y = vBR - ov; qt[4].x = uBL - ou; qt[4].y = vBL - ov
             ImGui.AddImageQuad(p.tex, qp[1], qp[2], qp[3], qp[4], qt[1], qt[2], qt[3], qt[4], 255)
-            if br < 0.97 then                        -- shade via a black overlay
+            W.frameQuads = (W.frameQuads or 0) + 1
+            if br < 0.953 then                       -- black-overlay shade (skip alpha<12: invisible)
                 ImGui.AddRectFilled(xL, yT, xR, yB, 0, 0, 0, ci((1 - br) * 255))
+                W.frameQuads = W.frameQuads + 1
+            end
+            return
+        end
+        -- Run does not fit one tile period after the shift (drawing it would
+        -- CLAMP-smear the edge texel). Split into halves until every piece fits;
+        -- the guards keep the cheap solid fill only for true near-horizon rows
+        -- whose span could never fit (span wider than the column count). Depth
+        -- cap 10 lets a full 200-column run split down to the <=2-column path below.
+        if cE > cS and (depth or 0) < 10
+            and (umax - umin) <= (cE - cS + 1) and (vmax - vmin) <= (cE - cS + 1) then
+            W.planeDraws = W.planeDraws - 1             -- parent draws nothing
+            local mid = floor((cS + cE) * 0.5)
+            W.drawSpan(p, rq, cS, mid, (depth or 0) + 1)
+            W.drawSpan(p, rq, mid + 1, cE, (depth or 0) + 1)
+            return
+        end
+        -- Narrow piece (<=2 columns) still straddling a boundary: draw textured
+        -- with the uv nudged into [0,1]. The <=2-column smear is imperceptible;
+        -- a solid tooth here would speckle every plane silhouette edge.
+        if (cE - cS) <= 1 and (umax - umin) <= 1.0 and (vmax - vmin) <= 1.0 then
+            local du = (umax - ou) > 1.0 and (umax - ou - 1.0) or 0
+            local dv = (vmax - ov) > 1.0 and (vmax - ov - 1.0) or 0
+            local qp, qt = W.qp, W.qt
+            qp[1].x = xL; qp[1].y = yT; qp[2].x = xR; qp[2].y = yT
+            qp[3].x = xR; qp[3].y = yB; qp[4].x = xL; qp[4].y = yB
+            qt[1].x = uTL - ou - du; qt[1].y = vTL - ov - dv
+            qt[2].x = uTR - ou - du; qt[2].y = vTR - ov - dv
+            qt[3].x = uBR - ou - du; qt[3].y = vBR - ov - dv
+            qt[4].x = uBL - ou - du; qt[4].y = vBL - ov - dv
+            ImGui.AddImageQuad(p.tex, qp[1], qp[2], qp[3], qp[4], qt[1], qt[2], qt[3], qt[4], 255)
+            W.frameQuads = (W.frameQuads or 0) + 1
+            if br < 0.953 then
+                ImGui.AddRectFilled(xL, yT, xR, yB, 0, 0, 0, ci((1 - br) * 255))
+                W.frameQuads = W.frameQuads + 1
             end
             return
         end
@@ -1636,11 +1683,12 @@ function W.drawSpan(p, rq, cS, cE)
     -- Solid fallback / far LOD: one distance-shaded rect (texture is a blur here).
     local base = p.avg or (p.isCeil and W.PLANECOL.ceil or W.PLANECOL.floor)
     ImGui.AddRectFilled(xL, yT, xR, yB, ci(base[1] * br), ci(base[2] * br), ci(base[3] * br), 255)
+    W.frameQuads = (W.frameQuads or 0) + 1
 end
 
--- Fill every live visplane's gap. Per plane: resolve its texture, then extract
--- horizontal runs with the classic DOOM column sweep (compare each column's row
--- range to the previous) and draw each run. Row indices are quantized to ROWSTEP.
+-- Fill every live visplane's gap. Per plane: resolve texture, extract horizontal
+-- runs with a column sweep (compare each column's row range to the previous),
+-- draw each run. Row indices are quantized to ROWSTEP.
 function W.drawPlanes()
     if W.quadOk == nil then
         W.quadOk = (type(ImGui.AddImageQuad) == "function")
@@ -1657,23 +1705,20 @@ function W.drawPlanes()
     for i = 1, W.planeCount do
         local p = W.planePool[i]
         if p.sky then
-            -- Vanilla sky branch (R_DrawPlanes): screen-space strips, never
-            -- world-mapped spans. Exempt from the plane budget: a truncated
-            -- sky is a hole straight to the background gradient.
+            -- Sky branch: screen-space strips, never world-mapped spans. Exempt
+            -- from the plane budget (a truncated sky is a hole to the background).
             W.drawSkyPlane(p)
         elseif W.planeDraws < W.PLANE_BUDGET then
             W.resolvePlaneTex(p)
-            -- Column sweep (classic DOOM R_MakeSpans): compare each column's row range
-            -- to the PREVIOUS column's ORIGINAL range. Empty range = top > bottom, with
-            -- top = BIG so the "open from top" arm runs. prevT/prevB keep the previous
-            -- column's unmodified range; the four while-loops mutate local copies only.
+            -- Column sweep: compare each column's row range to the PREVIOUS column's
+            -- ORIGINAL range. Empty range = top > bottom, top = BIG so the "open from
+            -- top" arm runs. prevT/prevB stay unmodified; the while-loops mutate copies.
             local prevT, prevB = BIG, -1
             for c = p.minx, p.maxx + 1 do               -- +1 flushes any still-open spans
                 local curT, curB = BIG, -1
                 if c <= p.maxx and p.stamp[c] == W.frameSeq then
-                    -- floor (not ceil) the top so the topmost band overlaps the wall
-                    -- edge by <STEP px; walls are drawn first, planes over them, so this
-                    -- covers the sub-STEP seam that otherwise leaks the background gradient.
+                    -- floor the top so the topmost band overlaps the wall edge by
+                    -- <STEP px, covering the sub-STEP seam (walls drawn first, planes over).
                     local tt = floor(p.top[c] / STEP)
                     local bb = floor((p.bot[c] - 1e-3) / STEP)
                     if bb >= tt then curT, curB = tt, bb end
@@ -1690,17 +1735,12 @@ function W.drawPlanes()
     end
 end
 
--- Draw one SKY visplane exactly like vanilla R_DrawPlanes' sky branch: the
--- captured columns are filled with SCREEN-SPACE strips of the sky wall texture,
--- never world-mapped, so the texture's bottom edge can never show at the
--- horizon (the old backdrop bug: mountains ending in the background gradient).
--- u: vanilla ANGLETOSKYSHIFT semantics - a full 360 deg turn pans 1024 texels
--- (90 deg of view = one 256-wide texture), per-column atan (xtoviewangle) so
--- the sky tracks the wall geometry; W.SKY_DIR keeps the proven pan direction.
--- v: r_sky.c/r_plane.c - dc_texturemid = 100, dc_iscale = 320/viewwidth, so
--- texel row = 100 + (y - horizon) * 320/viewW, tiling past the texture height
--- exactly like vanilla's column wrap. Adjacent columns with identical bands
--- merge into one AddImage (u is atan-sampled at both ends, runs kept narrow).
+-- Draw one SKY visplane: captured columns filled with SCREEN-SPACE strips of the
+-- sky wall texture, never world-mapped, so its bottom edge cannot show at the
+-- horizon. u: a full 360 deg turn pans 1024 texels (90 deg view = one 256-wide
+-- texture), per-column atan so the sky tracks the geometry; W.SKY_DIR sets pan
+-- direction. v: texel row = 100 + (y - horizon) * 320/viewW, tiling past texture
+-- height. Adjacent columns with identical bands merge into one AddImage.
 function W.drawSkyPlane(p)
     local skyName = W.map and W.map.skyName
     local tex = skyName and W.getTex(skyName, false)   -- sky is a wall TEXTURE (patch path)
@@ -1734,9 +1774,8 @@ function W.drawSkyPlane(p)
 end
 
 -- One sky quad [x0..x1] x [y0..y1]: split horizontally at texture wrap
--- boundaries and vertically at texH tile boundaries (the sampler is CLAMP, so
--- every AddImage must keep uv inside [0,1]). Full bright, no light shade
--- (vanilla draws the sky with colormaps[0] always).
+-- boundaries and vertically at texH tile boundaries (CLAMP sampler needs uv in
+-- [0,1]). Full bright, no light shade.
 function W.skyStrip(tex, x0, x1, y0, y1, tx0, tx1, texW, texH, horizon, vScale)
     if x1 <= x0 or y1 <= y0 then return end
     local v0 = 100 + (y0 - horizon) * vScale
@@ -1764,6 +1803,7 @@ function W.skyStrip(tex, x0, x1, y0, y1, tx0, tx1, texW, texH, horizon, vScale)
                     local yB = y0 + (hi - v0) / (v1 - v0) * (y1 - y0)
                     ImGui.AddImage(tex, xA, yA, xB, yB,
                         u0, (lo - k * texH) / texH, u1, (hi - k * texH) / texH, 0xFFFFFFFF)
+                    W.frameQuads = (W.frameQuads or 0) + 1
                 end
             end
         end
@@ -1775,20 +1815,18 @@ end
 ----------------------------------------------------------------------
 -- SECTION H: THINGS as billboard sprites (static render, no AI/pickups)
 --
--- Map THINGS (items, decorations, monster idle frames) are drawn as camera-
--- facing billboards after the walls + planes pass. Each thing type maps (by its
--- doomednum) to a sprite prefix + idle frame in W.THING_SPR; the S_START/S_END
--- lump namespace (scanned in W.scanNamespaces) is indexed into W.spriteFrames
+-- Map THINGS are drawn as camera-facing billboards after the walls + planes
+-- pass. Each thing type maps (by doomednum) to a sprite prefix + idle frame in
+-- W.THING_SPR; the S_START/S_END lump namespace is indexed into W.spriteFrames
 -- for O(1) frame/rotation resolution. Sprites are composited (single patch, with
--- alpha) to an on-disk PNG and uploaded exactly like walls/flats (shared budget +
--- async LoadTexture). Depth-sorting is far->near for correct sprite-vs-sprite
--- overlap; per-column silhouette clipping against the drawseg list (built during
--- the BSP wall pass, see W.buildSpriteClip) hides sprites behind walls and clips
--- partial cover. Unknown doomednums are skipped (no clutter, no wrong art).
+-- alpha) to PNG and uploaded like walls/flats (shared budget + async load).
+-- Depth-sorted far->near for correct overlap; per-column silhouette clipping
+-- against the drawseg list (W.buildSpriteClip) hides sprites behind walls.
+-- Unknown doomednums are skipped.
 ----------------------------------------------------------------------
 -- H.1: doomednum -> sprite catalogue. Player/DM starts (1-4,11) deliberately
--- absent. r = blocking radius (a LATER collision phase, unused here). hang = top
--- anchored to the sector ceiling. anim = optional idle flash frames (unused here).
+-- absent. r = blocking radius (unused here). hang = top anchored to the ceiling.
+-- anim = optional idle flash frames (unused here).
 W.THING_SPR = {
     -- MONSTERS (idle spawn frame 'A', directional)
     [3004]={spr="POSS",seq="A",rot=true, kind="monster",r=20},
@@ -1900,7 +1938,6 @@ W.KINDCOL = { monster={210,70,60}, weapon={230,200,70}, ammo={200,170,90},
 
 ----------------------------------------------------------------------
 -- SECTION Ha: gameplay data tables (pickups, ammo, weapon names, monster HP)
--- Ported from DOOM p_inter.c (P_GiveBody/Armor/Ammo/Weapon/Card, clipammo[]).
 ----------------------------------------------------------------------
 W.CLIPAMMO = { bul = 10, shl = 4, rck = 1, cel = 20 }   -- one "clip" per ammo type
 -- doomednum -> pickup descriptor. amt/max health, pts/atype armor, at/clips ammo,
@@ -1977,11 +2014,9 @@ W.rndtable = { 0,8,109,220,222,241,149,107,75,248,254,140,16,66,
  236,249 }
 function W.pRandom() W.rndIdx = (W.rndIdx + 1) & 0xFF; return W.rndtable[W.rndIdx + 1] end
 
--- info.c mobjinfo (exact vanilla numbers). speed = map units per P_Move call;
--- the state chains set the call cadence, so units/sec is emergent, not stored.
--- Sound fields are lump BASE names; *N > 1 means pick base1..baseN at random
--- (A_Look / A_Scream randomize the former-human and imp barks). melee/missile
--- say which attack branches exist (both true = one shared atk chain decides).
+-- info.c mobjinfo (exact vanilla numbers). speed = map units per P_Move call.
+-- Sound fields are lump BASE names; *N > 1 means pick base1..baseN at random.
+-- melee/missile flag which attack branches exist.
 W.MINFO = {
     POSS = { hp=20, speed=8, r=20, h=56, mass=100, pain=200, countkill=true,
         melee=false, missile=true,
@@ -2001,8 +2036,8 @@ W.MINFO = {
     BOSS = { hp=1000, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
         melee=true, missile=true,
         sight="DSBRSSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSBRSDTH" },
-    -- DOOM II roster + DOOM bosses (info.c mobjinfo, exact numbers).
-    -- mrVile/mrSkel/mrHalf/mrCyber = the per-species P_CheckMissileRange shaping.
+    -- DOOM II roster + DOOM bosses. mrVile/mrSkel/mrHalf/mrCyber = per-species
+    -- P_CheckMissileRange shaping.
     BOS2 = { hp=500, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
         melee=true, missile=true,
         sight="DSKNTSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSKNTDTH" },
@@ -2040,9 +2075,8 @@ W.MINFO = {
         melee=false, missile=false, psfx="DSKEENPN", dsfx="DSKEENDT" },
     BBRN = { hp=250, speed=0, r=16, h=16, mass=10000000, pain=255, countkill=false,
         melee=false, missile=false, psfx="DSBOSPN", dsfx="DSBOSDTH" },
-    -- The arch-vile flame (MT_FIRE): a stateful non-blocking, non-shootable fx
-    -- species; its THING_SPR entry has r=nil so hitscan/missiles/blocking all
-    -- ignore it, and only the "die" chain exists (S_FIRE1..30 ends removing it).
+    -- Arch-vile flame (MT_FIRE): non-blocking, non-shootable fx (r=nil); only the
+    -- "die" chain exists (S_FIRE1..30 ends removing it).
     FIRE = { hp=1000, speed=0, r=20, h=16, mass=100, pain=0, countkill=false,
         melee=false, missile=false },
     BAR1 = { hp=20, speed=0, r=10, h=42, mass=100, pain=0, noblood=true },
@@ -2184,8 +2218,8 @@ FATT = {
 },
 BSPI = {
  stnd={{f="A",t=10,a="look"},{f="B",t=10,a="look"}},
- -- run[1] is S_BSPI_SIGHT (a 20-tic freeze before the walk); the run loop
- -- re-enters at 2 (ch.loop), exactly like vanilla RUN12 -> RUN1.
+ -- run[1] is S_BSPI_SIGHT (a 20-tic freeze before the walk); the loop re-enters
+ -- at 2 (loop=2), like vanilla RUN12 -> RUN1.
  run={{f="A",t=20},{f="A",t=3,a="babymetal"},{f="A",t=3,a="chase"},{f="B",t=3,a="chase"},
       {f="B",t=3,a="chase"},{f="C",t=3,a="chase"},{f="C",t=3,a="chase"},{f="D",t=3,a="babymetal"},
       {f="D",t=3,a="chase"},{f="E",t=3,a="chase"},{f="E",t=3,a="chase"},{f="F",t=3,a="chase"},
@@ -2553,31 +2587,18 @@ function W.spriteGpu(name)
         end
         local id
         local lok, lid = pcall(Texture.LoadTexture, path); if lok then id = lid end
-        if not id then W.texCache[key] = { state = "fail" }; return nil end
-        W.texCache[key] = { id = id, state = "pending", w = sw, h = sh }
+        if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
+        W.texCache[key] = { id = id, state = "pending", w = sw, h = sh, path = path }
         return nil
     end
-    if c.state == "fail" then return nil end
-    if c.state == "pending" then
-        local vok, valid = pcall(Texture.IsTextureValid, c.id); if not (vok and valid) then return nil end
-        local tok, tex = pcall(Texture.GetTexture, c.id); if not (tok and tex) then return nil end
-        c.tex = tex; c.state = "ready"
-    end
-    if c.state == "ready" and c.tex then
-        local gok, handle = pcall(function() return c.tex:GetCurrent() end)
-        if gok and handle then return handle end
-    end
-    return nil
+    return W.texStep(c)
 end
 
--- Build the per-column sprite clip window (mfloorclip/mceilingclip) over columns
--- [cL,cR] for a sprite at inverse depth invD (=1/depth). Walks the drawseg list
--- far->near; the FIRST seg that both is in front of the sprite (its per-column
--- 1/depth > invD) and actually recorded that column wins it, and its snapshot is
--- the cumulative clip window there (ceilclip=top, floorclip=bottom). Because the
--- record order is near->far, the first winner in a far->near sweep is the FARTHEST
--- in-front seg, whose cumulative snapshot already folds in every nearer occluder.
--- clipTop/clipBot are left at -1 where nothing in front occludes (no clip).
+-- Build the per-column sprite clip window over columns [cL,cR] for a sprite at
+-- inverse depth invD (=1/depth). Walks the drawseg list far->near; the first seg
+-- in front of the sprite (per-column 1/depth > invD) that recorded the column
+-- wins it, with its cumulative snapshot as the clip window (ceilclip=top,
+-- floorclip=bottom). clipTop/clipBot stay -1 where nothing in front occludes.
 function W.buildSpriteClip(cL, cR, invD)
     local ctop, cbot, ds = W.clipTop, W.clipBot, W.dsPool
     for c = cL, cR do ctop[c] = -1; cbot[c] = -1 end
@@ -2652,8 +2673,7 @@ function W.drawThing(th, e, depth)
     local cL = clamp(floor(xLeft / colW), 0, W.RW - 1)
     local cR = clamp(floor((xRight - 1e-4) / colW), 0, W.RW - 1)
     local spanH = yBot - yTop                    -- sprite full screen height (>0)
-    -- Per-column silhouette clip from the drawseg list. depth is the constant
-    -- thing-center forward distance, so the whole billboard z-tests at one depth.
+    -- Per-column silhouette clip; the whole billboard z-tests at one depth.
     W.buildSpriteClip(cL, cR, 1 / depth)
     local ctop, cbot, viewH = W.clipTop, W.clipBot, W.viewH
     -- Runs merge only while BOTH clip edges match, so an unclipped sprite is still
@@ -2679,9 +2699,11 @@ function W.drawThing(th, e, depth)
             if v1 > 1 - vh then v1 = 1 - vh end
             if meta.tex then
                 ImGui.AddImage(meta.tex, rxL, runYT, rxR, runYB, u0, v0, u1, v1, tint)
+                W.frameQuads = (W.frameQuads or 0) + 1
             elseif W.SPRITE_PLACEHOLDER then
                 local col = W.KINDCOL[e.kind] or W.KINDCOL.decor
                 ImGui.AddRectFilled(rxL, runYT, rxR, runYB, ci(col[1] * br), ci(col[2] * br), ci(col[3] * br), 110)
+                W.frameQuads = (W.frameQuads or 0) + 1
             end
             W.spriteDraws = W.spriteDraws + 1     -- one charge per emitted run (matches old)
         end
@@ -2744,6 +2766,7 @@ function W.drawMaskedSeg(d)
                     ImGui.AddImage(tex, x0, y0, x0 + colW + 0.8, y1,
                         u, (y0 - yT) / (yB - yT), u, (y1 - yT) / (yB - yT),
                         W.greyTint(W.wallLight(fs, 1 / inv, seg)))
+                    W.frameQuads = (W.frameQuads or 0) + 1
                 end
             end
         end
@@ -2961,11 +2984,10 @@ function W.blocked(nx, ny)
 end
 
 -- Highest floor the player's bounding box overlaps at (x,y) = DOOM's tmfloorz, the
--- height the player actually stands at. Floor-follow MUST use this (not just the
--- center sector's floor): after a fall you can land with your box overlapping a
--- step, and standing at the lower center floor while the box sits on a higher step
--- is exactly the mismatch that wedged the player. Standing on the box's top floor
--- keeps tmfloor == feet, so you are never "inside" a step and can always walk off.
+-- height the player actually stands at. Floor-follow MUST use this, not the center
+-- sector's floor: after a fall the box can overlap a higher step, and standing at
+-- the lower center floor would leave the player "inside" the step. Standing on the
+-- box's top floor keeps tmfloor == feet so the player can always walk off.
 function W.floorZFor(R, x, y)
     local bl, br, bb, bt = x - R, x + R, y - R, y + R
     local sec = W.sectorAt(x, y)
@@ -2998,7 +3020,7 @@ end
 function W.floorZAt(x, y) return W.floorZFor(W.RADIUS, x, y) end
 
 -- P_TryMove for the player: commit the position if the box test passes, firing
--- any walk-over trigger lines the move crossed. Momentum stays untouched.
+-- any walk-over trigger lines the move crossed.
 function W.pTryMove(nx, ny)
     if W.blocked(nx, ny) then return false end
     local ox, oy = W.viewX, W.viewY
@@ -3008,8 +3030,8 @@ function W.pTryMove(nx, ny)
 end
 
 -- Would this line block the player's box (for the slide trace)? One-sided and
--- ML_BLOCKING always; a two-sided line blocks when its live opening is too
--- short for the player or steps up more than MAXSTEP from the current feet.
+-- ML_BLOCKING always; a two-sided line blocks when its opening is too short or
+-- steps up more than MAXSTEP from the current feet.
 function W.lineBlocksPlayer(ld)
     if ld.back == NONE or ld.front == NONE then return true end
     if (ld.flags & 0x0001) ~= 0 then return true end
@@ -3026,11 +3048,10 @@ function W.lineBlocksPlayer(ld)
     return false
 end
 
--- P_SlideMove: the blocked move slides along the nearest blocking wall instead
--- of stopping dead. Three lead-corner traces find the closest blocking line;
--- the remaining momentum is projected onto it (P_HitSlideLine) and re-tried.
--- Momentum is CLIPPED to the projected vector, so pushing into a wall does not
--- keep the full speed (matches vanilla). Stairstep axis fallback if all else fails.
+-- P_SlideMove: a blocked move slides along the nearest blocking wall. Three
+-- lead-corner traces find the closest blocking line; remaining momentum is
+-- projected onto it (P_HitSlideLine) and re-tried. Momentum is CLIPPED to the
+-- projected vector. Stairstep axis fallback if all else fails.
 function W.slideMove()
     local R = W.RADIUS
     local V, LD = W.map.vertexes, W.map.linedefs
@@ -3074,10 +3095,8 @@ function W.slideMove()
     if not W.pTryMove(W.viewX, W.viewY + W.momy) then W.pTryMove(W.viewX + W.momx, W.viewY) end
 end
 
--- Safety net: if the player is somehow inside a blocking zone (e.g. landed hard
--- against a tall step after a fall), push out toward the first clear direction so
--- they can never be permanently trapped. Inert in normal play (collision keeps the
--- player clear of blockers, so W.blocked at the current spot is false).
+-- Safety net: if the player is inside a blocking zone, push out toward the first
+-- clear direction so they can never be permanently trapped. Inert in normal play.
 W.UNSTICK_DIRS = { {8,0},{-8,0},{0,8},{0,-8},{6,6},{6,-6},{-6,6},{-6,-6} }
 function W.unstick()
     if not W.blocked(W.viewX, W.viewY) then return end
@@ -3092,10 +3111,9 @@ end
 ----------------------------------------------------------------------
 -- SECTION Ib: sector effects (doors) + line "use"
 --
--- Sectors are animated in place. The renderer, floor-follow, and W.blocked all
--- read sec.ceil / sec.floor live every frame, so raising a door sector's ceiling
--- both reveals it and unblocks passage with no other change. W.activeSectors[si]
--- holds at most one in-progress movement per sector index (keyed by sidedef sector).
+-- Sectors are animated in place; the renderer, floor-follow, and W.blocked read
+-- sec.ceil / sec.floor live every frame. W.activeSectors[si] holds at most one
+-- in-progress movement per sector index.
 ----------------------------------------------------------------------
 -- Specials engine constants (DOOM units per 35 Hz tic; movers run on a tic clock).
 W.VDOORSPEED = 2      -- door plane units per tic (blazing = x4)
@@ -3107,7 +3125,7 @@ W.CEILSPEED  = 1      -- ceiling mover base speed
 W.BUTTONTIME = 35     -- tics a pressed switch stays flipped before reverting
 
 -- Manual (use-activated) door line specials. type = door behaviour; key = keycard
--- colour required to open; one = one-shot (special cleared, door stays open).
+-- colour required; one = one-shot (special cleared, door stays open).
 W.DOOR_SPECIALS = {
     [1]   = { type = "normal" },
     [26]  = { type = "normal", key = "blue" },
@@ -3121,9 +3139,9 @@ W.DOOR_SPECIALS = {
     [118] = { type = "blazeOpen", one = true },
 }
 
--- Walk-over (cross) line specials -> generic effect. once = W1 (fires one time,
--- then the special clears); no once = WR (repeatable). mon = monsters may also
--- trigger; monOnly = only monsters (a player passes with no effect).
+-- Walk-over (cross) line specials -> generic effect. once = W1 (fires once, then
+-- clears); no once = WR (repeatable). mon = monsters may trigger; monOnly = only
+-- monsters.
 W.CROSS_KIND = {
     [2]={ev="door",kind="open",once=true}, [3]={ev="door",kind="close",once=true},
     [4]={ev="door",kind="normal",once=true,mon=true}, [5]={ev="floor",kind="raiseFloor",once=true},
@@ -3285,8 +3303,7 @@ function W.findMinLight(si, maxl)
 end
 
 -- Iterate every sector whose tag matches (remote specials). fn(si, sec) arms a
--- mover; sectors already running one are skipped (one per sector, like DOOM's
--- sec->specialdata). tag 0 is ignored so an untagged remote line does nothing.
+-- mover; sectors already running one are skipped (one per sector). tag 0 ignored.
 function W.forTagSectors(tag, fn)
     if not tag or tag == 0 then return false end
     local rtn = false
@@ -3346,7 +3363,7 @@ function W.movePlane(sec, si, speed, dest, crush, isCeil, dir)
     end
     if compress and W.thingBlocksPlane(si, isCeil and sec.floor or nh, isCeil and nh or sec.ceil) then
         if crush then
-            W.crushThings(si)                -- crushers keep moving and hurt (10 per 4 tics)
+            W.crushThings(si)                -- crushers keep moving and hurt
         else
             return "crushed"                 -- do not move; caller reverses/stalls
         end
@@ -3695,9 +3712,9 @@ function W.mapExists(name)
     return false
 end
 
--- G_DoCompleted: gather the intermission stats + compute the next map with the
--- vanilla secret-exit routing (ExM9 / MAP31/MAP32) and episode-end handling,
--- then hand off to the intermission screen.
+-- G_DoCompleted: gather intermission stats + compute the next map with vanilla
+-- secret-exit routing (ExM9 / MAP31/MAP32) and episode-end handling, then hand
+-- off to the intermission screen.
 function W.exitLevel(secret)
     W.finishLevel()                         -- keep gear across the level, drop keys/powers
     local cur = (W.map and W.map.name) or ""
@@ -3741,7 +3758,7 @@ function W.exitLevel(secret)
 end
 
 -- After the intermission: load the next map, or return to the front-end menu
--- when the episode/game is over (the victory text screens are not simulated).
+-- when the episode/game is over (victory text screens are not simulated).
 function W.worldDone(wm)
     if wm.next then W.startMap(wm.next)
     else
@@ -3753,9 +3770,8 @@ end
 
 -- EV_Teleport: move a player/monster to the MT_TELEPORTMAN (thing type 14) in a
 -- sector matching the line tag. side 1 (came from the back) does not teleport.
--- Vanilla trimmings: TFOG bursts + sound at BOTH ends, an 18-tic post-teleport
--- freeze, the player telefrags anything on the pad, and a monster whose pad is
--- occupied simply does not teleport (P_StompThing rule).
+-- TFOG bursts + sound at both ends, an 18-tic freeze, player telefrags anything
+-- on the pad, and a monster whose pad is occupied does not teleport.
 function W.evTeleport(ld, side, isPlayer, th)
     if side == 1 then return false end
     if not ld.tag or ld.tag == 0 then return false end
@@ -3874,7 +3890,7 @@ function W.crossSpecialLine(ld, side, isPlayer, th)
 end
 
 -- P_UseSpecialLine: the player pressed use on a special line. Returns true if the
--- line responded (so the caller stops looking). Manual doors, switches, exits.
+-- line responded. Manual doors, switches, exits.
 function W.useSpecialLine(ld)
     local sp = ld.special
     if W.DOOR_SPECIALS[sp] then W.evVerticalDoor(ld); return true end
@@ -3900,8 +3916,8 @@ function W.useSpecial(ld)
     if ld then W.useSpecialLine(ld) end
 end
 
--- P_ShootSpecialLine: player gunfire impacts an impact-special line. Scans forward
--- for the nearest such line not hidden behind a closer solid wall, then triggers it.
+-- P_ShootSpecialLine: gunfire impacts an impact-special line. Scans forward for
+-- the nearest such line not hidden behind a closer solid wall, then triggers it.
 function W.shootSpecialLine(x1, y1, ang, range)
     local dx, dy = cos(ang), sin(ang)
     local x2, y2 = x1 + dx * range, y1 + dy * range
@@ -3928,7 +3944,7 @@ function W.shootSpecialLine(x1, y1, ang, range)
 end
 
 -- Forward "use" ray (USERANGE 64): the nearest special line, unless a solid wall
--- is closer (cannot reach a door through a wall). Returns the linedef, or nil.
+-- is closer. Returns the linedef, or nil.
 function W.useLine()
     local x1, y1 = W.viewX, W.viewY
     local x2, y2 = x1 + cos(W.viewAngle) * 64, y1 + sin(W.viewAngle) * 64
@@ -4006,8 +4022,8 @@ function W.lightTick(lt)
     end
 end
 
--- P_PlayerInSpecialSector: damage / secret floors, only while grounded (the player
--- z equals the floor). radsuit (ironfeet) blocks nukage/slime damage.
+-- P_PlayerInSpecialSector: damage / secret floors, only while grounded.
+-- radsuit (ironfeet) blocks nukage/slime damage.
 function W.playerInSpecialSector()
     if W.playerDead then return end
     local sec = W.sectorAt(W.viewX, W.viewY); if not sec then return end
@@ -4053,9 +4069,8 @@ function W.tickSpecials()
     W.playerInSpecialSector()
 end
 
--- P_Ticker: ONE 35 Hz game tic. Everything gameplay-visible advances here so
--- every vanilla tic constant drops in verbatim; rendering interpolates the view
--- between tics (W.rSwap). Order matches vanilla: player, thinkers, specials.
+-- P_Ticker: ONE 35 Hz game tic. Everything gameplay-visible advances here;
+-- rendering interpolates the view between tics (W.rSwap). Order matches vanilla.
 function W.gameTic()
     W.oldPX = W.viewX; W.oldPY = W.viewY; W.oldVZ = W.viewZ   -- interp snapshot
     W.playerThink()
@@ -4065,8 +4080,8 @@ function W.gameTic()
     W.stTicker()
 end
 
--- Accumulate real time into 35 Hz tics and run the game clock. Bounded so a
--- long stall cannot spend the frame running hundreds of catch-up tics.
+-- Accumulate real time into 35 Hz tics. Bounded so a long stall cannot spend
+-- the frame running hundreds of catch-up tics.
 function W.runTics(dt)
     W.specAccum = (W.specAccum or 0) + dt
     local steps = 0
@@ -4085,8 +4100,8 @@ function W.runTics(dt)
     if W.specAccum > W.TIC * 6 then W.specAccum = 0 end
 end
 
--- P_SpawnSpecials: after a map loads, arm sector-special thinkers, count secrets,
--- reset the tic clock, and cache the trigger-line list the movement code scans.
+-- P_SpawnSpecials: arm sector-special thinkers, count secrets, reset the tic
+-- clock, and cache the trigger-line list the movement code scans.
 function W.spawnSpecials(map)
     W.levelTime = 0; W.specAccum = 0
     W.buttons = {}; W.lightThinkers = {}
@@ -4141,10 +4156,9 @@ function W.spawnSpecials(map)
     end
 end
 
--- P_NoiseAlert: flood the player's noise through connected sectors. Sound
--- passes any live opening; an ML_SOUNDBLOCK line eats one "block level" (sound
--- travels through at most one). Flooded sectors remember the noise-maker so
--- A_Look can wake on it. Iterative stack walk (deep maps recurse far).
+-- P_NoiseAlert: flood the player's noise through connected sectors. Sound passes
+-- any live opening; an ML_SOUNDBLOCK line eats one block level (travels through at
+-- most one). Flooded sectors remember the noise-maker so A_Look can wake on it.
 function W.noiseAlert()
     local map = W.map; if not (map and map.soundAdj) then return end
     W.soundValid = (W.soundValid or 0) + 1
@@ -4201,11 +4215,10 @@ end
 
 ----------------------------------------------------------------------
 -- SECTION Ic: player inventory + pickups + actor spawn
--- Inventory persists across levels (DOOM G_PlayerFinishLevel keeps health/ammo/
--- weapons, clears keys/powers). Pickups are enriched map THINGS touched by radius.
+-- Inventory persists across levels (keeps health/ammo/weapons, clears keys/powers).
 ----------------------------------------------------------------------
 function W.newGame()
-    W.skill = W.skill or 3               -- default Hurt Me Plenty; keep an explicit menu choice
+    W.skill = W.skill or 3               -- default Hurt Me Plenty
     W.health = 100
     W.armor = 0; W.armorType = 0
     W.ammo = { bul = 50, shl = 0, rck = 0, cel = 0 }
@@ -4240,9 +4253,9 @@ function W.finishLevel()                    -- between levels: keep gear, drop k
     W.bonusCount = 0; W.damageCount = 0; W.hudMsg = nil
 end
 
--- Skill 1..5 (ITYTD/HNTR/HMP/UV/Nightmare). W.skillBit maps to the DOOM thing
--- skill-flag bit a monster/item must carry to spawn at this skill (P_SpawnMapThing):
--- baby+easy need MTF_EASY(1), medium needs MTF_NORMAL(2), hard+nightmare need MTF_HARD(4).
+-- Skill 1..5 (ITYTD/HNTR/HMP/UV/Nightmare). skillBit maps to the skill-flag bit a
+-- thing must carry to spawn at this skill: baby+easy MTF_EASY(1), medium
+-- MTF_NORMAL(2), hard+nightmare MTF_HARD(4).
 W.SKILLNAME = { "I'm Too Young To Die", "Hey Not Too Rough", "Hurt Me Plenty", "Ultra-Violence", "Nightmare" }
 function W.skillBit()
     local s = W.skill or 3
@@ -4303,7 +4316,7 @@ function W.giveThing(th)
     return false
 end
 
--- End-of-frame item touch (DOOM P_TouchSpecialThing): radius overlap, give, remove.
+-- End-of-frame item touch (P_TouchSpecialThing): radius overlap, give, remove.
 function W.updatePickups()
     if not W.pickupThings then return end
     local px, py = W.viewX, W.viewY
@@ -4340,19 +4353,17 @@ function W.selectSlot(n)
     if pick ~= W.curWeapon then W.pendingWeapon = pick end
 end
 
--- Build the live-actor and pickup indices from the map THINGS (called per level).
--- Monsters/barrels get a .think tag + hp/z and enter W.thinkers (ticked once AI
--- lands); pickups get .pk and enter W.pickupThings; decor gets nothing. In place,
--- so renderThings/blocked keep reading the same table.
+-- Build the live-actor and pickup indices from the map THINGS (per level).
+-- Monsters/barrels get a .think tag + hp/z and enter W.thinkers; pickups get
+-- .pk and enter W.pickupThings; decor gets nothing. In place.
 function W.spawnActors(map)
     W.thinkers = {}
     W.pickupThings = {}
     W.freeThingSlots = {}
     W.killCount = 0; W.itemCount = 0
     W.totalKills = 0; W.totalItems = 0
-    -- Skill filter (P_SpawnMapThing): a thing spawns only if it is not multiplayer-
-    -- only AND carries this skill's flag bit. Filtered things are marked removed so
-    -- the renderer/collision/pickups all skip them (no frozen ghost monsters).
+    -- Skill filter (P_SpawnMapThing): spawn only if not multiplayer-only AND
+    -- carries this skill's flag bit. Filtered things are marked removed.
     local bit = W.skillBit()
     for _, th in ipairs(map.things) do
         local e = W.THING_SPR[th.dtype]
@@ -4373,14 +4384,13 @@ function W.spawnActors(map)
                     th.momx = 0; th.momy = 0; th.momz = 0
                     th.skullfly = false; th.tracer = nil
                     th.movedir = 8; th.movecount = 0
-                    th.reaction = (W.skill == 5) and 0 or 8   -- info reactiontime (0 on NM)
+                    th.reaction = (W.skill == 5) and 0 or 8   -- reactiontime (0 on NM)
                     th.threshold = 0
                     th.justhit = false; th.justattacked = false
                     th.ambush = (th.flags & 0x0008) ~= 0      -- deaf flag: sight-only wake
                     th.shadow = (th.dtype == 58)              -- spectre
                     th.target = nil; th.spr = nil; th.bright = false
                     if th.states then
-                        -- spawn state set directly, no action (P_SpawnMobj semantics)
                         local st = th.states.stnd[1]
                         th.stkey = "stnd"; th.stidx = 1
                         th.frame = st.f; th.tics = st.t
@@ -4403,17 +4413,12 @@ end
 
 ----------------------------------------------------------------------
 -- SECTION Id: actor tick (state machine, fx pool) + hitscan combat + weapons
--- Ported from DOOM p_pspr.c (weapons), p_map.c (P_LineAttack/P_RadiusAttack),
--- p_inter.c (P_DamageMobj), p_enemy.c/p_mobj.c (state frames + AI). Player weapons,
--- damage, pain/death animation, barrels, plus monster AI: A_Look sight/wakeup,
--- A_Chase 8-direction movement (P_NewChaseDir/P_Move with dropoff avoidance and
--- monster/player collision), and melee + hitscan attacks. Missile species walk up
--- and melee for now; their projectiles (imp/caco/baron fireballs) land in chunk 4.
+-- Player weapons, damage, pain/death animation, barrels, plus monster AI:
+-- A_Look sight/wakeup, A_Chase 8-direction movement, melee + hitscan attacks.
 ----------------------------------------------------------------------
 -- Spawn a short-lived cosmetic actor (puff/blood/fog/explosion) via the appended
--- thing pool so it draws + occludes like any billboard. frames = frame letters,
--- ftics = tics per frame (number or per-frame table). opts: bright, momz (u/tic),
--- startIdx (blood/melee-puff start mid-chain), spr required.
+-- thing pool. frames = frame letters, ftics = tics per frame (number or per-frame
+-- table). opts: bright, momz (u/tic), startIdx, spr required.
 function W.spawnFx(spr, frames, ftics, x, y, z, opts)
     local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
     local th = W.map.things[idx]
@@ -4443,9 +4448,8 @@ function W.fxThink(th)
 end
 
 -- P_SpawnMissile core: launch projectile kind from (x,y,z) at horizontal angle
--- ang (radians) with vertical momz (u/tic). owner ("player" or the firing
--- monster) is never hit by its own missile; a monster's missile also passes
--- through its own species (vanilla infighting rule). Plays the launch sound.
+-- ang (radians) with vertical momz (u/tic). owner is never hit by its own missile;
+-- a monster's missile also passes through its own species (infighting rule).
 function W.spawnProjectile(kind, x, y, z, ang, momz, owner)
     local p = W.PROJ[kind]; if not p then return end
     local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
@@ -4466,8 +4470,8 @@ function W.spawnProjectile(kind, x, y, z, ang, momz, owner)
 end
 
 -- P_ExplodeMissile: stop, enter the explosion frames (first tics shortened by
--- P_Random&3 like vanilla), apply the direct-hit roll and any A_Explode splash.
--- The BFG ball defers its tracer spray to explosion frame 3 (S_BFGLAND3).
+-- P_Random&3), apply the direct-hit roll and any A_Explode splash. The BFG ball
+-- defers its tracer spray to explosion frame 3.
 function W.projExplode(th, hit)
     local p = th.proj
     th.st = "boom"; th.momx = 0; th.momy = 0; th.momz = 0
@@ -4482,7 +4486,7 @@ function W.projExplode(th, hit)
     if (p.splash or 0) > 0 then W.radiusDamage(th.x, th.y, p.splash, p.splash, th, th.owner) end
 end
 
--- A_BFGSpray: 40 tracer rays over a 90 degree cone from the SHOOTER toward where
+-- A_BFGSpray: 40 tracer rays over a 90 degree cone from the shooter toward where
 -- the ball hit; each visible target takes the sum of 15 rolls of (P_Random&7)+1
 -- and gets a BFE2 flash at 1/4 body height. Fires on explosion frame 3.
 function W.bfgSpray(th)
@@ -4504,7 +4508,7 @@ end
 
 -- Missile per-tic: animate, substep (<=8u) the move testing wall / thing /
 -- player / floor-ceiling; explode on the first hit. A missile whose blocking
--- line fronts an F_SKY1 ceiling vanishes without exploding (vanilla sky hack).
+-- line fronts an F_SKY1 ceiling vanishes without exploding (sky hack).
 function W.projThink(th)
     if th.st == "boom" then
         th.tics = th.tics - 1
@@ -4526,7 +4530,7 @@ function W.projThink(th)
     if th.life <= 0 then th.removed = true; return end
     -- A_Tracer (revenant missile): every 4th tic leave a puff + smoke trail and
     -- steer at most TRACEANGLE (16.875 deg) toward the tracer target; the climb
-    -- eases toward the aim slope by 1/8 unit per call (p_enemy.c).
+    -- eases toward the aim slope by 1/8 unit per call.
     if th.proj.homing and ((W.levelTime or 0) & 3) == 0 then
         W.spawnFx("PUFF", "ABCD", 4, th.x, th.y, th.z, { bright = true })
         W.spawnFx("PUFF", "BCBCD", 4, th.x - th.momx, th.y - th.momy, th.z, { momz = 1 })
@@ -4606,8 +4610,7 @@ function W.projThink(th)
                 local fsec = fsd and W.map.sectors[fsd.sector + 1]
                 local far = bsec
                 if bsec and fsec then
-                    -- pick whichever side the missile is NOT in as the far sector
-                    local cur = W.sectorAt(ox, oy)
+                    local cur = W.sectorAt(ox, oy)      -- far sector = the side the missile is NOT in
                     far = (cur == bsec) and fsec or bsec
                 end
                 if far and far.ceilTex == "F_SKY1" and th.z > far.ceil - 8 then
@@ -4630,7 +4633,7 @@ end
 -- Monster state machine core (P_SetMobjState). A thing's state = (chain key,
 -- index) into W.SSTATES[species]; actions run on state ENTRY; a 0-tic state
 -- falls straight through to the next. t=-1 freezes (corpse). Advancing past
--- the end: stnd/run loop, atk/pain fall back to run, die/xdie removes (barrel).
+-- the end: stnd/run loop, atk/pain fall back to run, die/xdie removes.
 ----------------------------------------------------------------------
 function W.setMState(th, key, idx)
     local chains = th.states; if not chains then return end
@@ -4673,8 +4676,8 @@ function W.advMState(th)
     local ch = th.states and th.states[th.stkey]
     if not ch then return end
     local cur = ch[th.stidx]
-    -- nx = explicit in-chain jump (vanilla nextstate loops: chaingunner /
-    -- spider / arachnotron refire bursts, the lost soul's charge frames)
+    -- nx = explicit in-chain jump (chaingunner / spider / arachnotron refire
+    -- bursts, the lost soul's charge frames)
     local nidx = (cur and cur.nx) or (th.stidx + 1)
     if not ch[nidx] then
         local k = th.stkey
@@ -4713,15 +4716,12 @@ function W.distToTarget(th)
     return sqrt(dx * dx + dy * dy)
 end
 
--- P_CheckSight (linuxdoom p_sight.c), minus the BSP/REJECT acceleration: true iff
--- the 3D sight line from the looker eye (x1,y1,z1) to the target box (x2,y2,
--- zbot..ztop) is unobstructed. It traces the SLOPED line and keeps a vertical cone
--- [bottomslope, topslope]; at every two-sided line the trace crosses it raises the
--- floor slope / lowers the ceiling slope by the opening at that crossing (slope =
--- (open - z1)/frac, frac = fraction along the trace). A one-sided line, a closed
--- opening, or the cone pinching shut (topslope <= bottomslope) blocks sight. This
--- is why a monster in a pit or below a step can no longer "see" over the lip: the
--- flat-Z rayWallDist ignored the opening slope; this does not. See DoomSrc/p_sight.c.
+-- P_CheckSight, minus the BSP/REJECT acceleration: true iff the 3D sight line
+-- from the looker eye (x1,y1,z1) to the target box (x2,y2,zbot..ztop) is
+-- unobstructed. Traces the sloped line and keeps a vertical cone
+-- [bottomslope, topslope]; at every two-sided line crossed it raises the floor
+-- slope / lowers the ceiling slope by the opening there. A one-sided line, a
+-- closed opening, or the cone pinching shut (topslope <= bottomslope) blocks sight.
 function W.checkSight(x1, y1, z1, x2, y2, zbot, ztop)
     local topslope = ztop - z1
     local bottomslope = zbot - z1
@@ -4757,8 +4757,8 @@ function W.checkSight(x1, y1, z1, x2, y2, zbot, ztop)
     return true
 end
 
--- P_CheckSight wrapper: can the monster see its target? Vanilla eye height is
--- z + 3/4 of the looker's height; the target's full body box is the aim window.
+-- P_CheckSight wrapper: can the monster see its target? Eye height is z + 3/4 of
+-- the looker's height; the target's full body box is the aim window.
 function W.monsterSees(th, tgt)
     tgt = tgt or th.target or "player"
     if not W.tgtAlive(tgt) then return false end
@@ -4771,7 +4771,7 @@ function W.monsterSees(th, tgt)
 end
 
 -- A_FaceTarget (WAD degrees). Aiming at a shadow target (spectre / blur-sphere
--- player) fuzzes the angle by (P_Random-P_Random)<<21 like vanilla.
+-- player) fuzzes the angle by (P_Random-P_Random)<<21.
 function W.faceTarget(th)
     if not th.target then return end
     th.ambush = false
@@ -4791,17 +4791,17 @@ function W.checkMeleeRange(th)
     return W.monsterSees(th)
 end
 
--- P_CheckMissileRange: distance-scaled attack decision, with the vanilla
--- retaliation (just-hit) fast path and per-species range shaping.
+-- P_CheckMissileRange: distance-scaled attack decision, with the just-hit
+-- retaliation fast path and per-species range shaping.
 function W.checkMissileRange(th)
     if not W.monsterSees(th) then return false end
     if th.justhit then th.justhit = false; return true end   -- fight back NOW
     if (th.reaction or 0) > 0 then return false end
     local dist = W.distToTarget(th) - 64
     if not (th.info and th.info.melee) then dist = dist - 128 end  -- no melee: fire more
-    -- per-species shaping, exactly P_CheckMissileRange (p_enemy.c): the vile
-    -- refuses past 14*64; the revenant refuses INSIDE 196 (fist range) and
-    -- halves; cyberdemon/mastermind/lost soul halve; cyberdemon caps at 160.
+    -- per-species shaping (P_CheckMissileRange): the vile refuses past 14*64;
+    -- the revenant refuses inside 196 (fist range) and halves; cyberdemon/
+    -- mastermind/lost soul halve; cyberdemon caps at 160.
     local mi = th.info
     if mi then
         if mi.mrVile and dist > 14 * 64 then return false end
@@ -4852,9 +4852,8 @@ end
 -- exceeds MAXSTEP, it would stand over a dropoff > MAXSTEP (non-floaters only),
 -- or it overlaps another solid thing or the player. Floaters skip the height/
 -- step/dropoff gates. floatok = an opening tall enough exists, only the z gates
--- failed (P_Move nudges a floater vertically then). Crossed special lines are
--- collected into W.spechit (vanilla spechit[]) so a blocked monster can open a
--- manual door it walked into.
+-- failed. Crossed special lines go into W.spechit so a blocked monster can open
+-- a manual door it walked into.
 function W.monBlocked(th, nx, ny)
     local se = W.THING_SPR[th.dtype]
     local mi = th.info
@@ -4963,8 +4962,8 @@ function W.tryWalk(th)
 end
 
 -- P_NewChaseDir: choose an 8-way heading toward the target, trying the direct
--- diagonal, then each axis (larger-delta first, with the vanilla 200/256 random
--- swap), the old heading, a randomized full sweep, then the turnaround.
+-- diagonal, then each axis (larger-delta first, with the 200/256 random swap),
+-- the old heading, a randomized full sweep, then the turnaround.
 function W.newChaseDir(th)
     local olddir = th.movedir or 8
     local turn = W.OPPOSITE[olddir]
@@ -5002,8 +5001,7 @@ function W.monShootZ(th)
     return (th.z or 0) + ((th.info and th.info.h or 56) * 0.5) + 8
 end
 
--- P_SpawnMissile: from the monster at z+32 toward the target's feet; momz uses
--- the vanilla flight-time division; shadow targets fuzz the launch angle.
+-- Monster missile: from z+32 toward the target's feet; shadow targets fuzz angle.
 function W.spawnMonMissile(th, kind)
     local p = W.PROJ[kind]; if not p then return end
     local tx, ty, tz = W.tgtPos(th.target)
@@ -5015,10 +5013,8 @@ function W.spawnMonMissile(th, kind)
     return W.spawnProjectile(kind, th.x, th.y, (th.z or 0) + 32, ang, (tz - (th.z or 0)) / flight, th)
 end
 
--- Mancubus volley half: P_SpawnMissile aims at the target, then the SECOND
--- missile of each pair gets its angle skewed by offDeg with the horizontal
--- momentum recomputed (A_FatAttack1/2/3 post-spawn adjustment). momz keeps the
--- original aim solution, exactly like vanilla (only momx/momy are redone).
+-- Mancubus volley half: skew the second missile's angle by offDeg and recompute
+-- momx/momy; momz keeps the original aim solution.
 function W.spawnMonMissileOff(th, kind, offDeg)
     local mo = W.spawnMonMissile(th, kind)
     if not mo then return end
@@ -5032,8 +5028,8 @@ end
 ----------------------------------------------------------------------
 -- Monster action routines (p_enemy.c), dispatched by state entry via W.MACT.
 ----------------------------------------------------------------------
--- A_Look: wake on the sector's flooded sound target (AMBUSH monsters need
--- sight too) or on a player inside the 180 degree front cone.
+-- A_Look: wake on the sector's sound target (AMBUSH monsters also need sight)
+-- or on a player inside the 180 degree front cone.
 function W.actLook(th)
     th.threshold = 0
     local sec = W.sectorAt(th.x, th.y)
@@ -5078,8 +5074,7 @@ function W.actChase(th)
     end
     if mi.melee and W.checkMeleeRange(th) then
         if mi.atksfx then pcall(W.playSfx, mi.atksfx) end
-        -- species with a SEPARATE melee chain (revenant fist) use matk; the
-        -- rest share the atk chain and branch inside the attack action
+        -- species with a separate melee chain use matk; others share the atk chain
         W.setMState(th, (th.states and th.states.matk) and "matk" or "atk", 1)
         return
     end
@@ -5184,7 +5179,7 @@ function W.actExplode(th)
     W.radiusDamage(th.x, th.y, 128, 128, th, th.target)
 end
 
--- A_BossDeath (p_enemy.c, full port): per-map / per-species victory triggers.
+-- A_BossDeath: per-map / per-species victory triggers.
 -- MAP07: mancubi -> floor 666 lowers, arachnotrons -> floor 667 raises.
 -- E1M8 barons / E4M8 spider -> floor 666 lowers; E4M6 cyberdemon -> blaze door
 -- 666 opens; E2M8 cyberdemon / E3M8 spider -> the level simply ends.
@@ -5232,8 +5227,7 @@ function W.actBossDeath(th)
     W.exitLevel(false)
 end
 
--- A_CPosAttack (chaingunner + SS burst): one aimed hitscan per call, spread
--- (P_Random-P_Random)<<20 like A_PosAttack, shotgun bark per shot.
+-- A_CPosAttack: one aimed hitscan per call with (P_Random-P_Random) spread.
 function W.actCPosAttack(th)
     if not th.target then return end
     pcall(W.playSfx, "DSSHOTGN")
@@ -5245,8 +5239,7 @@ function W.actCPosAttack(th)
     W.lineAttack(th, th.x, th.y, sz, ang, 2048, slope, (W.pRandom() % 5 + 1) * 3)
 end
 
--- A_CPosRefire / A_SpidRefire: keep the burst rolling until the target is
--- gone or out of sight (then back to the run chain).
+-- A_CPosRefire / A_SpidRefire: keep firing until the target is gone or unseen.
 function W.actCPosRefire(th)
     W.faceTarget(th)
     if W.pRandom() < 40 then return end
@@ -5280,8 +5273,7 @@ function W.actHoof(th) pcall(W.playSfx, "DSHOOF"); W.actChase(th) end
 function W.actMetal(th) pcall(W.playSfx, "DSMETAL"); W.actChase(th) end
 function W.actBabyMetal(th) pcall(W.playSfx, "DSBSPWLK"); W.actChase(th) end
 
--- A_SkullAttack: hurl the lost soul at its target (SKULLSPEED 20/tic); the
--- charge itself is ticked by W.skullFlyMove until it slams.
+-- A_SkullAttack: hurl the lost soul at its target (SKULLSPEED 20/tic).
 function W.actSkullAttack(th)
     if not th.target then return end
     th.skullfly = true
@@ -5295,8 +5287,8 @@ function W.actSkullAttack(th)
     th.momz = (tz + hh * 0.5 - (th.z or 0)) / dist
 end
 
--- A_PainShootSkull: spit a live lost soul prestep units along angleDeg. Vanilla
--- refuses past 20 souls on the level; one spat into a wall dies on the spot.
+-- A_PainShootSkull: spit a lost soul prestep units along angleDeg. Refused past
+-- 20 souls on the level; one spat into a wall dies on the spot.
 function W.actPainShootSkull(th, angleDeg)
     local count = 0
     for _, o in ipairs(W.thinkers) do
@@ -5349,8 +5341,8 @@ function W.actSkelFist(th)
     end
 end
 
--- A_SkelMissile: launch the homing TRACER from 16 above the usual missile
--- origin, advance it one tic, and hand it the target to steer toward.
+-- A_SkelMissile: launch the homing TRACER from 16 above the usual origin,
+-- advance it one tic, and give it the target to steer toward.
 function W.actSkelMissile(th)
     if not th.target then return end
     W.faceTarget(th)
@@ -5427,9 +5419,8 @@ end
 
 function W.actVileStart(th) pcall(W.playSfx, "DSVILATK") end
 
--- A_VileTarget: spawn the flame on the victim. Vanilla passes target->x for
--- BOTH coordinates (kept: A_StartFire re-seats it in front of the victim on
--- the same tic whenever the vile still has sight).
+-- A_VileTarget: spawn the flame on the victim. target->x is passed for BOTH
+-- coordinates on purpose; A_StartFire re-seats it in front the same tic.
 function W.actVileTarget(th)
     if not th.target then return end
     W.faceTarget(th)
@@ -5470,7 +5461,7 @@ function W.actVileAttack(th)
     if th.target == "player" then
         W.momz = 1000 / 100             -- vanilla: momz = 1000*FRACUNIT/mass
     end
-    -- (monster victims keep their feet: walkers have no vertical momentum here)
+    -- monster victims keep their feet (no vertical momentum here)
     local an = (th.angle or 0) * (pi / 180)
     local fire = th.tracer
     if not fire then return end
@@ -5492,9 +5483,8 @@ function W.actKeenDie(th)
     W.evDoDoor({ tag = 666, front = NONE, back = NONE }, "open")
 end
 
--- Boss brain (MAP30). The spitter/cube spawner machinery is not simulated;
--- the brain itself is shootable, screams in a sweep of rocket bursts, and its
--- death ends the level (A_BrainDie = G_ExitLevel).
+-- Boss brain (MAP30). Cube spawner not simulated; the brain is shootable,
+-- screams in a sweep of rocket bursts, and its death ends the level.
 function W.actBrainPain(th) pcall(W.playSfx, "DSBOSPN") end
 
 function W.actBrainScream(th)
@@ -5526,10 +5516,9 @@ W.MACT = {
     brainpain = W.actBrainPain, brainscream = W.actBrainScream, braindie = W.actBrainDie,
 }
 
--- MF_SKULLFLY charge, one tic: no friction ever (p_mobj.c), bounce momz off
--- floor/ceiling (P_ZMovement), and the slam rules (PIT_CheckThing): hitting a
--- shootable thing deals (P_Random%8+1)*damage, then the skull stops and drops
--- back to its spawn state; a wall stops it the same way without damage.
+-- MF_SKULLFLY charge, one tic: no friction, momz bounces off floor/ceiling;
+-- hitting a shootable thing deals (P_Random%8+1)*damage then stops the skull,
+-- a wall stops it the same way without damage.
 function W.skullFlyMove(th)
     local mh = (th.info and th.info.h) or 56
     th.z = (th.z or 0) + (th.momz or 0)
@@ -5587,7 +5576,7 @@ function W.skullSlam(th, hit)
     end
     th.skullfly = false
     th.momx = 0; th.momy = 0; th.momz = 0
-    W.setMState(th, "stnd", 1)      -- vanilla: back to spawnstate
+    W.setMState(th, "stnd", 1)      -- back to spawnstate
 end
 
 -- One monster tic: skull charge OR damage-thrust knockback (friction 0.90625,
@@ -5609,9 +5598,8 @@ function W.monsterThink(th)
     if th.tics <= 0 then W.advMState(th) end
 end
 
--- Dynamically spawn a live monster-species thing mid-level (the pain
--- elemental's lost souls, the arch-vile flame). Reuses freed thing slots so it
--- renders, blocks and takes damage like a map-spawned actor.
+-- Spawn a live monster-species thing mid-level (lost souls, arch-vile flame).
+-- Reuses freed thing slots so it renders, blocks and takes damage normally.
 function W.spawnDynMonster(dtype, x, y, z)
     local e = W.THING_SPR[dtype]; if not e then return nil end
     local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
@@ -5691,9 +5679,8 @@ end
 
 -- P_LineAttack: one hitscan ray from src ("player" or a monster). Walls stop it
 -- (slope-aware); the nearest shootable thing before the wall takes the damage.
--- Monster shots can hit the player AND other monsters (infighting). Blood spawns
--- on flesh (state skips by damage size), rising puffs on walls (pulled back 4u,
--- melee puffs start at the small frame). Returns (victim or nil, distance).
+-- Monster shots hit the player and other monsters (infighting). Blood on flesh,
+-- puffs on walls (pulled back 4u). Returns (victim or nil, distance).
 function W.lineAttack(src, x1, y1, shootZ, ang, range, slope, dmg)
     slope = slope or 0
     local dx, dy = cos(ang), sin(ang)
@@ -6171,10 +6158,9 @@ function W.movePsprites()
     end
 end
 
--- Draw the view weapon + flash psprites with the vanilla R_DrawPSprite
--- transform: 320x168-view coordinates (BASEYCENTER 100), sprite offsets from
--- the WAD, scaled by viewH/168 and anchored to the view center/horizon. The
--- flash layer rides the gun's bob and draws fullbright.
+-- Draw the view weapon + flash psprites (R_DrawPSprite transform): 320x168-view
+-- coords, WAD sprite offsets scaled by viewH/168, anchored to view center/horizon.
+-- The flash layer rides the gun's bob and draws fullbright.
 function W.drawWeapon(sw, viewH)
     local S2 = viewH / 168
     local secl = W.sectorAt(W.viewX, W.viewY)
@@ -6198,9 +6184,9 @@ end
 
 ----------------------------------------------------------------------
 -- SECTION J: input, per-frame update, state machine
--- States: W.gameState in { "nowad","frontend","loading","play","error" } ("menu"
--- is a superseded safety-net render branch). Front-end sub-screens live in W.menu.screen.
--- (Separate from Phase-1 W.state, which stays the WAD container status.)
+-- W.gameState in { "nowad","frontend","loading","play","error" } ("menu" is a
+-- superseded safety-net branch). Front-end sub-screens live in W.menu.screen.
+-- (Separate from Phase-1 W.state, the WAD container status.)
 ----------------------------------------------------------------------
 W.VK = {
     W = 0x57, A = 0x41, S = 0x53, DK = 0x44, Q = 0x51, E = 0x45,
@@ -6209,7 +6195,7 @@ W.VK = {
     M = 0x4D, BACKSPACE = 0x08, Y = 0x59, N = 0x4E,
     ONE = 0x31, TWO = 0x32, THREE = 0x33, FOUR = 0x34, FIVE = 0x35, SIX = 0x36, SEVEN = 0x37,
 }
--- keys polled for rising-edge detection every frame (menu nav keys included)
+-- keys polled for rising-edge detection every frame
 W.trackVK = { W.VK.ENTER, W.VK.M, W.VK.BACKSPACE, W.VK.SPACE, W.VK.E,
     W.VK.ONE, W.VK.TWO, W.VK.THREE, W.VK.FOUR, W.VK.FIVE, W.VK.SIX, W.VK.SEVEN,
     W.VK.UP, W.VK.DOWN, W.VK.LEFT, W.VK.RIGHT, W.VK.ESCAPE, W.VK.Y, W.VK.N }
@@ -6224,8 +6210,8 @@ function W.thrust(angle, move)
     W.momy = W.momy + (move / 32) * sin(angle)
 end
 
--- P_MovePlayer: sample the held movement keys as this tic's command; thrust
--- applies only on the ground (no air control, momentum carries).
+-- P_MovePlayer: sample held movement keys as this tic's command; thrust applies
+-- only on the ground (no air control, momentum carries).
 function W.movePlayerCmd()
     local run = kdown(W.VK.SHIFT)
     local fm = 0
@@ -6243,7 +6229,7 @@ end
 
 -- P_XYMovement: clamp to MAXMOVE (30/tic), substep halves above MAXMOVE/2,
 -- blocked moves slide along the wall; ground friction 0.90625 with the
--- STOPSPEED no-input stop. Walk tops out ~8.3 u/tic, run ~15.6 (vanilla).
+-- STOPSPEED no-input stop.
 function W.playerXYMovement()
     if W.momx ~= 0 or W.momy ~= 0 then
         if W.momx > 30 then W.momx = 30 elseif W.momx < -30 then W.momx = -30 end
@@ -6394,20 +6380,18 @@ function W.playerThink()
 end
 
 function W.update(dt, menuOpen)
-    W.updateWipe(dt)                             -- advance the screen melt (over any state)
-    -- World is frozen (no input, no move) while the menu is open or a wipe plays.
+    W.updateWipe(dt)                             -- advance the screen melt
+    -- World is frozen while the menu is open or a wipe plays.
     if W.gameState == "play" and not menuOpen and not W.wipe.active then
         -- fire input: held state; the psprite ready/refire actions consume it.
-        -- Check LCTRL/RCTRL specifically (LMB via ImGui). NOTE: the generic
-        -- VK_CONTROL (0x11) is deliberately NOT polled - it is held/latched by
-        -- all sorts of other software and was the reason LCTRL/RCTRL were added.
-        -- A real Ctrl press still registers as 0xA2/0xA3, so nothing is lost.
+        -- Check LCTRL/RCTRL specifically (LMB via ImGui). Generic VK_CONTROL
+        -- (0x11) is deliberately NOT polled - it is latched by other software;
+        -- a real Ctrl press still registers as 0xA2/0xA3.
         local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
         local rawFire = kdown(0xA2) or kdown(0xA3) or md
-        -- Arming guard: a fire source that reads "held" from the very first frame
-        -- (a stuck/latched key or a garbage ImGui mouse state on some builds) must
-        -- NOT autofire the pistol at spawn. Require the input to be observed
-        -- RELEASED at least once before it can fire; a real tap arms it instantly.
+        -- Arming guard: a fire source reading "held" from the first frame (stuck
+        -- key or garbage ImGui mouse state) must not autofire at spawn. Require
+        -- the input observed RELEASED once before it can fire; a tap arms instantly.
         if not rawFire then W.fireArmed = true end
         W.fireHeld = rawFire and (W.fireArmed == true)
 
@@ -6427,8 +6411,8 @@ function W.update(dt, menuOpen)
                 W.turnHeld = 0
             end
             if W.mouseLook then
-                -- GTA's raw mouse-look input (INPUT_LOOK_LR): no cursor warp, reads 0
-                -- unfocused. Read the DISABLED control (all controls are suppressed).
+                -- raw mouse-look input (INPUT_LOOK_LR): no cursor warp, reads 0
+                -- unfocused. Read the DISABLED control (all controls suppressed).
                 local ok, look = pcall(Natives.InvokeFloat, 0x11E65974A982637C, 0, 1)
                 if ok and look then W.viewAngle = W.viewAngle - look * W.LOOKSENS end
             end
@@ -6455,8 +6439,8 @@ function W.update(dt, menuOpen)
         end
     elseif W.gameState == "intermission" and not menuOpen then
         -- edge-detected (never held-repeat), and no generic VK_CONTROL, so a
-        -- stuck fire source cannot auto-skip the intermission. W.firePrevWi is
-        -- seeded true on entry to swallow the held shot that flipped the exit.
+        -- stuck fire source cannot auto-skip. W.firePrevWi is seeded true on
+        -- entry to swallow the held shot that flipped the exit.
         local md = false; local mok, mr = pcall(ImGui.IsMouseDown, 0); if mok then md = mr end
         local fire = kdown(0xA2) or kdown(0xA3) or md
         if (fire and not W.firePrevWi) or kpressed(W.VK.SPACE) or kpressed(W.VK.E)
@@ -6474,7 +6458,7 @@ function W.update(dt, menuOpen)
     elseif not menuOpen and not BLAD_MODE
         and (W.gameState == "nowad" or W.gameState == "error" or W.gameState == "menu") then
         -- These screens have no DOOM menu to quit from; ESC/Backspace closes
-        -- the overlay (the Play Doom button reopens it).
+        -- the overlay.
         if kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then
             W.playOn = false; W.active = false
         end
@@ -6512,8 +6496,7 @@ function W.startMap(name)
     if not m then W.gameState = "error"; return end
     if W.spawnPlayer(m) then W.gameState = "play" end
     -- Defer music start to the present thread (onPresent services W.musPending):
-    -- MCI open/stop must share one thread or a present-thread stop cannot reach a
-    -- device opened on the menu thread. startMap can run from the menu (map picker).
+    -- MCI open/stop must share one thread. startMap can run from the menu (map picker).
     if W.gameState == "play" and W.map then W.musPending = W.map.name end
 end
 
@@ -6522,8 +6505,8 @@ end
 ----------------------------------------------------------------------
 -- Vanilla status bar (st_stuff.c): STBAR background, STTNUM big numbers with
 -- STTPRCNT, STARMS + STYSNUM/STGNUM arms grid, STKEYS pips, the STYSNUM ammo
--- table and the STF* face widget, all at their 320x200 coordinates scaled by
--- sh/200 and centered (black wings on widescreen).
+-- table and the STF* face widget, at 320x200 coords scaled by sh/200 and
+-- centered (black wings on widescreen).
 W.ST_FACES = nil
 function W.stInit()
     W.st = { faceIndex = 0, faceCount = 0, priority = 0, oldHealth = -1,
@@ -6713,8 +6696,8 @@ function W.drawHUD(sw, sh)
             or W.DOOR_SPECIALS[sp] and "SPACE: OPEN" or "SPACE: USE"
         ImGui.AddText(W.centerX - 34, W.horizon + 16, label, 245, 230, 140, 255)
     end
-    -- pickup / locked-door message, vanilla top-left in the hu_font (ImGui text
-    -- only while the glyphs bake or if the WAD lacks the STCFN lumps)
+    -- pickup / locked-door message, top-left in the hu_font (ImGui text only
+    -- while the glyphs bake or if the WAD lacks the STCFN lumps)
     local m = (W.hudMsgUntil and now() < W.hudMsgUntil) and W.hudMsg or nil
     if m then
         local mS = sh / 200
@@ -6974,15 +6957,14 @@ end
 ----------------------------------------------------------------------
 -- SECTION M: audio (MUS -> MIDI music, DMX -> WAV sound effects)
 --
--- DOOM music lumps are stored in id's MUS format (a compact event stream).
--- They are converted, once, to a Standard MIDI File on disk and played through
--- the OS media control interface (MCI) "sequencer" device. MciSendString only
--- reports success/failure (not the device's play position), and the sequencer
--- has no built-in loop, so looping is driven off the wall clock (ImGui.GetTime)
--- against the track's computed duration. Every MCI call is routed through W.mci
--- (pcall + boolean), so a missing or unavailable sequencer degrades to silence,
--- never a crash. Sound effects are DMX (DSxxx) PCM lumps converted to WAV and
--- played with Utils.PlaySound. All binary is written via io.open("wb").
+-- DOOM music lumps (id's MUS event stream) are converted once to a Standard
+-- MIDI File on disk and played through the OS media control interface (MCI)
+-- "sequencer" device. MciSendString reports only success/failure (not play
+-- position) and the sequencer has no built-in loop, so looping is driven off
+-- the wall clock (ImGui.GetTime) against the track's computed duration. Every
+-- MCI call routes through W.mci (pcall + boolean), so a missing sequencer
+-- degrades to silence. Sound effects are DMX (DSxxx) PCM lumps converted to
+-- WAV and played with Utils.PlaySound. All binary is written via io.open("wb").
 --
 -- Endianness: the MIDI container is BIG-endian (">"); MUS headers and WAV/RIFF
 -- are LITTLE-endian ("<").
@@ -7021,15 +7003,14 @@ function W.musicLumpFor(mapName)
 end
 
 -- Core MUS -> MIDI conversion. May return nil on any structural problem; the
--- public W.mus2midi wraps this in pcall so a truncated/garbage lump is silent.
--- volScale (0..1) multiplies note-on velocities so the music-volume slider can
--- attenuate the whole track at conversion time (MCI's sequencer has no live
--- volume command, so volume is baked into the cached .mid per level).
+-- public W.mus2midi wraps this in pcall so a garbage lump is silent. volScale
+-- (0..1) multiplies note-on velocities so the music-volume slider attenuates
+-- the whole track at conversion time (baked into the cached .mid per level).
 function W._mus2midi(mus, volScale)
     volScale = volScale or 1
     if type(mus) ~= "string" or #mus < 4 then return nil end
-    -- Passthrough: a lump that is already a Standard MIDI File is returned as-is
-    -- (0 = unknown exact length -> caller disables auto-loop for it).
+    -- Passthrough: a lump already a Standard MIDI File is returned as-is
+    -- (0 = unknown length -> caller disables auto-loop for it).
     if mus:sub(1, 4) == "MThd" then return mus, 0 end
     if #mus < 16 or mus:sub(1, 4) ~= "MUS\26" then return nil end
     local scoreLen   = string.unpack("<I2", mus, 5)
@@ -7038,8 +7019,8 @@ function W._mus2midi(mus, volScale)
     if scoreStart < 16 + instrCnt * 2 then return nil end
     if scoreStart >= #mus then return nil end
 
-    -- DIVISION=140, TEMPO=1000000us/qtr => 140*1e6/1e6 = 140 MIDI ticks/sec, so
-    -- one MUS tick maps 1:1 to one MIDI tick and deltas need no scaling.
+    -- DIVISION=140, TEMPO=1000000us/qtr => 140 MIDI ticks/sec, so one MUS tick
+    -- maps 1:1 to one MIDI tick and deltas need no scaling.
     local DIVISION, TEMPO = 140, 1000000
 
     local pos = scoreStart + 1
@@ -7170,8 +7151,8 @@ function W.mus2midi(mus, volScale)
     return midi, secs
 end
 
--- Send one MCI command. Returns false (never throws) if MCI is unavailable or
--- the command failed; only an explicit false result counts as failure.
+-- Send one MCI command. Returns false (never throws) on failure or if MCI is
+-- unavailable; only an explicit false result counts as failure.
 function W.mci(cmd)
     if not (Utils and Utils.MciSendString) then return false end
     local ok, res = pcall(Utils.MciSendString, cmd)
@@ -7179,10 +7160,9 @@ function W.mci(cmd)
     return res ~= false
 end
 
--- Settings persistence: a tiny key=value text file in Lua/DoomWad, loaded once
--- at boot and rewritten on every options change (so mouselook/music/volumes
--- stick between sessions with no manual save, like the host's saveable toggles).
--- Best-effort; a missing/garbage file just leaves the init defaults in place.
+-- Settings persistence: a key=value text file loaded once at boot and rewritten
+-- on every options change. Best-effort; a missing/garbage file leaves the init
+-- defaults in place.
 function W.settingsFile()
     if W.settingsPath ~= nil then return W.settingsPath end
     W.settingsPath = false
@@ -7212,7 +7192,7 @@ function W.loadSettings()
     end
 end
 
--- Write current settings. Called on every options change (cheap, ~5 short lines).
+-- Write current settings. Called on every options change.
 function W.saveSettings()
     local path = W.settingsFile(); if not path then return end
     local body = table.concat({
@@ -7226,11 +7206,10 @@ function W.saveSettings()
     pcall(f.write, f, body); pcall(f.close, f)
 end
 
--- Ensure the on-disk cache directory exists (textures, music and sfx share it).
--- The directory is PER-WAD: cache/<size>-<crc> from W.wadFingerprint, because
--- every cached file is named after its lump and different wads reuse the same
--- lump names; a shared directory would serve the previous wad's baked assets
--- after a wad switch. Returns true if a cache path is available.
+-- Ensure the on-disk cache directory exists. It is PER-WAD (cache/<size>-<crc>
+-- from W.wadFingerprint) because cached files are named after their lump and
+-- different wads reuse the same lump names; a shared dir would serve the previous
+-- wad's assets after a switch. Returns true if a cache path is available.
 function W.ensureCacheDir()
     if W.cacheDir then return true end
     local rok, root = pcall(FileMgr.GetMenuRootPath)
@@ -7254,8 +7233,8 @@ function W.playMusic(mapName)
     if not W.ensureCacheDir() then return end
     local ord, name = W.musicLumpFor(mapName)
     if not ord then return end
-    -- Volume is baked into the .mid, so cache per (track, volume): a level plays
-    -- silently at vol 0, at full velocity at vol 15. The file name carries the vol.
+    -- Volume is baked into the .mid, so cache per (track, volume). The file name
+    -- carries the vol.
     local vol = clamp(floor(W.musicVol or 15), 0, 15)
     local volScale = vol / 15
     local key = name .. "_v" .. vol
@@ -7265,8 +7244,8 @@ function W.playMusic(mapName)
         local dok, de = pcall(FileMgr.DoesFileExist, path)
         if dok and de then exists = true end
     end
-    -- Convert + cache once per (track, volume). If the .mid is already on disk and
-    -- we know its duration, skip the (re)conversion entirely.
+    -- Convert + cache once per (track, volume); skip if the .mid is already on
+    -- disk and its duration is known.
     W.musLenByName = W.musLenByName or {}
     local secs = W.musLenByName[key]
     if not (exists and secs) then
@@ -7283,7 +7262,7 @@ function W.playMusic(mapName)
         end
         if not midi then return end
         if not exists then
-            if not W.writeBytes(path, midi) then return end   -- io.open "wb"
+            if not W.writeBytes(path, midi) then return end
         end
         W.musLenByName[key] = secs
     end
@@ -7291,22 +7270,17 @@ function W.playMusic(mapName)
     W.musAlias = W.musAlias or "doommus"
     W.mci('close ' .. W.musAlias)             -- clear any stale alias
     if not W.mci('open "' .. mp .. '" type sequencer alias ' .. W.musAlias) then return end
-    -- Unload protection, three layers (periodic keep-alive MCI commands are NOT
-    -- an option: each play command costs a lagspike and degrades playback, per
-    -- in-game testing): (1) PRIMARY - on unload, the teardown present frames
-    -- deliver the stop via serviceStop (see the ON_UNLOAD handler); (2) a host
-    -- script, when present, stops the music from its own present-thread tick
-    -- the moment our liveness feature leaves the registry; (3) last resort -
-    -- the play below is BOUNDED to the track length, never unbounded, so even a
-    -- fully orphaned sequencer runs out at the end of the current track. The
-    -- bound rides on the same play command the track start and each loop
-    -- already issue, costing zero extra MCI traffic.
+    -- Unload protection, three layers (periodic keep-alive MCI commands are not an
+    -- option: each costs a lagspike and degrades playback): (1) on unload the
+    -- teardown present frames deliver the stop via serviceStop; (2) a host script,
+    -- when present, stops the music from its own present-thread tick once our
+    -- feature leaves the registry; (3) the play below is BOUNDED to the track
+    -- length so even a fully orphaned sequencer runs out at the end of the track.
     W.musBoundMs = nil
     if secs and secs > 0.5 and W.mci('set ' .. W.musAlias .. ' time format milliseconds') then
-        -- The bound must stay INSIDE the media: 'play to' past the sequence
-        -- length fails with MCIERR_OUTOFRANGE (verified against winmm; a +1000
-        -- overshoot here was the silent-music bug). Undershoot by 500ms; the
-        -- wall-clock loop reseek replays from the start anyway.
+        -- The bound must stay INSIDE the media: 'play to' past the sequence length
+        -- fails with MCIERR_OUTOFRANGE. Undershoot by 500ms; the wall-clock loop
+        -- reseek replays from the start anyway.
         local b = floor(secs * 1000) - 500
         if b > 1000 then W.musBoundMs = b end
     end
@@ -7314,8 +7288,7 @@ function W.playMusic(mapName)
     if W.musBoundMs then playCmd = playCmd .. ' to ' .. W.musBoundMs end
     local played = W.mci(playCmd)
     if not played and W.musBoundMs then
-        -- Never let the bound break playback: fall back to an unbounded play
-        -- (the host watchdog still stops it on unload).
+        -- Fall back to an unbounded play (the host watchdog still stops it).
         W.musBoundMs = nil
         played = W.mci('play ' .. W.musAlias)
     end
@@ -7348,9 +7321,8 @@ function W.updateMusic()
 end
 
 -- Stop + close the current track. Safe to call at any time (degrades silently
--- when MCI is unavailable). Clears the playing state either way. Logs the raw
--- MciSendString results to cherax.log (W.stopDiag) so the stop can be diagnosed
--- in-game, since MCI behaviour cannot be verified headlessly.
+-- when MCI is unavailable). Clears the playing state either way. Logs raw MCI
+-- results when W.stopDiag is set.
 function W.stopMusic(tag)
     local a = W.musAlias or "doommus"
     local ok1, r1, ok2, r2 = false, nil, false, nil
@@ -7369,9 +7341,8 @@ function W.stopMusic(tag)
 end
 
 -- Request a stop with a retry window: a single MCI stop/close can be missed
--- depending on the device/thread state in-game, so W.serviceStop re-sends it for
--- a number of frames. This is why the manual "disable music" (which retries every
--- frame) worked while the old one-shot toggle-off/unload stops did not.
+-- depending on device/thread state, so W.serviceStop re-sends it for a number
+-- of frames.
 function W.requestStop(tag)
     W.stopRetries = 30
     W.stopMusic(tag)
@@ -7456,7 +7427,7 @@ function W.playSfx(name)
     if not exists then
         local wav = W.dmx2wav(W.lumpBytes(ord), vol / 15)
         if not wav then return end
-        if not W.writeBytes(path, wav) then return end     -- io.open "wb"
+        if not W.writeBytes(path, wav) then return end
     end
     if Utils and Utils.PlaySound then
         pcall(Utils.PlaySound, path:gsub("/", "\\"), false)
@@ -7498,7 +7469,7 @@ W.OPT_ITEMS = {
     { text = "Look Sensitivity", opt = "looksens" },
 }
 
--- Menu patch lump -> RGBA (clone of W.spriteRGBA but keyed by the MAIN lump index).
+-- Menu patch lump -> RGBA, keyed by the MAIN lump index.
 function W.patchRGBA(name)
     local li = W.lumpIndex and W.lumpIndex[name]
     local data = W.lumpBytes(li and li[1]); if not data or #data < 8 then return nil end
@@ -7527,7 +7498,7 @@ function W.patchRGBA(name)
     return table.concat(out), w, h
 end
 
--- Async GPU upload of a menu patch (cache key "MU:"), clone of W.spriteGpu.
+-- Async GPU upload of a menu patch (cache key "MU:").
 function W.menuTex(name)
     if not (name and W.pal and W.cacheDir) then return nil end
     local key = "MU:" .. name
@@ -7549,21 +7520,11 @@ function W.menuTex(name)
         end
         local id
         local lok, lid = pcall(Texture.LoadTexture, path); if lok then id = lid end
-        if not id then W.texCache[key] = { state = "fail" }; return nil end
-        W.texCache[key] = { id = id, state = "pending" }
+        if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
+        W.texCache[key] = { id = id, state = "pending", path = path }
         return nil
     end
-    if c.state == "fail" then return nil end
-    if c.state == "pending" then
-        local vok, valid = pcall(Texture.IsTextureValid, c.id); if not (vok and valid) then return nil end
-        local tok, tex = pcall(Texture.GetTexture, c.id); if not (tok and tex) then return nil end
-        c.tex = tex; c.state = "ready"
-    end
-    if c.state == "ready" and c.tex then
-        local gok, handle = pcall(function() return c.tex:GetCurrent() end)
-        if gok and handle then return handle end
-    end
-    return nil
+    return W.texStep(c)
 end
 
 -- Patch pixel size + offsets (cheap 4-int header read, cached), independent of
@@ -7644,7 +7605,7 @@ function W.drawThermo(dx, dy, S, xbase, val, maxv)
     end
 end
 
--- draw one thermometer patch at doom-space (dx,dy); returns true if it drew a lump
+-- Draw one thermometer patch at doom-space (dx,dy); returns true if it drew a lump.
 function W.stPatchThermoPart(name, dx, dy, S, xbase)
     local w, h = W.patchSize(name)
     local handle = W.menuTex(name)
@@ -7742,9 +7703,9 @@ function W.fontLumpName(b)
 end
 
 -- Screen-pixel width of one line in the hu_font at scale S (space/unknown glyph
--- advances 4 units, matching vanilla). Calling this also kicks the glyph bakes;
--- returns nil while any needed glyph is not yet GPU-ready so the caller can fall
--- back to plain ImGui text for the frame instead of drawing a gap-toothed line.
+-- advances 4 units, matching vanilla). Also kicks the glyph bakes; returns nil
+-- while any needed glyph is not yet GPU-ready so the caller can fall back to
+-- plain ImGui text for the frame.
 function W.fontLineWidth(line, S)
     local w, ready = 0, true
     for i = 1, #line do
@@ -7782,9 +7743,9 @@ function W.drawFontLine(line, x, y, S, a)
 end
 
 -- Draw a possibly multi-line string (\n separated) centered on cx, lines stacked
--- downward from y0. Used for the verbatim DOOM prompts (NIGHTMARE / quit taunts).
--- Rendered with the WAD's own hu_font like vanilla; the r/g/b ImGui text is only
--- the fallback while the glyphs bake or when the WAD lacks the STCFN lumps.
+-- downward from y0. Rendered with the WAD's own hu_font like vanilla; the r/g/b
+-- ImGui text is only the fallback while the glyphs bake or when the WAD lacks the
+-- STCFN lumps.
 function W.drawMsgLines(text, cx, y0, lh, r, g, b, a)
     local S = lh / 12                       -- vanilla steps 12 doom-units per line
     local y = y0
@@ -7803,9 +7764,8 @@ function W.drawMsgLines(text, cx, y0, lh, r, g, b, a)
 end
 
 -- Attract background: load the first map and pose a camera at the player start so
--- the menu (main/skill/options) renders over a live, slowly panning view of the
--- level instead of a black fill. Monsters/items are spawned (skill-filtered) so the
--- scene looks lived-in; they are NOT ticked (no AI) - the pan supplies the motion.
+-- the menu renders over a live, slowly panning view of the level. Monsters/items
+-- are spawned (skill-filtered) but NOT ticked (no AI); the pan supplies the motion.
 function W.startAttract()
     W.attractOn = true                       -- mark attempted so we do not reload every frame
     if not (W.mapList and #W.mapList > 0 and W.loadMap) then return end
@@ -7905,9 +7865,8 @@ function W.updateFrontend(dt)
     end
     if scr == "quit" then
         if kpressed(W.VK.Y) then
-            -- Host mode: Quit fully unloads CheraxDoom back to GTA (same path the
-            -- host's Stop button drives). Standalone closes the overlay too; the
-            -- next Play Doom click reopens on the title screen.
+            -- Host mode: Quit fully unloads back to GTA. Standalone closes the
+            -- overlay too; the next Play Doom click reopens on the title screen.
             if BLAD_MODE then W.hostShutdown()
             else
                 W.playOn = false; W.active = false
@@ -8011,34 +7970,42 @@ end
 function W.render()
     local sok, sw, sh = pcall(ImGui.GetDisplaySize)
     if not sok or not sw or sw < 16 or sh < 16 then return end
+    -- VERTEX BUDGET: one ImGui window = one draw list with 16-bit vertex indices
+    -- (~65k vertices = ~16k quads). Past that, indices wrap and whole batches
+    -- render as garbage. A multi-window split is not viable (extra windows render
+    -- behind the first, hiding planes/sprites), so keep the per-frame quad count
+    -- low: ROWSTEP 3, shade rects only when visibly dark, hard overload valve in
+    -- drawSpan. The body runs under pcall so a mid-frame error cannot skip End():
+    -- an unbalanced Begin/End would desync the shared ImGui window stack.
+    W.rSwap()
+    local errs = nil
     ImGui.SetNextWindowPos(0, 0, ImGuiCond.Always)
     ImGui.SetNextWindowSize(sw, sh, ImGuiCond.Always)
     ImGui.Begin("##DoomWadOverlay", true, W.OVERLAY_FLAGS)
-    -- Draw the body under pcall so a mid-frame error can never skip ImGui.End():
-    -- an unbalanced Begin/End would desync the shared ImGui window stack and
-    -- corrupt Cherax's own overlay/menu on later frames.
-    W.rSwap()
     local bok, berr = pcall(W.renderBody, sw, sh)
-    W.rRestore()
+    if not bok then errs = tostring(berr) end
+    if W.phase2 then
+        local pok, perr = pcall(W.drawPlanes)
+        if not pok then errs = (errs or "") .. " planes: " .. tostring(perr) end
+        local cok, cerr = pcall(W.renderBodyPost, sw, sh)
+        if not cok then errs = (errs or "") .. " post: " .. tostring(cerr) end
+    end
     ImGui.End()
-    if not bok then Logger.LogError("[DOOMWAD] render body: " .. tostring(berr)) end
+    W.rRestore()
+    if errs then Logger.LogError("[DOOMWAD] render body: " .. errs) end
 end
 
+-- Window A: background + walls (plane capture happens during the BSP walk).
+-- Sets W.phase2 when the planes/post windows must follow.
 function W.renderBody(sw, sh)
     local gs = W.gameState
+    W.phase2 = nil
     if gs == "play" then
         W.setupView(sw, sh)
         W.drawBackground()                                  -- safety fill under planes/sky
         if W.map and W.map.rootNode then W.renderNode(W.map.rootNode) end  -- walls + plane capture
-        W.drawPlanes()                                      -- fill the floor/ceiling gaps
-        W.renderThings()                                    -- billboards over walls+planes (drawseg-clipped)
-        W.drawWeapon(sw, W.viewH)                            -- view weapon over the world, under HUD
-        W.drawHUD(sw, sh)
-        if W.menuOpen then
-            ImGui.AddText(floor(sw * 0.5 - 120), 8, "PAUSED - CLOSE MENU TO PLAY", 240, 220, 90, 255)
-        end
-    elseif gs == "intermission" then
-        W.wiDraw(sw, sh)
+        W.phase2 = "play"
+        return
     elseif gs == "frontend" then
         -- Button screens render over a live view: the attract level (fresh menu) or
         -- the frozen game (pause). The title screen keeps its full-screen TITLEPIC.
@@ -8047,13 +8014,14 @@ function W.renderBody(sw, sh)
             W.setupView(sw, sh)
             W.drawBackground()
             W.renderNode(W.map.rootNode)
-            W.drawPlanes()
-            W.renderThings()
-            ImGui.AddRectFilled(0, 0, floor(sw), floor(sh), 0, 0, 0, 100)   -- dim for menu legibility
+            W.phase2 = "frontend"
+            return
         elseif W.menu.screen ~= "title" then
             ImGui.AddRectFilled(0, 0, floor(sw), floor(sh), 12, 10, 14, 255) -- fallback bg (no map yet)
         end
         W.drawFrontend(sw, sh)
+    elseif gs == "intermission" then
+        W.wiDraw(sw, sh)
     elseif gs == "menu" then
         ImGui.AddText(12, 12, "WAD loaded. Pick a map in the DOOM WAD tab. " .. tostring(W.status),
             200, 200, 205, 255)
@@ -8068,39 +8036,56 @@ function W.renderBody(sw, sh)
     end
 
     W.drawWipe(sw, sh)                           -- screen-melt overlay (over the live play frame)
+    W.drawFpsCounter(sw)
+end
 
-    -- framerate counter (top-right), colour-coded
+-- Window C: everything over the planes (sprites, weapon, HUD, front-end
+-- chrome, wipe, fps), for the split states set via W.phase2.
+function W.renderBodyPost(sw, sh)
+    if W.phase2 == "play" then
+        W.renderThings()                                    -- billboards over walls+planes (drawseg-clipped)
+        W.drawWeapon(sw, W.viewH)                            -- view weapon over the world, under HUD
+        W.drawHUD(sw, sh)
+        if W.menuOpen then
+            ImGui.AddText(floor(sw * 0.5 - 120), 8, "PAUSED - CLOSE MENU TO PLAY", 240, 220, 90, 255)
+        end
+    else                                                    -- frontend over a live view
+        W.renderThings()
+        ImGui.AddRectFilled(0, 0, floor(sw), floor(sh), 0, 0, 0, 100)   -- dim for menu legibility
+        W.drawFrontend(sw, sh)
+    end
+    W.drawWipe(sw, sh)                           -- screen-melt overlay (over the live play frame)
+    W.drawFpsCounter(sw)
+end
+
+-- framerate counter (top-right), colour-coded
+function W.drawFpsCounter(sw)
     local fps = floor((W.fps or 0) + 0.5)
     local fr, fg, fb = 90, 230, 110
     if fps < 30 then fr, fg, fb = 235, 70, 60 elseif fps < 60 then fr, fg, fb = 235, 210, 70 end
     ImGui.AddText(sw - 92, 6, string.format("FPS %d", fps), fr, fg, fb, 255)
 end
 
--- Probe common locations for a shareware/retail wad. Best-effort: the tab also
--- lets the user pick one by hand. Fills W.wadCandidates.
+-- Probe common locations for a shareware/retail wad; fills W.wadCandidates.
 function W.scanWads()
     local out, seen = {}, {}
     local function add(p)
         local k = p and p:lower()
         if p and p ~= "" and not seen[k] then seen[k] = true; out[#out + 1] = p end
     end
-    -- Last-resort probe names for when FindFiles is unavailable or empty. This
-    -- is NOT a filter: any .wad FindFiles returns is listed, whatever its name
-    -- (openWad validates the IWAD/PWAD magic).
+    -- Fallback probe names for when FindFiles is unavailable or empty (not a
+    -- filter; openWad validates the IWAD/PWAD magic).
     local names = { "DOOM1.WAD", "DOOM.WAD", "DOOM2.WAD", "freedoom1.wad", "freedoom2.wad" }
-    -- FindFiles' extension matching is finicky (dot-prefixed, case-sensitive;
-    -- "" = every file), so query each spelling PLUS "" and keep anything that
-    -- ends in .wad, case-insensitive, regardless of which query surfaced it.
+    -- Query each extension spelling plus "" (FindFiles ext matching is
+    -- case-sensitive/dot-prefixed); keep anything ending in .wad.
     local exts = { ".wad", ".WAD", "" }
     local dirs = {}
     local rok, root = pcall(FileMgr.GetMenuRootPath)
     if rok and root and root ~= "" then
-        -- Known-good FindFiles callers pass all-backslash directories with a
-        -- trailing separator; a mixed-separator path can enumerate nothing.
+        -- FindFiles needs all-backslash paths; mixed separators enumerate nothing.
         root = tostring(root):gsub("/", "\\")
         if root:sub(-1) == "\\" then root = root:sub(1, -2) end
-        -- The Cherax root folder is cleared on update, so persistent user files
-        -- live under Lua/. Prefer Lua/DoomWad, then Lua, before the volatile root.
+        -- Root folder is cleared on update; prefer Lua/ subdirs before the volatile root.
         dirs[#dirs + 1] = root .. "\\Lua\\DoomWad\\"
         dirs[#dirs + 1] = root .. "\\Lua\\"
         dirs[#dirs + 1] = root .. "\\DoomWad\\"
@@ -8113,8 +8098,7 @@ function W.scanWads()
     local function accept(f, d)
         f = tostring(f or "")
         if f:lower():sub(-4) ~= ".wad" then return end
-        -- FindFiles may return bare names or full paths; accept whichever
-        -- form actually exists so we never list an unopenable candidate.
+        -- FindFiles may return bare names or full paths; accept whichever exists.
         local full = d .. f
         local aok, ex = pcall(FileMgr.DoesFileExist, full)
         if aok and ex then add(full)
@@ -8132,8 +8116,8 @@ function W.scanWads()
                         calls = calls + 1
                         for _, f in ipairs(list) do hits = hits + 1; accept(f, d) end
                     else
-                        -- sol2 may hand back a userdata container: length and
-                        -- indexing go through metamethods, so probe via pcall.
+                        -- sol2 userdata container: length/indexing go through
+                        -- metamethods, so probe via pcall.
                         local lok, ln = pcall(function() return #list end)
                         if lok and type(ln) == "number" then
                             calls = calls + 1
@@ -8156,8 +8140,8 @@ function W.scanWads()
     return out
 end
 
--- Put one wad path straight into the tab's candidate list (no folder scan),
--- deduped case-insensitively. Used by the shareware download button.
+-- Add one wad path to the candidate list (no folder scan), deduped
+-- case-insensitively. Used by the shareware download button.
 function W.addWadCandidate(p)
     if not p or p == "" then return end
     W.wadCandidates = W.wadCandidates or {}
@@ -8180,13 +8164,11 @@ function W.autoLoad()
     W.gameState = "frontend"                 -- land on the Doom title screen, not straight into a map
 end
 
--- Fetch DOOM1.WAD (shareware IWAD) into Lua/DoomWad: the host-mode first-run
--- flow, and the standalone tab's download button (W.dlForce, which skips the
--- "some other wad already exists" early-out so DOOM1.WAD itself is fetched).
--- Async, driven from onPresent: returns "busy" while the transfer is in flight,
--- "done" once a wad is on disk (downloaded now OR already present), "failed" on a
--- hard error. Cherax's libcurl exposes no FOLLOWLOCATION, so we hit the final
--- raw.githubusercontent.com host directly (the github.com/raw path 302-redirects).
+-- Fetch DOOM1.WAD (shareware IWAD) into Lua/DoomWad (host first-run flow + the
+-- tab download button, which sets W.dlForce to skip the "some other wad exists"
+-- early-out). Async, driven from onPresent: returns "busy" while in flight,
+-- "done" once a wad is on disk, "failed" on a hard error. curl has no
+-- FOLLOWLOCATION, so hit the final raw.githubusercontent.com host directly.
 function W.ensureWadDownload()
     if W.dlDone then return "done" end
     if W.dlFailed then return "failed" end
@@ -8203,17 +8185,14 @@ function W.ensureWadDownload()
         local dok, de = pcall(FileMgr.DoesFileExist, W.dlTarget)
         if dok and de then W.dlDone = true; return "done" end
         if not W.dlForce then
-            -- Host boot flow only: any wad already on disk counts as done. The
-            -- tab button (dlForce) always fetches DOOM1.WAD itself, no scan.
+            -- Host boot only: any wad already on disk counts as done.
             local cands = W.scanWads()
             if cands and cands[1] then W.dlDone = true; return "done" end
         end
     end
-    -- A finished transfer passed the cheap checks: pump the pinned-SHA-256
-    -- verification, one ~96 KB slice per frame (hashing all 4.2 MB of pure Lua
-    -- in one go would stall the present thread for a second or more). Accept the
-    -- body only on an exact digest match; anything else counts as a failed
-    -- attempt and rotates to the next source.
+    -- Finished transfer: pump the pinned SHA-256 verify in ~96 KB slices per
+    -- frame (hashing 4.2 MB at once would stall the present thread). Accept the
+    -- body only on an exact digest match; anything else is a failed attempt.
     if W.dlVerify then
         local v = W.dlVerify
         local ok = pcall(function()
@@ -8231,13 +8210,11 @@ function W.ensureWadDownload()
         end
         return W.wadRetry()   -- digest mismatch (or disk write failed)
     end
-    -- Download sources. HTTPS host first; a plain-HTTP mirror is the fallback.
-    -- Cherax's curl exposes NO TLS options (no verify/revoke/CAINFO), so a broken
-    -- Windows schannel ("AcquireCredentialsHandle failed / Local Security Authority
-    -- cannot be contacted") sinks EVERY HTTPS attempt - an HTTP URL skips the TLS
-    -- handshake entirely and works anyway. Both serve the byte-identical 4.2 MB
-    -- shareware IWAD; because HTTP is unauthenticated the body is only trusted
-    -- after it matches the pinned exact size + SHA-256 (see WAD_SHA256).
+    -- Download sources: HTTPS host first, plain-HTTP mirror fallback. curl
+    -- exposes no TLS options, so a broken Windows schannel sinks every HTTPS
+    -- attempt while an HTTP URL skips the handshake and works. Both serve the
+    -- byte-identical 4.2 MB IWAD; the HTTP body is trusted only after it matches
+    -- the pinned exact size + SHA-256 (see WAD_SHA256).
     W.WAD_URLS = W.WAD_URLS or { WAD_URL, "http://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad" }
     W.dlIdx = W.dlIdx or 1
     W.dlTries = W.dlTries or 0
@@ -8276,8 +8253,8 @@ function W.ensureWadDownload()
     return W.wadRetry()
 end
 
--- Record a failed attempt, rotate to the next source, and either schedule a retry
--- after a short cooldown or give up once the attempt cap is reached.
+-- Record a failed attempt, rotate source, schedule a retry after a short
+-- cooldown, or give up once the attempt cap is reached.
 function W.wadRetry()
     W.dlTries = (W.dlTries or 0) + 1
     W.dlIdx = (W.dlIdx or 1) + 1
@@ -8287,9 +8264,8 @@ function W.wadRetry()
     return "busy"
 end
 
--- Minimal boot overlay drawn while the host-mode wad download is in flight (or on
--- failure). Mirrors W.render's single-window structure so the ImGui stack stays
--- balanced; the normal renderer takes over once the wad is ready.
+-- Boot overlay drawn while the host-mode wad download is in flight or failed.
+-- Mirrors W.render's single-window structure to keep the ImGui stack balanced.
 function W.drawBootProgress(st)
     local sok, sw, sh = pcall(ImGui.GetDisplaySize)
     if not sok or not sw or sw < 16 or sh < 16 then return end
@@ -8318,14 +8294,10 @@ function W.drawBootProgress(st)
     ImGui.End()
 end
 
--- Host mode: unload this script (stop music first). Both the hidden shutdown
--- feature (host OnClick) and DOOM's own in-game Quit route here. The unload is
--- DEFERRED a few frames: MCI only answers on the present thread (stop/close sent
--- from the OnClick or unload threads return false per the in-game log), and an
--- immediate SetShouldUnload would kill the present-thread retry window before it
--- ever delivered the stop. So request the stop, mark shutdown pending, and let
--- onPresent service the stop first; it calls SetShouldUnload when the countdown
--- runs out, which marks THIS script done and returns the player to GTA.
+-- Host mode: unload this script (stop music first). Unload is DEFERRED a few
+-- frames because MCI only answers on the present thread: request the stop, mark
+-- shutdown pending, and let onPresent service the stop and call SetShouldUnload
+-- when the countdown runs out (which marks THIS script done, returning to GTA).
 function W.hostShutdown()
     pcall(W.requestStop, "shutdown")
     if not SetShouldUnload then return end
@@ -8343,9 +8315,9 @@ function W.init()
             | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoInputs
             | ImGuiWindowFlags.NoNav
     end)
-    -- Player physics constants (vanilla units; movement itself is momentum
-    -- + friction on the 35 Hz tic clock, see W.playerXYMovement). Turn rates
-    -- are the BAM angleturn {320,640,1280}<<16 per tic as radians/second.
+    -- Player physics constants (vanilla units; momentum + friction on the 35 Hz
+    -- tic clock, see W.playerXYMovement). Turn rates are the BAM angleturn
+    -- {320,640,1280}<<16 per tic as radians/second.
     W.EYE = 41; W.RADIUS = 16; W.MAXSTEP = 24; W.PHEIGHT = 56
     W.NEARZ = 4; W.HFOV = pi / 2
     W.MAXMOVE = 30                       -- momentum clamp, units/tic
@@ -8355,9 +8327,12 @@ function W.init()
     W.FLOATSPEED = 4                     -- cacodemon vertical adjust, units/tic
     W.LOOKSENS = 0.1                     -- mouse turn sensitivity (GTA INPUT_LOOK_LR -> radians)
     -- Phase-4 visplane (textured floors/ceilings) + sky constants.
-    W.ROWSTEP = 2          -- plane row granularity (1=full res, 2=half draws)
+    W.ROWSTEP = 4          -- plane row granularity (N = 1/N the draws); 4 keeps
+                           -- worst-case plane quads within one ImGui draw list's
+                           -- 16-bit vertex budget
     W.FLAT_TILE = 8        -- flats baked tiled NxN (8 => 512x512); 1 uv unit = 64*8 world units
-    W.PLANE_BUDGET = 3200  -- max plane image/solid draws per frame; degrade past this
+    W.PLANE_BUDGET = 10000 -- max plane image/solid draws per frame; degrade past
+                           -- this (worst measured E1M2 frame ~7100 at grazing angles)
     W.PLANE_FOG = 0.00072  -- distance-diminish rate (shared by walls, planes, sprites)
     W.SKY_DIR = -1         -- sky scroll sign (-1 locks sky to world motion; flip if wrong)
     W.PLANECOL = { floor = { 70, 54, 40 }, ceil = { 40, 42, 52 } } -- fallback tones (no flat/tex)
@@ -8384,10 +8359,9 @@ function W.init()
     W.active = false
     W.playOn = false          -- standalone launch flag (Play Doom button / Quit Game)
     W.mouseLook = false
-    -- audio / music state (Section M). musicOn is a user toggle (default on);
-    -- looping is duration-driven off now() since MCI cannot report position.
-    -- musicVol/sfxVol are 0..15 (DOOM's range), baked into the cached MIDI/WAV.
-    -- These defaults are overridden by W.loadSettings on first activation.
+    -- audio / music state (Section M). Looping is duration-driven off now()
+    -- (MCI cannot report position); vol 0..15 (DOOM's range) baked into the
+    -- cached MIDI/WAV. Defaults overridden by W.loadSettings on first activation.
     W.musicOn = true
     W.musicVol = 15
     W.sfxVol = 15
@@ -8399,7 +8373,7 @@ function W.init()
     W.musLenByName = {}       -- cached track duration in seconds, keyed by lump name
     W.stopRetries = 0         -- frames left to re-send the music stop (robust stop)
     W.musPending = nil        -- map name whose music start is deferred to the present thread
-    W.stopDiag = true         -- log stop attempts to cherax.log (diagnose in-game)
+    W.stopDiag = false        -- log stop attempts to cherax.log (diagnostic only)
     W.autoTried = false
     W.curKey = {}
     W.prevKey = {}
@@ -8415,9 +8389,8 @@ function W.init()
 end
 
 function W.onPresent()
-    -- Re-send any pending music stop every frame, regardless of enabled state, so
-    -- a toggle-off/unload stop that did not take is retried (mirrors the working
-    -- per-frame manual-disable path).
+    -- Re-send any pending music stop every frame so a toggle-off/unload stop
+    -- that did not take is retried.
     W.serviceStop()
     -- Deferred hostShutdown: keep only the stop retries running for a few frames
     -- so the music stop lands on this thread, then actually unload.
@@ -8429,18 +8402,17 @@ function W.onPresent()
         end
         return
     end
-    -- Standalone: service the tab's shareware-download button even while DOOM
-    -- itself is closed (the click only arms it; the curl transfer polls here,
-    -- and the finished wad goes straight onto the candidate list - no scan).
+    -- Standalone: service the download button even while DOOM is closed; the
+    -- click only arms it, the curl transfer polls here, and the finished wad
+    -- goes straight onto the candidate list (no scan).
     if W.dlWanted then
         local st = W.ensureWadDownload()
         if st ~= "busy" then
             W.dlWanted = false
             if st == "done" and W.dlTarget then
                 W.addWadCandidate(W.dlTarget)
-                -- Nothing loaded yet: open the fresh wad right away so the
-                -- overlay (open now or on the next Play click) lands on the
-                -- title screen instead of the no-wad help text.
+                -- Nothing loaded yet: open the fresh wad so the overlay lands on
+                -- the title screen instead of the no-wad help text.
                 if not W.wad and W.openWad(W.dlTarget) then
                     W.mapList = W.listMaps()
                     W.menu.screen = "title"; W.menu.cursor = 1
@@ -8449,11 +8421,11 @@ function W.onPresent()
             end
         end
     end
-    -- Host mode runs unconditionally; standalone runs while the Play Doom
-    -- button has it open (DOOM's own Quit Game closes it again).
+    -- Host mode runs unconditionally; standalone runs while the Play Doom button
+    -- has it open (DOOM's own Quit Game closes it again).
     local enabled = BLAD_MODE or W.playOn or false
     if not enabled then
-        -- Feature toggled off: request a stop with retries. Trigger only on the
+        -- Feature toggled off: request a stop with retries, only on the
         -- transition (musPlaying or active still set) so we do not spam forever.
         if W.musPlaying or W.active then
             if W.stopDiag and Logger and Logger.LogInfo then
@@ -8464,16 +8436,14 @@ function W.onPresent()
         W.active = false
         return
     end
-    -- Host mode: pull the shareware IWAD into Lua/DoomWad on first run so the user
-    -- drops straight into DOOM with nothing to place by hand. Hold here (drawing a
-    -- progress overlay) until the wad is on disk, then fall through to the normal
-    -- autoLoad below. A failure falls through too: the nowad screen and the DOOM
-    -- WAD tab still let the user supply a wad by hand.
+    -- Host mode: pull the shareware IWAD into Lua/DoomWad on first run, drawing a
+    -- progress overlay until it is on disk, then fall through to autoLoad. A
+    -- failure falls through too; the nowad screen and DOOM WAD tab still let the
+    -- user supply a wad by hand.
     if BLAD_MODE and not W.dlDone and not W.dlFailed then
         local st = W.ensureWadDownload()
-        -- Only paint the boot overlay while still waiting/failed; on the frame the
-        -- wad becomes ready, fall straight through to the normal renderer so we
-        -- don't open the shared overlay window twice in one frame.
+        -- Paint the boot overlay only while waiting/failed; on the ready frame
+        -- fall straight through so we don't open the shared window twice.
         if st ~= "done" then W.drawBootProgress(st); return end
     end
 
@@ -8527,6 +8497,18 @@ function W.onPresent()
     if not uok then Logger.LogError("[DOOMWAD] update: " .. tostring(uerr)) end
     local rok, rerr = pcall(W.render)
     if not rok then Logger.LogError("[DOOMWAD] render: " .. tostring(rerr)) end
+
+    -- Texture self-heal telemetry: reports every ~10s only when loads
+    -- retried/got stuck or ready handles died (see W.texStep).
+    W.texDiagIn = (W.texDiagIn or 600) - 1
+    if W.texDiagIn <= 0 then
+        W.texDiagIn = 600
+        if ((W.texRetries or 0) > 0 or (W.texDeadHits or 0) > 0)
+            and Logger and Logger.LogInfo then
+            pcall(Logger.LogInfo, ("[DOOMWAD] tex self-heal: %d retries, %d dead-handle hits, %d revives")
+                :format(W.texRetries or 0, W.texDeadHits or 0, W.texRevives or 0))
+        end
+    end
 end
 
 -- one clickable row: prefer Selectable, fall back to Button, else static text
@@ -8537,109 +8519,456 @@ function W.uiRow(label)
     return false
 end
 
-function W.renderTab()
-    if ClickGUI.RenderFeature then pcall(ClickGUI.RenderFeature, FEATURE_HASH) end
-    if ImGui.Separator then ImGui.Separator() end
-    if not ImGui.Text then return end
-    ImGui.Text("Click Play Doom, then close the Cherax menu. Quit Game inside DOOM returns to GTA.")
-    ImGui.Text("Plays any DOOM-format .wad (DOOM/DOOM2/TNT/Plutonia/FreeDoom).")
-    ImGui.Text("Drop wads in Cherax/Lua/DoomWad (or Cherax/Lua), or use the download button below.")
-    ImGui.Text("State: " .. tostring(W.gameState) .. "    " .. tostring(W.status or ""))
-    if ImGui.Separator then ImGui.Separator() end
+-- clickable row with a persistent highlight (loaded wad / current map).
+-- CRITICAL: this Selectable returns the row's SELECTED STATE, not a one-shot
+-- click flag. Passing selected=true makes it return true EVERY FRAME, which
+-- re-fires openWad/startMap once per frame. Click-detect with the plain
+-- one-arg call (true only on the click frame) and paint the highlight ourselves.
+function W.uiRowSel(label, sel)
+    if not ImGui.Selectable then return W.uiRow(label) end
+    if sel then
+        local ok, cx, cy = pcall(ImGui.GetCursorScreenPos)
+        if ok and cx then
+            local w = 120
+            local aok, aw = pcall(ImGui.GetContentRegionAvail)
+            if aok and aw then w = aw end
+            local fh = 17
+            local fok, fs = pcall(ImGui.GetFontSize)
+            if fok and fs then fh = floor(fs + 4) end
+            ImGui.AddRectFilled(cx - 2, cy - 1, cx + w, cy + fh, 255, 255, 255, 28, 2)
+            ImGui.AddRectFilled(cx - 2, cy - 1, cx + 1, cy + fh, 165, 120, 255, 220)
+        end
+    end
+    local ok, r = pcall(ImGui.Selectable, label)
+    return ok and r
+end
 
-    -- WAD picker
-    ImGui.Text("WAD: " .. tostring(W.wadPath or "(none)"))
-    if W.uiRow("Scan for WAD files") then W.scanWads() end
-    if W.uiRow("Download DOOM1.WAD (shareware, 4 MB)") then
-        -- Arm/re-arm the async download; onPresent polls it and puts the wad
-        -- straight onto the list below on success (no folder scan involved).
-        W.dlWanted = true; W.dlForce = true
-        W.dlDone = false; W.dlChecked = false; W.dlFailed = false
-        W.dlTries = 0; W.dlIdx = 1; W.dlNextTry = 0; W.dlVerify = nil
+function W.uiBasename(p)
+    p = tostring(p or "")
+    return p:match("([^/\\]+)$") or p
+end
+
+-- Circular-arrow refresh icon drawn with line segments (menu font is ASCII-only,
+-- so glyphs like U+27F3 render as "?"). (cx, cy) center, r radius.
+function W.uiDrawRefreshIcon(cx, cy, r, hot)
+    local cr, cg, cb = 205, 205, 215
+    if hot then
+        cr, cg, cb = 255, 255, 255
+        ImGui.AddCircleFilled(floor(cx), floor(cy), r + 4, 255, 255, 255, 26)
     end
-    if W.dlWanted then
-        ImGui.Text(W.dlVerify and "Verifying DOOM1.WAD..." or "Downloading DOOM1.WAD...")
-    elseif W.dlForce and W.dlFailed then
-        ImGui.Text("Download failed. Check your connection and click again.")
+    -- clockwise arc with a gap at the top; the arrowhead sits at the gap end
+    local a0 = -1.2
+    local a1 = a0 + 4.9
+    local segs = 12
+    local px, py
+    for i = 0, segs do
+        local a = a0 + (a1 - a0) * (i / segs)
+        local x = cx + cos(a) * r
+        local y = cy + sin(a) * r
+        if px then ImGui.AddLine(px, py, x, y, cr, cg, cb, 255, 1.6) end
+        px, py = x, y
     end
-    if W.wadCandidates and #W.wadCandidates > 0 then
-        for _, p in ipairs(W.wadCandidates) do
-            if W.uiRow("Load: " .. p) then
-                local opened = W.openWad(p)
+    local ex = cx + cos(a1) * r
+    local ey = cy + sin(a1) * r
+    local tx, ty = -sin(a1), cos(a1)     -- direction of travel at the arc end
+    local nx, ny = cos(a1), sin(a1)      -- outward normal
+    ImGui.AddTriangleFilled(
+        ex + tx * 4.2, ey + ty * 4.2,
+        ex + nx * 2.8, ey + ny * 2.8,
+        ex - nx * 2.8, ey - ny * 2.8,
+        cr, cg, cb, 255)
+end
+
+-- AddText centered on a screen-space x (draw-list text, not layout text)
+function W.uiTextCenteredAt(cx, y, text, r, g, b, a)
+    local tw = 0
+    local ok, w = pcall(ImGui.CalcTextSize, text)
+    if ok and w then tw = w end
+    ImGui.AddText(floor(cx - tw * 0.5), floor(y), text, r, g, b, a)
+end
+
+-- Cover art for the floppy label: the first fullscreen menu graphic the loaded
+-- wad has. Returns ImTextureID, w, h; nil while baking or with no wad. A lump
+-- that failed to bake falls through to the next candidate.
+W.COVER_LUMPS = { "TITLEPIC", "INTERPIC", "M_DOOM" }
+function W.uiCoverArt()
+    if not (W.wad and W.lumpIndex) then return nil end
+    for i = 1, #W.COVER_LUMPS do
+        local nm = W.COVER_LUMPS[i]
+        if W.lumpIndex[nm] then
+            local tex = W.menuTex(nm)
+            if tex then
+                local w, h = W.patchSize(nm)
+                if w then return tex, w, h end
+                return nil
+            end
+            local c = W.texCache and W.texCache["MU:" .. nm]
+            if not (c and c.state == "fail") then return nil end
+        end
+    end
+    return nil
+end
+
+-- Vector-drawn 3.5" floppy, insert edge (shutter) down, cover art on the label.
+-- (x, y) is the top-left corner; s/h are pixel width/height.
+function W.uiDrawFloppy(x, y, s, h)
+    local x0, y0 = floor(x), floor(y)
+    local x1, y1 = x0 + floor(s), y0 + floor(h)
+    -- drop shadow, then body shell
+    ImGui.AddRectFilled(x0 - 3, y0 + 5, x1 + 3, y1 + 7, 0, 0, 0, 60, 9)
+    ImGui.AddRectFilled(x0, y0, x1, y1, 30, 31, 37, 255, 7)
+    ImGui.AddRect(x0, y0, x1, y1, 86, 88, 100, 150, 7, 0, 1)
+    ImGui.AddLine(x0 + 8, y0 + 2, x1 - 8, y0 + 2, 112, 114, 126, 80, 1)
+    -- molded corner holes on the grab edge
+    ImGui.AddRectFilled(x0 + 7, y0 + 7, x0 + 12, y0 + 12, 17, 17, 21, 255, 1)
+    ImGui.AddRectFilled(x1 - 12, y0 + 7, x1 - 7, y0 + 12, 17, 17, 21, 255, 1)
+    -- paper label with the cover art
+    local lx0 = x0 + floor(s * 0.10); local lx1 = x1 - floor(s * 0.10)
+    local ly0 = y0 + floor(h * 0.065); local ly1 = y0 + floor(h * 0.60)
+    ImGui.AddRectFilled(lx0, ly0, lx1, ly1, 225, 223, 213, 255, 3)
+    local ax0, ay0 = lx0 + 4, ly0 + 4
+    local ax1, ay1 = lx1 - 4, ly1 - 21
+    local tex, aw, ah = W.uiCoverArt()
+    if tex and aw and ah and aw > 0 and ah > 0 then
+        ImGui.AddRectFilled(ax0, ay0, ax1, ay1, 21, 14, 15, 255, 2)
+        local sc = min((ax1 - ax0) / aw, (ay1 - ay0) / ah)
+        local dw, dh = floor(aw * sc), floor(ah * sc)
+        local dx = floor((ax0 + ax1 - dw) * 0.5); local dy = floor((ay0 + ay1 - dh) * 0.5)
+        ImGui.AddImageRounded(tex, dx, dy, dx + dw, dy + dh, 0, 0, 1, 1, 0xFFFFFFFF, 2)
+    else
+        ImGui.AddRectFilled(ax0, ay0, ax1, ay1, 54, 26, 28, 255, 2)
+        local msg = W.wad and "loading art..." or "insert disk"
+        W.uiTextCenteredAt((ax0 + ax1) * 0.5, (ay0 + ay1) * 0.5 - 7, msg, 222, 200, 160, 230)
+    end
+    -- the handwritten line on the label: the wad file name
+    local cap = W.wad and W.uiBasename(W.wadPath) or "no wad loaded"
+    if #cap > 20 then cap = cap:sub(1, 17) .. "..." end
+    W.uiTextCenteredAt((lx0 + lx1) * 0.5, ly1 - 20, cap, 52, 48, 58, 255)
+    -- metal shutter on the insert edge, brushed, with its media window
+    local shw = floor(s * 0.56)
+    local sx0 = floor((x0 + x1 - shw) * 0.5); local sx1 = sx0 + shw
+    local sy0 = y0 + floor(h * 0.70)
+    ImGui.AddRectFilled(sx0, sy0, sx1, y1 - 1, 148, 150, 157, 255, 2)
+    ImGui.AddLine(sx0 + 4, sy0 + 4, sx1 - 4, sy0 + 4, 168, 170, 176, 160, 1)
+    ImGui.AddLine(sx0 + 4, sy0 + 7, sx1 - 4, sy0 + 7, 128, 130, 137, 120, 1)
+    local shh = (y1 - 1) - sy0
+    local wx0 = sx0 + floor(shw * 0.13)
+    ImGui.AddRectFilled(wx0, sy0 + floor(shh * 0.20), wx0 + floor(shw * 0.30), y1 - 1 - floor(shh * 0.14), 36, 37, 42, 255, 1)
+    -- molded insert arrow (bottom right) + write-protect notch (bottom left)
+    local arx = x1 - floor(s * 0.09); local ary = y1 - floor(h * 0.05)
+    ImGui.AddTriangleFilled(arx - 5, ary - 7, arx + 5, ary - 7, arx, ary, 100, 102, 112, 210)
+    local nx = x0 + floor(s * 0.055)
+    ImGui.AddRectFilled(nx, y1 - 9, nx + 5, y1 - 4, 17, 17, 21, 255, 1)
+end
+
+-- Floppy zone at the bottom of the tab: the disk sits centered at rest and,
+-- while Play Doom is on, slides into a drive slot at the window's bottom edge
+-- (about half swallowed, clipped by the window) with a drive LED blinking while
+-- assets are still being prepared. Ejects back up when DOOM quits.
+function W.uiFloppyZone()
+    local u = W.ui
+    if not u then u = { anim = 0, from = 0, target = 0, t0 = 0 }; W.ui = u end
+    local wantIn = (W.playOn and W.wad) and 1 or 0
+    if wantIn ~= u.target then u.from = u.anim; u.target = wantIn; u.t0 = now() end
+    local p = clamp((now() - u.t0) / 0.9, 0, 1)
+    local e
+    if p < 0.5 then e = 4 * p * p * p else local q = -2 * p + 2; e = 1 - q * q * q * 0.5 end
+    u.anim = u.from + (u.target - u.from) * e
+
+    local wxp, wyp, wwd, wht = 0, 0, 400, 300
+    do
+        local ok, a1, a2 = pcall(ImGui.GetWindowPos); if ok and a1 then wxp, wyp = a1, a2 end
+        local ok2, b1, b2 = pcall(ImGui.GetWindowSize); if ok2 and b1 then wwd, wht = b1, b2 end
+    end
+    local csy = wyp
+    do local ok, _, c2 = pcall(ImGui.GetCursorScreenPos); if ok and c2 then csy = c2 end end
+
+    local fw = floor(clamp(wwd * 0.34, 132, 212))
+    local fh = floor(fw * 1.04)
+    pcall(ImGui.Dummy, 1, fh + 20)
+
+    local restY = csy + 10
+    local slotY = wyp + wht                 -- bottom edge of the Cherax window
+    local insY = slotY - fh * 0.45          -- inserted: 55 percent swallowed
+    local fx = wxp + (wwd - fw) * 0.5
+    local fy = restY + (insY - restY) * u.anim
+    local busy = (W.pendingMap ~= nil) or W.dlWanted or (W.playOn and W.gameState ~= "play")
+
+    W.uiDrawFloppy(fx, fy, fw, fh)
+
+    -- drive faceplate: the slot the disk sinks into, drawn over the floppy
+    if u.anim > 0.001 then
+        local a = ci(min(1, u.anim * 2.5) * 255)
+        local bx0 = floor(fx - fw * 0.20); local bx1 = floor(fx + fw * 1.20)
+        ImGui.AddRectFilled(bx0, floor(slotY - 8), bx1, floor(slotY), 16, 16, 20, a, 3)
+        ImGui.AddLine(bx0 + 5, floor(slotY - 8), bx1 - 5, floor(slotY - 8), 96, 98, 110, a, 1)
+        local ledOn = (busy and (floor(now() * 6) % 2 == 0)) or (W.playOn and W.gameState == "play")
+        if ledOn then ImGui.AddCircleFilled(bx1 - 12, floor(slotY - 4), 2.5, 110, 235, 120, a)
+        else ImGui.AddCircleFilled(bx1 - 12, floor(slotY - 4), 2.5, 34, 70, 40, a) end
+    end
+end
+
+-- Rainbow helper: hue 0..1 -> fully saturated r, g, b color bytes.
+function W.uiRainbow(h)
+    h = (h - floor(h)) * 6
+    local i = floor(h)
+    local f = h - i
+    local q = ci((1 - f) * 255)
+    local t = ci(f * 255)
+    if i == 0 then return 255, t, 0
+    elseif i == 1 then return q, 255, 0
+    elseif i == 2 then return 0, 255, t
+    elseif i == 3 then return 0, q, 255
+    elseif i == 4 then return t, 0, 255
+    else return 255, 0, q end
+end
+
+-- Centered launch switch, drawn by hand so it can read the game state: dim plate
+-- while no wad is loaded, rainbow pulse once a wad is picked, red Stop plate
+-- while the game runs. Clicking toggles W.playOn.
+function W.uiPlayButton(availW)
+    local bw, bh = 180, 34
+    local running = W.playOn and true or false
+    local label = running and "Stop Doom" or "Play Doom"
+
+    local okp, wpx = pcall(ImGui.GetWindowPos)
+    local okc, cx0 = pcall(ImGui.GetCursorScreenPos)
+    if not (okp and wpx and okc and cx0 and ImGui.InvisibleButton) then
+        -- bare fallback: a stock button with the right label
+        if ImGui.Button then
+            local ok, r = pcall(ImGui.Button, label .. "##DoomPlay", bw, bh)
+            if ok and r then W.playOn = not running end
+        end
+        return
+    end
+    pcall(ImGui.SetCursorPosX, (cx0 - wpx) + max(0, floor((availW - bw) * 0.5)))
+    local bok, bx, by = pcall(ImGui.GetCursorScreenPos)
+    local ok, clicked = pcall(ImGui.InvisibleButton, "##DoomPlay", bw, bh)
+    if not (ok and bok and bx) then return end
+    local hov = false
+    do local hok, hv = pcall(ImGui.IsItemHovered); if hok then hov = hv and true or false end end
+    local x1, y1 = bx + bw, by + bh
+    local fh = 15
+    do local fok, fs = pcall(ImGui.GetFontSize); if fok and fs then fh = fs end end
+    local tcy = by + floor((bh - fh) * 0.5)
+
+    if running then
+        local lift = hov and 26 or 0
+        ImGui.AddRectFilled(bx, by, x1, y1, 96 + lift, 24 + floor(lift * 0.3), 24, 255, 5)
+        ImGui.AddRect(bx, by, x1, y1, 235, 84, 74, 255, 5, 0, 2)
+        W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, 255, 216, 210, 255)
+        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Close DOOM and return to GTA") end
+    elseif W.wad then
+        -- ready to play: border cycles the rainbow and the plate breathes
+        local t = now()
+        local pulse = 0.5 + 0.5 * sin(t * 3.2)
+        local r, g, b = W.uiRainbow(t * 0.30)
+        local base = 26 + (hov and 18 or 0) + floor(pulse * 12)
+        ImGui.AddRectFilled(bx, by, x1, y1, base, base, base + 8, 255, 5)
+        ImGui.AddRect(bx - 2, by - 2, x1 + 2, y1 + 2, r, g, b, ci(40 + pulse * 110), 7, 0, 3)
+        ImGui.AddRect(bx, by, x1, y1, r, g, b, 255, 5, 0, 2)
+        local lr = ci(r + (255 - r) * 0.55)
+        local lg = ci(g + (255 - g) * 0.55)
+        local lb = ci(b + (255 - b) * 0.55)
+        W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, lr, lg, lb, 255)
+        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Ready: click, then close the Cherax menu") end
+    else
+        local lift = hov and 14 or 0
+        ImGui.AddRectFilled(bx, by, x1, y1, 40 + lift, 40 + lift, 46 + lift, 255, 5)
+        ImGui.AddRect(bx, by, x1, y1, 90, 90, 100, 255, 5, 0, 1)
+        W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, 150, 150, 158, 255)
+        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "No wad loaded: pick one below (or download DOOM1.WAD)") end
+    end
+    if clicked then W.playOn = not running end
+end
+
+-- rows for the WAD list panel (also used by the no-child fallback layout);
+-- the shareware download lives in the list like any other entry
+function W.uiWadRows()
+    local list = W.wadCandidates
+    if list and #list > 0 then
+        for i = 1, #list do
+            local pth = list[i]
+            if W.uiRowSel(W.uiBasename(pth), pth == W.wadPath) then
+                local opened = W.openWad(pth)
                 if opened then W.mapList = W.listMaps(); W.menu.screen = "title"; W.menu.cursor = 1 end
                 W.gameState = opened and "frontend" or "error"
             end
         end
+    else
+        ImGui.Text("(no wads found)")
+    end
+    if W.dlWanted then
+        ImGui.Text(W.dlVerify and "Verifying DOOM1.WAD..." or "Downloading DOOM1.WAD...")
+    elseif W.uiRow("Download DOOM1.WAD (4 MB)") then
+        -- Arm/re-arm the async download; onPresent polls it and puts the wad
+        -- straight onto the list above on success (no folder scan).
+        W.dlWanted = true; W.dlForce = true
+        W.dlDone = false; W.dlChecked = false; W.dlFailed = false
+        W.dlTries = 0; W.dlIdx = 1; W.dlNextTry = 0; W.dlVerify = nil
+    end
+    if (not W.dlWanted) and W.dlForce and W.dlFailed then
+        ImGui.Text("(download failed, click again)")
+    end
+end
+
+-- rows for the map list panel; clicking starts the map at the current skill
+function W.uiMapRows(curMap)
+    if not W.wad then ImGui.Text("(load a wad first)"); return end
+    -- Synthetic top row: the game's own front-end (title screen). Selected by
+    -- default whenever no real map is picked, so it reads as "leave this alone
+    -- and start on the proper menu, not straight into a level".
+    if W.uiRowSel("Menu", curMap == nil) then
+        W.newGame()
+        W.map = nil; W.pendingMap = nil          -- drop the level so Menu reads as selected
+        W.menu.fromPlay = false; W.menu.screen = "title"; W.menu.cursor = 1
+        W.gameState = "frontend"
+    end
+    local list = W.mapList
+    if not (list and #list > 0) then ImGui.Text("(no maps found)"); return end
+    for i = 1, #list do
+        local name = list[i]
+        if W.uiRowSel(name, name == curMap) then W.newGame(); W.startMap(name) end
+    end
+end
+
+function W.renderTab()
+    if not ImGui.Text then return end
+    -- DOOM's own renderer resets the per-frame texture bake budget while it
+    -- runs; when the game is closed the tab resets it so cover art still bakes.
+    if not W.active then W.bakeUsed = 0 end
+    if W.wad and not W.cacheDir then pcall(W.ensureCacheDir) end
+
+    local availW = 400
+    do local ok, aw = pcall(ImGui.GetContentRegionAvail); if ok and aw then availW = aw end end
+
+    -- populate the wad list the first time the tab is drawn; the refresh
+    -- button is only needed to pick up files added after that
+    if not W.uiScanDone then
+        W.uiScanDone = true
+        if not W.wadCandidates then W.scanWads() end
     end
 
-    -- Difficulty (temporary dev selector; the real skill-select screen lands with
-    -- the frontend menu). Cycling here sets W.skill for the next map launch.
+    -- centered launch/stop switch (the Play Doom feature stays registered for
+    -- hotkeys and toggles the same flag, but its stock row is not rendered)
+    W.uiPlayButton(availW)
+
+    if ImGui.Separator then ImGui.Separator() end
+    ImGui.Text("Plays any DOOM-format .wad (DOOM/DOOM2/TNT/Plutonia/FreeDoom).")
+    ImGui.Text("Drop wads in Cherax/Lua/DoomWad, pick one below, then close this menu.")
+    if ImGui.Separator then ImGui.Separator() end
+
+    -- WAD + map pickers, side by side, each with its own scrollbar
+    local curMap = (W.map and W.map.name) or W.pendingMap
+    local canSplit = (ImGui.BeginChild and ImGui.EndChild and ImGui.SameLine) and true or false
+    if canSplit then
+        local colW = floor((availW - 10) * 0.5)
+        local okp, wpx = pcall(ImGui.GetWindowPos)
+        local okc, hx, hy = pcall(ImGui.GetCursorScreenPos)
+        if okc and hx then
+            W.uiTextCenteredAt(hx + colW * 0.5, hy + 3, "WAD: " .. W.uiBasename(W.wadPath or "(none)"), 235, 231, 245, 255)
+            W.uiTextCenteredAt(hx + colW + 10 + colW * 0.5, hy + 3, "Map: " .. tostring(curMap or "(none)"), 235, 231, 245, 255)
+            -- rescan button at the right edge of the WAD column header: an
+            -- invisible hit box with a hand-drawn refresh icon over it
+            local didBtn = false
+            if ImGui.InvisibleButton and okp and wpx then
+                pcall(ImGui.SetCursorPosX, (hx - wpx) + colW - 24)
+                local bok, bx, by = pcall(ImGui.GetCursorScreenPos)
+                local ok, r = pcall(ImGui.InvisibleButton, "##DoomRescan", 20, 18)
+                didBtn = ok
+                if ok then
+                    local hov = false
+                    local hok, hv = pcall(ImGui.IsItemHovered)
+                    if hok then hov = hv and true or false end
+                    if bok and bx then W.uiDrawRefreshIcon(bx + 10, by + 9, 6.5, hov) end
+                    if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Rescan wad folders") end
+                    if r then W.scanWads() end
+                end
+            elseif ImGui.Button and okp and wpx then
+                pcall(ImGui.SetCursorPosX, (hx - wpx) + colW - 44)
+                local ok, r = pcall(ImGui.Button, "Scan##DoomRescan", 44, 0)
+                didBtn = ok
+                if ok and r then W.scanWads() end
+            end
+            if not didBtn then pcall(ImGui.Dummy, 1, 18) end
+        end
+        pcall(ImGui.BeginChild, "##DoomWads", colW, 150, true, 0)
+        W.uiWadRows()
+        pcall(ImGui.EndChild)
+        pcall(ImGui.SameLine)
+        pcall(ImGui.BeginChild, "##DoomMaps", colW, 150, true, 0)
+        W.uiMapRows(curMap)
+        pcall(ImGui.EndChild)
+    else
+        ImGui.Text("WAD: " .. tostring(W.wadPath or "(none)"))
+        if W.uiRow("Rescan wad folders") then W.scanWads() end
+        W.uiWadRows()
+        ImGui.Text("Map: " .. tostring(curMap or "(none)"))
+        W.uiMapRows(curMap)
+    end
+
+    -- skill + music on one compact strip under the panels
     if W.mapList and #W.mapList > 0 then
-        if ImGui.Separator then ImGui.Separator() end
         W.skill = W.skill or 3
         if W.uiRow("Skill: " .. (W.SKILLNAME[W.skill] or "?") .. "  (click to cycle)") then
             W.skill = (W.skill % 5) + 1
         end
     end
-
-    -- Map picker (populated after a wad loads)
-    if W.mapList and #W.mapList > 0 then
-        if ImGui.Separator then ImGui.Separator() end
-        ImGui.Text("Maps (" .. #W.mapList .. "):  skill = " .. (W.SKILLNAME[W.skill or 3] or "?"))
-        for _, name in ipairs(W.mapList) do
-            if W.uiRow(name) then W.newGame(); W.startMap(name) end
-        end
-    end
-
-    -- Music controls (best-effort; MCI failures are swallowed by W.mci)
-    if ImGui.Separator then ImGui.Separator() end
     if ImGui.Checkbox then
-        local v, changed = ImGui.Checkbox("Music", W.musicOn)
-        if changed then
+        -- Binding returns (value, pressed); react only to an actual flip of the
+        -- value so a misread click flag can never re-arm musPending per frame.
+        local v = ImGui.Checkbox("Music", W.musicOn)
+        if type(v) == "boolean" and v ~= W.musicOn then
             W.musicOn = v
             -- menu thread: request a retried stop, or defer the start to onPresent
             if not v then W.requestStop("music-cb")
             elseif W.gameState == "play" and W.map then W.musPending = W.map.name end
         end
+        if ImGui.SameLine then pcall(ImGui.SameLine) end
     end
-    if ImGui.Text then
-        ImGui.Text("Now playing: " .. tostring(W.musTrack or "(none)"))
-        -- (MIDI volume is not adjustable: the Windows MCI sequencer device has
-        --  no volume command, so use your system volume mixer for the game.)
+    -- (MIDI volume is not adjustable: the Windows MCI sequencer device has
+    --  no volume command, so use your system volume mixer for the game.)
+    ImGui.Text("Now playing: " .. tostring(W.musTrack or "(none)"))
+
+    local showCtl = true
+    if ImGui.CollapsingHeader then
+        local ok, open = pcall(ImGui.CollapsingHeader, "Controls")
+        showCtl = (ok and open) and true or false
+    end
+    if showCtl then
+        ImGui.Text("Move: W/S or Up/Down      Strafe: A/D")
+        ImGui.Text("Turn: Left/Right or Mouse (toggle with M)")
+        ImGui.Text("Run: Shift                Back to map menu: Backspace")
+        ImGui.Text("Quit Game inside DOOM returns to GTA.")
     end
 
-    if ImGui.Separator then ImGui.Separator() end
-    ImGui.Text("Controls:")
-    ImGui.Text("Move: W/S or Up/Down      Strafe: A/D")
-    ImGui.Text("Turn: Left/Right or Mouse (toggle with M)")
-    ImGui.Text("Run: Shift                Back to map menu: Backspace")
+    W.uiFloppyZone()
 end
 
 W.init()
 
--- Inert test seam: only exposes internals when a harness sets __DOOMWAD_TEST.
+-- Inert test seam: exposes internals only when a harness sets __DOOMWAD_TEST.
 -- Cherax never sets this global, so this is a no-op in production.
 if rawget(_G, "__DOOMWAD_TEST") then _G.__DOOMWAD = W end
 
--- Standalone only: the Play Doom button is the launch switch and lives in the
--- tab; quitting from DOOM's own menu (or ESC on the no-wad/error screens) closes
--- it again. In host mode we auto-run, so neither the button nor the tab are
--- registered; the only UI is the fullscreen DOOM overlay window.
+-- Standalone only: the launch switch is the tab's centered Play/Stop button
+-- (W.uiPlayButton); quitting from DOOM's own menu (or ESC on the no-wad/error
+-- screens) closes it again. This feature mirrors that switch for hotkey use.
+-- In host mode we auto-run, so neither the feature nor the tab are registered;
+-- the only UI is the fullscreen DOOM overlay window.
 if (not BLAD_MODE) and FeatureMgr and FeatureMgr.AddFeature then
     pcall(FeatureMgr.AddFeature, FEATURE_HASH, "Play Doom",
         (eFeatureType and eFeatureType.Button) or 0,
-        "Play DOOM in the overlay: click, then close the Cherax menu. Quit Game inside DOOM returns to GTA.",
-        function() W.playOn = true end)
+        "Play/stop DOOM in the overlay: click, then close the Cherax menu. Quit Game inside DOOM returns to GTA.",
+        function() W.playOn = not W.playOn end)
 end
 
--- Register the hidden cross-script shutdown feature in ALL modes (was host-only).
--- The host resolves SHUTDOWN_HASH from the shared registry and OnClick()s it;
--- that callback runs in THIS script's state (via W.hostShutdown), so
--- SetShouldUnload marks this script for unload, never the host. It also serves
--- as a liveness heartbeat: a host script that sees it leave the registry stops
--- any still-playing music from its own live state, which covers a direct
--- uninject of this file even when it was not launched through the host. Never
--- RenderFeature'd, invisible.
+-- Register the hidden cross-script shutdown feature in all modes. The host
+-- resolves SHUTDOWN_HASH from the shared registry and OnClick()s it; that
+-- callback runs in THIS script's state (via W.hostShutdown), so SetShouldUnload
+-- marks this script for unload, never the host. It also serves as a liveness
+-- heartbeat: a host that sees it leave the registry stops any still-playing
+-- music from its own live state. Never RenderFeature'd, invisible.
 if FeatureMgr and FeatureMgr.AddFeature and SHUTDOWN_HASH ~= 0 then
     local sf = FeatureMgr.AddFeature(SHUTDOWN_HASH, "CheraxDoom Shutdown",
         (eFeatureType and eFeatureType.Button) or 0,
@@ -8653,23 +8982,19 @@ end
 
 if EventMgr and EventMgr.RegisterHandler then
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_PRESENT) or 7, W.onPresent)
-    -- On unload (uninject), stop the music via the TEARDOWN PRESENT FRAMES.
-    -- The MCI device is only reachable from the thread that opened it (the
-    -- present thread); every direct attempt from this unload thread fails
-    -- (alias commands return false, 'stop all'/'close all' return true against
-    -- an empty device view and silence nothing). But ON_PRESENT keeps firing
-    -- for a few frames after this handler runs (verified in-game: an MCI stop
-    -- from one of those frames returns true and the music dies), and
-    -- W.serviceStop is the first thing onPresent does each frame. So arming
-    -- the retry counter here is the entire fix; the next present frame sends
-    -- stop+close from the right thread.
+    -- On unload, stop the music via the teardown present frames. The MCI device
+    -- is only reachable from the thread that opened it (the present thread);
+    -- direct stops from this unload thread fail. But ON_PRESENT keeps firing for
+    -- a few frames after this handler runs, and W.serviceStop is the first thing
+    -- onPresent does each frame, so arming the retry counter here is the whole
+    -- fix; the next present frame sends stop+close from the right thread.
     pcall(EventMgr.RegisterHandler, (eLuaEvent and eLuaEvent.ON_UNLOAD) or 11, function()
         W.musPlaying = false; W.musTrack = nil
         W.stopRetries = 60
         if Utils and Utils.StopSound then pcall(Utils.StopSound) end
         -- Drop the hidden cross-script shutdown feature so no stale entry lingers
-        -- in the shared registry for the next launch. (The host, if present, sees
-        -- it vanish and also stops the music from its own present-thread tick.)
+        -- in the shared registry. (A host, if present, sees it vanish and also
+        -- stops the music from its own present-thread tick.)
         if FeatureMgr and FeatureMgr.RemoveFeature then
             pcall(FeatureMgr.RemoveFeature, SHUTDOWN_HASH)
         end
