@@ -63,6 +63,13 @@ end
 local function rectf(x0, y0, x1, y1, r, g, b, a)
     ImGui.AddRectFilled(x0, y0, x1, y1, ci(r), ci(g), ci(b), a or 255)
 end
+-- P_AproxDistance: DOOM's octagonal distance estimate (larger + smaller/2).
+-- Always >= true distance by up to ~6%; used for AI melee/missile/float range so
+-- monsters judge distance exactly as vanilla does.
+local function aproxDist(dx, dy)
+    dx = abs(dx); dy = abs(dy)
+    if dx < dy then return dy + dx * 0.5 else return dx + dy * 0.5 end
+end
 -- squared distance from point (px,py) to segment (x1,y1)-(x2,y2)
 local function segDist2(px, py, x1, y1, x2, y2)
     local vx, vy = x2 - x1, y2 - y1
@@ -272,7 +279,8 @@ function W.openWad(path)
     local fok, fp = pcall(W.wadFingerprint, data)
     W.wadFp = (fok and fp) or nil       -- selects this wad's cache subdirectory
     W.state = "ready"
-    W.status = string.format("%s: %d lumps, %d maps", W.wadId, #W.lumps, #W.listMaps())
+    W.mapList = W.listMaps()             -- single source of truth: callers no longer need to set it
+    W.status = string.format("%s: %d lumps, %d maps", W.wadId, #W.lumps, #W.mapList)
     pcall(W.loadGraphics)   -- best-effort palette/pnames/texture defs (Phase 3)
     return true
 end
@@ -914,8 +922,8 @@ function W.texStep(c)
         if c.wait > 300 and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
             W.bakeUsed = (W.bakeUsed or 0) + 1
             c.wait = 0
-            local lok, lid = pcall(Texture.LoadTexture, c.path)
-            if lok and lid then
+            local lid = Texture.LoadTexture(c.path)
+            if lid then
                 c.id = lid; c.state = "pending"
                 W.texRetries = (W.texRetries or 0) + 1
             end
@@ -923,23 +931,23 @@ function W.texStep(c)
         return nil
     end
     if c.state == "pending" then
-        local vok, valid = pcall(Texture.IsTextureValid, c.id)
-        if not (vok and valid) then
+        local valid = Texture.IsTextureValid(c.id)
+        if not valid then
             -- still uploading, or the load was dropped: retry stuck ids
             c.wait = (c.wait or 0) + 1
             if c.wait > 300 and c.path and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
                 W.bakeUsed = (W.bakeUsed or 0) + 1
                 c.wait = 0
-                local lok, lid = pcall(Texture.LoadTexture, c.path)
-                if lok and lid then
+                local lid = Texture.LoadTexture(c.path)
+                if lid then
                     c.id = lid
                     W.texRetries = (W.texRetries or 0) + 1
                 end
             end
             return nil
         end
-        local tok, tex = pcall(Texture.GetTexture, c.id)
-        if not (tok and tex) then return nil end
+        local tex = Texture.GetTexture(c.id)
+        if not tex then return nil end
         c.tex = tex; c.state = "ready"; c.wait = nil
     end
     if c.state == "ready" and c.tex then
@@ -953,8 +961,8 @@ function W.texStep(c)
         if c.deadN > 120 and c.path and (W.bakeUsed or 0) < (W.BAKE_BUDGET or 4) then
             W.bakeUsed = (W.bakeUsed or 0) + 1
             c.deadN = 0
-            local lok, lid = pcall(Texture.LoadTexture, c.path)
-            if lok and lid then
+            local lid = Texture.LoadTexture(c.path)
+            if lid then
                 c.id = lid; c.tex = nil; c.state = "pending"
                 W.texRevives = (W.texRevives or 0) + 1
             end
@@ -1003,9 +1011,7 @@ function W.getTex(name, isFlat)
             end
             sw, sh = w, h
         end
-        local id
-        local lok, lid = pcall(Texture.LoadTexture, path)
-        if lok then id = lid end
+        local id = Texture.LoadTexture(path)
         if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
         W.texCache[key] = { id = id, state = "pending", w = sw, h = sh, path = path }
         return nil
@@ -1563,9 +1569,7 @@ function W.getTexTiled(name)
             -- vs ~1-4ms for a wall. Charge it heavily so at most ~1 bakes per frame.
             W.bakeUsed = (W.bakeUsed or 0) + 3
         end
-        local id
-        local lok, lid = pcall(Texture.LoadTexture, path)
-        if lok then id = lid end
+        local id = Texture.LoadTexture(path)
         if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
         W.texCache[key] = { id = id, state = "pending", w = S, h = S, path = path }
         return nil
@@ -2031,7 +2035,7 @@ W.MINFO = {
         melee=true, missile=false, atksfx="DSSGTATK",
         sight="DSSGTSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSSGTDTH" },
     HEAD = { hp=400, speed=8, r=31, h=56, mass=400, pain=128, countkill=true,
-        melee=true, missile=true, float=true,
+        melee=false, missile=true, float=true,    -- meleestate=0: no bite, earns the -128 missile-range bonus
         sight="DSCACSIT", act="DSDMACT", psfx="DSDMPAIN", dsfx="DSCACDTH" },
     BOSS = { hp=1000, speed=8, r=24, h=64, mass=1000, pain=50, countkill=true,
         melee=true, missile=true,
@@ -2509,12 +2513,14 @@ function W.spriteFrameLump(spr, fl, rot)
     return nil
 end
 
--- H.3: single-patch composite WITH alpha (0 untouched -> transparent, 255 drawn).
--- Mirrors W.compositeTexture, but for one sprite lump.
-function W.spriteRGBA(name)
-    local ord = W.spriteLump and W.spriteLump[name]
-    local data = W.lumpBytes(ord); if #data < 8 then return nil end
-    local w, h, cols = W.patchColumns(data); if not w then return nil end
+-- Decoded posts -> RGBA. Transparent texels are emitted at alpha 0 but carry the
+-- color of their nearest opaque neighbor (edge bleed / alpha dilation). Without
+-- this, bilinear filtering blends the transparent texel's RGB into every glyph
+-- edge; a black RGB there darkens whatever is behind the patch, which reads as a
+-- box around HUD/menu glyphs drawn over bright backgrounds (invisible over the
+-- dark 3D world, which is why sprites looked fine). One pixel of bleed is enough:
+-- bilinear only ever samples a texel and its immediate neighbor.
+function W.bakeMaskedRGBA(w, h, cols)
     local total = w * h; local idx, alpha = {}, {}
     for k = 0, total - 1 do alpha[k] = 0 end
     for px = 0, w - 1 do
@@ -2530,15 +2536,61 @@ function W.spriteRGBA(name)
         end
     end
     local out, pal = {}, W.pal
-    for k = 0, total - 1 do
-        if alpha[k] == 255 then
-            local c = pal[idx[k]] or { 0, 0, 0 }
-            out[k + 1] = string.char(c[1], c[2], c[3], 255)
-        else
-            out[k + 1] = "\0\0\0\0"
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            local k = y * w + x
+            if alpha[k] == 255 then
+                local c = pal[idx[k]] or { 0, 0, 0 }
+                out[k + 1] = string.char(c[1], c[2], c[3], 255)
+            else
+                local bi                                     -- nearest opaque neighbor's palette index
+                for dy = -1, 1 do
+                    for dx = -1, 1 do
+                        local nx, ny = x + dx, y + dy
+                        if nx >= 0 and nx < w and ny >= 0 and ny < h and alpha[ny * w + nx] == 255 then
+                            bi = idx[ny * w + nx]; break
+                        end
+                    end
+                    if bi then break end
+                end
+                if bi then local c = pal[bi] or { 0, 0, 0 }; out[k + 1] = string.char(c[1], c[2], c[3], 0)
+                else out[k + 1] = "\0\0\0\0" end
+            end
         end
     end
     return table.concat(out), w, h
+end
+
+-- Point-magnify an RGBA buffer by an integer factor. HUD/menu patches are tiny
+-- (a digit is 14x16) and get drawn several times their native size; Cherax
+-- samples the texture bilinearly, so at that magnification the one-texel alpha
+-- ramp around the glyph smears into a visible halo/box over bright backgrounds.
+-- Baking the patch pre-enlarged (nearest) shrinks that ramp to a fraction of a
+-- screen pixel, so the on-screen edge stays crisp like the original 320x200 art.
+-- Factor targets a ~96px short side, capped so the texture stays <=1024.
+function W.upscaleNearest(rgba, w, h)
+    local N = floor(96 / min(w, h)); if N < 2 then N = 2 elseif N > 8 then N = 8 end
+    while N > 1 and (w * N > 1024 or h * N > 1024) do N = N - 1 end
+    if N <= 1 then return rgba, w, h end
+    local W2, H2 = w * N, h * N
+    local out = {}
+    for y = 0, H2 - 1 do
+        local rb = (y // N) * w
+        for x = 0, W2 - 1 do
+            local o = (rb + (x // N)) * 4
+            out[#out + 1] = rgba:sub(o + 1, o + 4)
+        end
+    end
+    return table.concat(out), W2, H2
+end
+
+-- H.3: single-patch composite WITH alpha (0 untouched -> transparent, 255 drawn).
+-- Mirrors W.compositeTexture, but for one sprite lump.
+function W.spriteRGBA(name)
+    local ord = W.spriteLump and W.spriteLump[name]
+    local data = W.lumpBytes(ord); if #data < 8 then return nil end
+    local w, h, cols = W.patchColumns(data); if not w then return nil end
+    return W.bakeMaskedRGBA(w, h, cols)
 end
 
 -- H.3: sprite meta {tex, w, h, xoff(leftOffset), yoff(topOffset)} or nil. The
@@ -2570,7 +2622,7 @@ function W.spriteGpu(name)
     if c == nil then
         if (W.bakeUsed or 0) >= (W.BAKE_BUDGET or 4) then return nil end
         W.bakeUsed = (W.bakeUsed or 0) + 1
-        local fn = key:gsub("[^%w_%-]", function(ch) return string.format("$%02X", ch:byte()) end) .. ".png"
+        local fn = key:gsub("[^%w_%-]", function(ch) return string.format("$%02X", ch:byte()) end) .. ".v2.png"  -- v2: edge-dilated bake
         local path = W.cacheDir .. "/" .. fn
         local exists = false
         local dok, de = pcall(FileMgr.DoesFileExist, path); if dok then exists = de end
@@ -2585,8 +2637,7 @@ function W.spriteGpu(name)
         else
             local m = W.spriteMeta[name]; sw, sh = m.w, m.h
         end
-        local id
-        local lok, lid = pcall(Texture.LoadTexture, path); if lok then id = lid end
+        local id = Texture.LoadTexture(path)
         if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
         W.texCache[key] = { id = id, state = "pending", w = sw, h = sh, path = path }
         return nil
@@ -3364,6 +3415,10 @@ function W.movePlane(sec, si, speed, dest, crush, isCeil, dir)
     if compress and W.thingBlocksPlane(si, isCeil and sec.floor or nh, isCeil and nh or sec.ceil) then
         if crush then
             W.crushThings(si)                -- crushers keep moving and hurt
+            if isCeil then sec.ceil = nh else sec.floor = nh end
+            -- Reaching dest ends the stroke (pastdest wins); otherwise report the
+            -- crush so a crusher caller slows its grind to CEILSPEED/8 (T_MovePlane).
+            return past and "pastdest" or "crushed"
         else
             return "crushed"                 -- do not move; caller reverses/stalls
         end
@@ -3383,20 +3438,20 @@ function W.doorThink(m)
     if m.dir == 0 then
         m.topcountdown = m.topcountdown - 1
         if m.topcountdown <= 0 then
-            if m.type == "blazeRaise" then m.dir = -1; pcall(W.playSfx, "DSBDCLS")
-            elseif m.type == "normal" then m.dir = -1; pcall(W.playSfx, "DSDORCLS")
-            elseif m.type == "close30" then m.dir = 1; pcall(W.playSfx, "DSDOROPN") end
+            if m.type == "blazeRaise" then m.dir = -1; W.playSfx("DSBDCLS")
+            elseif m.type == "normal" then m.dir = -1; W.playSfx("DSDORCLS")
+            elseif m.type == "close30" then m.dir = 1; W.playSfx("DSDOROPN") end
         end
     elseif m.dir == 2 then
         m.topcountdown = m.topcountdown - 1
         if m.topcountdown <= 0 and m.type == "raiseIn5" then
-            m.dir = 1; m.type = "normal"; pcall(W.playSfx, "DSDOROPN")
+            m.dir = 1; m.type = "normal"; W.playSfx("DSDOROPN")
         end
     elseif m.dir == -1 then
         local res = W.movePlane(sec, si, m.speed, sec.floor, false, true, -1)
         if res == "pastdest" then
             if m.type == "blazeRaise" or m.type == "blazeClose" then
-                W.activeSectors[si] = nil; pcall(W.playSfx, "DSBDCLS")
+                W.activeSectors[si] = nil; W.playSfx("DSBDCLS")
             elseif m.type == "normal" or m.type == "close" then
                 W.activeSectors[si] = nil
             elseif m.type == "close30" then
@@ -3404,7 +3459,7 @@ function W.doorThink(m)
             end
         elseif res == "crushed" then
             if m.type ~= "blazeClose" and m.type ~= "close" then
-                m.dir = 1; pcall(W.playSfx, "DSDOROPN")     -- reopen: never crush the player
+                m.dir = 1; W.playSfx("DSDOROPN")     -- reopen: never crush the player
             end
         end
     elseif m.dir == 1 then
@@ -3426,17 +3481,17 @@ function W.evDoDoor(ld, kind)
             topwait = W.VDOORWAIT, speed = W.VDOORSPEED, topcountdown = 0, dir = 1 }
         if kind == "blazeClose" then
             m.topheight = W.findLowestCeil(si) - 4; m.dir = -1; m.speed = W.VDOORSPEED * 4
-            pcall(W.playSfx, "DSBDCLS")
+            W.playSfx("DSBDCLS")
         elseif kind == "close" then
-            m.topheight = W.findLowestCeil(si) - 4; m.dir = -1; pcall(W.playSfx, "DSDORCLS")
+            m.topheight = W.findLowestCeil(si) - 4; m.dir = -1; W.playSfx("DSDORCLS")
         elseif kind == "close30" then
-            m.topheight = sec.ceil; m.dir = -1; pcall(W.playSfx, "DSDORCLS")
+            m.topheight = sec.ceil; m.dir = -1; W.playSfx("DSDORCLS")
         elseif kind == "blazeRaise" or kind == "blazeOpen" then
             m.topheight = W.findLowestCeil(si) - 4; m.speed = W.VDOORSPEED * 4
-            if m.topheight ~= sec.ceil then pcall(W.playSfx, "DSBDOPN") end
+            if m.topheight ~= sec.ceil then W.playSfx("DSBDOPN") end
         else -- normal / open
             m.topheight = W.findLowestCeil(si) - 4
-            if m.topheight ~= sec.ceil then pcall(W.playSfx, "DSDOROPN") end
+            if m.topheight ~= sec.ceil then W.playSfx("DSDOROPN") end
         end
         W.activeSectors[si] = m
     end)
@@ -3447,7 +3502,7 @@ W.KEYDOORMSG = { blue = "PD_BLUEK", yellow = "PD_YELLOWK", red = "PD_REDK" }
 function W.needKeyMsg(col)
     W.hudMsg = W.STR[W.KEYDOORMSG[col]] or ("You need a " .. tostring(col) .. " key")
     W.hudMsgUntil = now() + 2.0
-    pcall(W.playSfx, "DSOOF")
+    W.playSfx("DSOOF")
 end
 
 -- EV_DoLockedDoor: a remote door gated behind a keycard.
@@ -3481,7 +3536,7 @@ function W.evVerticalDoor(ld)
     W.activeSectors[si] = { kind = "door", sec = sec, si = si, type = d.type,
         topheight = top, speed = blaze and (W.VDOORSPEED * 4) or W.VDOORSPEED,
         dir = 1, topwait = W.VDOORWAIT, topcountdown = 0 }
-    pcall(W.playSfx, blaze and "DSBDOPN" or "DSDOROPN")
+    W.playSfx(blaze and "DSBDOPN" or "DSDOROPN")
     if d.one then ld.special = 0 end                          -- D1 open: one-shot
 end
 
@@ -3491,8 +3546,10 @@ function W.floorThink(m)
     if res == "pastdest" then
         if m.dir == -1 and m.type == "lowerAndChange" then
             m.sec.special = m.newspecial or 0; m.sec.floorTex = m.texture
+        elseif m.dir == 1 and m.type == "donutRaise" then       -- pool ring adopts outer floor
+            m.sec.special = m.newspecial or 0; m.sec.floorTex = m.texture
         end
-        W.activeSectors[m.si] = nil; pcall(W.playSfx, "DSPSTOP")
+        W.activeSectors[m.si] = nil; W.playSfx("DSPSTOP")
     end
 end
 
@@ -3515,8 +3572,21 @@ function W.evDoFloor(ld, kind)
             if kind == "raiseFloorCrush" then m.dest = m.dest - 8 end
         elseif kind == "raiseFloorTurbo" then
             m.speed = W.FLOORSPEED * 4; m.dest = W.findNextHighestFloor(si, sec.floor)
-        elseif kind == "raiseFloorToNearest" or kind == "raiseToTexture" then
-            m.dest = W.findNextHighestFloor(si, sec.floor)   -- raiseToTexture lacks tex heights; nearest step
+        elseif kind == "raiseFloorToNearest" then
+            m.dest = W.findNextHighestFloor(si, sec.floor)
+        elseif kind == "raiseToTexture" then
+            -- Raise by the shortest lower ("bottom") texture height among the
+            -- sector's surrounding two-sided lines, checking both sides of each.
+            local minsize, SD = nil, W.map.sidedefs
+            W.eachNeighbor(si, function(_, l)
+                local a = SD[l.front + 1]; local b = SD[l.back + 1]
+                local da = a and a.lower and W.texDefs and W.texDefs[a.lower]
+                local db = b and b.lower and W.texDefs and W.texDefs[b.lower]
+                if da and da.h and (not minsize or da.h < minsize) then minsize = da.h end
+                if db and db.h and (not minsize or db.h < minsize) then minsize = db.h end
+            end)
+            if minsize then m.dest = sec.floor + minsize
+            else m.dest = W.findNextHighestFloor(si, sec.floor) end   -- no lower textures: nearest step
         elseif kind == "raiseFloor24" then
             m.dest = sec.floor + 24
         elseif kind == "raiseFloor512" then
@@ -3540,12 +3610,12 @@ function W.platThink(m)
     if m.status == "up" then
         local res = W.movePlane(sec, si, m.speed, m.high, m.crush, false, 1)
         if (m.type == "raiseAndChange" or m.type == "raiseToNearestAndChange") and (W.levelTime % 8) == 0 then
-            pcall(W.playSfx, "DSSTNMOV")
+            W.playSfx("DSSTNMOV")
         end
         if res == "crushed" and not m.crush then
-            m.count = m.wait; m.status = "down"; pcall(W.playSfx, "DSPSTART")
+            m.count = m.wait; m.status = "down"; W.playSfx("DSPSTART")
         elseif res == "pastdest" then
-            m.count = m.wait; m.status = "waiting"; pcall(W.playSfx, "DSPSTOP")
+            m.count = m.wait; m.status = "waiting"; W.playSfx("DSPSTOP")
             if m.type == "blazeDWUS" or m.type == "downWaitUpStay"
                 or m.type == "raiseAndChange" or m.type == "raiseToNearestAndChange" then
                 W.activeSectors[si] = nil
@@ -3553,12 +3623,12 @@ function W.platThink(m)
         end
     elseif m.status == "down" then
         local res = W.movePlane(sec, si, m.speed, m.low, false, false, -1)
-        if res == "pastdest" then m.count = m.wait; m.status = "waiting"; pcall(W.playSfx, "DSPSTOP") end
+        if res == "pastdest" then m.count = m.wait; m.status = "waiting"; W.playSfx("DSPSTOP") end
     elseif m.status == "waiting" then
         m.count = m.count - 1
         if m.count <= 0 then
             m.status = (sec.floor == m.low) and "up" or "down"
-            pcall(W.playSfx, "DSPSTART")
+            W.playSfx("DSPSTART")
         end
     end
 end
@@ -3576,21 +3646,21 @@ function W.evDoPlat(ld, kind, amount)
         local m = { kind = "plat", sec = sec, si = si, type = kind, crush = false, tag = ld.tag, count = 0 }
         if kind == "raiseToNearestAndChange" then
             m.speed = W.PLATSPEED / 2; if fsec then sec.floorTex = fsec.floorTex end
-            m.high = W.findNextHighestFloor(si, sec.floor); m.wait = 0; m.status = "up"; sec.special = 0
-            pcall(W.playSfx, "DSSTNMOV")
+            m.high = W.findNextHighestFloor(si, sec.floor); m.low = 0; m.wait = 0; m.status = "up"; sec.special = 0
+            W.playSfx("DSSTNMOV")
         elseif kind == "raiseAndChange" then
             m.speed = W.PLATSPEED / 2; if fsec then sec.floorTex = fsec.floorTex end
-            m.high = sec.floor + (amount or 0); m.wait = 0; m.status = "up"; pcall(W.playSfx, "DSSTNMOV")
+            m.high = sec.floor + (amount or 0); m.low = 0; m.wait = 0; m.status = "up"; W.playSfx("DSSTNMOV")
         elseif kind == "downWaitUpStay" or kind == "blazeDWUS" then
             m.speed = (kind == "blazeDWUS") and (W.PLATSPEED * 8) or (W.PLATSPEED * 4)
             m.low = W.findLowestFloor(si); if m.low > sec.floor then m.low = sec.floor end
-            m.high = sec.floor; m.wait = W.PLATWAIT; m.status = "down"; pcall(W.playSfx, "DSPSTART")
+            m.high = sec.floor; m.wait = W.PLATWAIT; m.status = "down"; W.playSfx("DSPSTART")
         elseif kind == "perpetualRaise" then
             m.speed = W.PLATSPEED; m.low = W.findLowestFloor(si)
             if m.low > sec.floor then m.low = sec.floor end
             m.high = W.findHighestFloor(si); if m.high < sec.floor then m.high = sec.floor end
-            m.wait = W.PLATWAIT; m.status = ((W.levelTime & 1) == 0) and "up" or "down"
-            pcall(W.playSfx, "DSPSTART")
+            m.wait = W.PLATWAIT; m.status = ((W.pRandom() & 1) == 0) and "up" or "down"
+            W.playSfx("DSPSTART")
         else
             m.speed = W.PLATSPEED; m.low = sec.floor; m.high = sec.floor; m.wait = W.PLATWAIT; m.status = "down"
         end
@@ -3606,6 +3676,57 @@ function W.evStopPlat(ld)
     end
     return true
 end
+-- EV_DoDonut: the tagged "hole" sector S1 lowers to the outer floor while the ring
+-- sector S2 around it rises to that same height, taking on the outer sector's floor
+-- texture and clearing its special. S2 is the sector across S1's first two-sided
+-- line; S3 (which supplies the target height + texture) is the sector beyond S2
+-- through a line not shared with S1. Both movers reuse the floor thinker machinery.
+function W.evDoDonut(ld)
+    local LD, SD, SE = W.map.linedefs, W.map.sidedefs, W.map.sectors
+    local rtn = false
+    for i = 1, #SE do
+        local s1, s1i = SE[i], i - 1
+        if s1.tag == ld.tag and not W.activeSectors[s1i] then
+            local s2, s2i
+            for _, l in ipairs(LD) do
+                if l.front ~= NONE and l.back ~= NONE then
+                    local fsd, bsd = SD[l.front + 1], SD[l.back + 1]
+                    if fsd and bsd then
+                        if fsd.sector == s1i then s2i = bsd.sector
+                        elseif bsd.sector == s1i then s2i = fsd.sector end
+                        if s2i then s2 = SE[s2i + 1]; break end
+                    end
+                end
+            end
+            if s2 then
+                local s3
+                for _, l in ipairs(LD) do
+                    if l.front ~= NONE and l.back ~= NONE then
+                        local fsd, bsd = SD[l.front + 1], SD[l.back + 1]
+                        if fsd and bsd then
+                            local oi
+                            if fsd.sector == s2i then oi = bsd.sector
+                            elseif bsd.sector == s2i then oi = fsd.sector end
+                            if oi and oi ~= s1i and oi ~= s2i then s3 = SE[oi + 1]; break end
+                        end
+                    end
+                end
+                if s3 then
+                    rtn = true
+                    -- Ring rises to the outer floor, adopting its texture + special.
+                    W.activeSectors[s2i] = { kind = "floor", sec = s2, si = s2i,
+                        type = "donutRaise", crush = false, dir = 1, speed = W.FLOORSPEED / 2,
+                        dest = s3.floor, texture = s3.floorTex, newspecial = s3.special }
+                    -- Hole lowers to the outer floor.
+                    W.activeSectors[s1i] = { kind = "floor", sec = s1, si = s1i,
+                        type = "lowerFloor", crush = false, dir = -1, speed = W.FLOORSPEED / 2,
+                        dest = s3.floor }
+                end
+            end
+        end
+    end
+    return rtn
+end
 
 -- T_MoveCeiling: one tic of a ceiling mover / crusher.
 function W.ceilThink(m)
@@ -3615,7 +3736,7 @@ function W.ceilThink(m)
         if res == "pastdest" then
             if m.type == "raiseToHighest" then W.activeSectors[si] = nil
             else m.dir = -1 end                              -- crushers reverse
-            if m.type == "silentCrushAndRaise" then pcall(W.playSfx, "DSPSTOP") end
+            if m.type == "silentCrushAndRaise" then W.playSfx("DSPSTOP") end
         end
     elseif m.dir == -1 then
         local res = W.movePlane(sec, si, m.speed, m.bottomheight, m.crush, true, -1)
@@ -3623,7 +3744,7 @@ function W.ceilThink(m)
             if m.type == "crushAndRaise" or m.type == "silentCrushAndRaise" then m.speed = W.CEILSPEED; m.dir = 1
             elseif m.type == "fastCrushAndRaise" then m.dir = 1
             else W.activeSectors[si] = nil end
-            if m.type == "silentCrushAndRaise" then pcall(W.playSfx, "DSPSTOP") end
+            if m.type == "silentCrushAndRaise" then W.playSfx("DSPSTOP") end
         elseif res == "crushed" then
             if m.type == "crushAndRaise" or m.type == "silentCrushAndRaise" or m.type == "lowerAndCrush" then
                 m.speed = W.CEILSPEED / 8
@@ -3634,7 +3755,17 @@ end
 
 -- EV_DoCeiling: remote ceiling mover / crusher on tagged sectors.
 function W.evDoCeiling(ld, kind)
-    return W.forTagSectors(ld.tag, function(si, sec)
+    -- P_ActivateInStasisCeiling: a re-trigger of a crusher type first restarts any
+    -- same-tag crusher we previously parked in-stasis (evCeilStop set dir=0).
+    local revived = false
+    if kind == "crushAndRaise" or kind == "silentCrushAndRaise" or kind == "fastCrushAndRaise" then
+        for _, m in pairs(W.activeSectors) do
+            if m.kind == "ceil" and m.tag == ld.tag and m.dir == 0 then
+                m.dir = m.olddir or -1; revived = true
+            end
+        end
+    end
+    local made = W.forTagSectors(ld.tag, function(si, sec)
         local m = { kind = "ceil", sec = sec, si = si, type = kind, crush = false, tag = sec.tag }
         if kind == "fastCrushAndRaise" then
             m.crush = true; m.topheight = sec.ceil; m.bottomheight = sec.floor + 8; m.dir = -1; m.speed = W.CEILSPEED * 2
@@ -3649,6 +3780,7 @@ function W.evDoCeiling(ld, kind)
         end
         W.activeSectors[si] = m
     end)
+    return made or revived
 end
 
 function W.evCeilStop(ld)
@@ -3805,13 +3937,13 @@ function W.evTeleport(ld, side, isPlayer, th)
                     ox, oy, oz = th.x, th.y, th.z or dz
                     th.x = t.x; th.y = t.y; th.z = dz
                     th.angle = t.angle; th.movecount = 0; th.movedir = 8
-                    th.reaction = 18
+                    -- vanilla sets reactiontime=18 only for players; monsters resume at once
                 end
                 if ox then W.spawnFx("TFOG", "ABABCDEFGHIJ", 6, ox, oy, oz, { bright = true }) end
                 W.spawnFx("TFOG", "ABABCDEFGHIJ", 6,
                     t.x + 20 * cos(math.rad(t.angle)), t.y + 20 * sin(math.rad(t.angle)),
                     dz, { bright = true })
-                pcall(W.playSfx, "DSTELEPT")
+                W.playSfx("DSTELEPT")
                 return true
             end
         end
@@ -3845,12 +3977,14 @@ end
 -- schedule a revert. Scans the front side's top/mid/bottom for a known switch face.
 function W.changeSwitch(ld, again)
     local fsd = W.map.sidedefs[ld.front + 1]; if not fsd then return end
-    local snd = (ld.special == 11 or ld.special == 51) and "DSSWTCHX" or "DSSWTCHN"
+    -- vanilla clears line->special BEFORE the swtchx test, so an S1 exit switch
+    -- (special already 0) actually plays swtchn; keep that faithful ordering.
     if not again then ld.special = 0 end
+    local snd = (ld.special == 11 or ld.special == 51) and "DSSWTCHX" or "DSSWTCHN"
     for _, f in ipairs({ "upper", "mid", "lower" }) do
         local opp = W.SWITCH_PAIR[fsd[f]]
         if opp then
-            pcall(W.playSfx, snd)
+            W.playSfx(snd)
             if again then W.startButton(ld, fsd, f, fsd[f]) end
             fsd[f] = opp
             return
@@ -3905,7 +4039,7 @@ function W.useSpecialLine(ld)
     elseif ev == "stairs" then ok = W.evBuildStairs(ld, s.kind)
     elseif ev == "lockeddoor" then ok = W.evDoLockedDoor(ld, s.kind, s.lock)
     elseif ev == "light" then W.evLightTurnOn(ld, s.amount); ok = true
-    elseif ev == "donut" then ok = false                     -- donut movers not implemented
+    elseif ev == "donut" then ok = W.evDoDonut(ld)
     end
     if ok then W.changeSwitch(ld, s.again or false) end
     return true
@@ -3980,7 +4114,7 @@ end
 function W.spawnLightFlash(si, sec)
     W.lightThinkers = W.lightThinkers or {}
     W.lightThinkers[#W.lightThinkers + 1] = { kind = "flash", sec = sec,
-        bright = sec.light, dark = W.findMinLight(si, sec.light), count = 1 + (W.pRandom() & 63) }
+        bright = sec.light, dark = W.findMinLight(si, sec.light), count = 1 + (W.pRandom() & 64) }
 end
 function W.spawnGlow(si, sec)
     W.lightThinkers = W.lightThinkers or {}
@@ -4004,7 +4138,7 @@ function W.lightTick(lt)
         lt.count = lt.count - 1
         if lt.count <= 0 then
             if lt.sec.light == lt.bright then lt.sec.light = lt.dark; lt.count = 1 + (W.pRandom() & 7)
-            else lt.sec.light = lt.bright; lt.count = 1 + (W.pRandom() & 32) end
+            else lt.sec.light = lt.bright; lt.count = 1 + (W.pRandom() & 64) end
         end
     elseif lt.kind == "glow" then
         lt.val = lt.val + lt.dir * 8
@@ -4015,7 +4149,7 @@ function W.lightTick(lt)
         lt.count = lt.count - 1
         if lt.count <= 0 then
             local amount = (W.pRandom() & 3) * 16
-            if lt.maxl - amount < lt.minl then lt.sec.light = lt.minl
+            if lt.sec.light - amount < lt.minl then lt.sec.light = lt.minl   -- test CURRENT level
             else lt.sec.light = lt.maxl - amount end
             lt.count = 4
         end
@@ -4042,7 +4176,14 @@ function W.playerInSpecialSector()
         W.secretCount = (W.secretCount or 0) + 1; sec.special = 0
         W.hudMsg = "A secret is revealed!"; W.hudMsgUntil = now() + 2.0
     elseif sp == 11 then
-        if due then W.hurtPlayer(20) end
+        -- P_DamageMobj "end of game hell hack": a special-11 floor can never reduce
+        -- the player below 1 HP, so the E1M8 exit hurts but never kills.
+        if due then
+            local dmg = 20
+            local hp = W.health or 0
+            if dmg >= hp then dmg = hp - 1 end
+            if dmg > 0 then W.hurtPlayer(dmg) end
+        end
         if (W.health or 0) <= 10 then W.exitLevel() end
     end
 end
@@ -4061,11 +4202,14 @@ function W.tickSpecials()
             b.timer = b.timer - 1
             if b.timer <= 0 then
                 if b.sd then b.sd[b.field] = b.tex end
-                pcall(W.playSfx, "DSSWTCHN"); table.remove(W.buttons, i)
+                W.playSfx("DSSWTCHN"); table.remove(W.buttons, i)
             end
         end
     end
-    if W.lightThinkers then for _, lt in ipairs(W.lightThinkers) do W.lightTick(lt) end end
+    if W.lightThinkers then for _, lt in ipairs(W.lightThinkers) do W.lightTick(lt) end end    -- Advance scrolling wall textures one unit per tic (renderSeg reads sd.xoff).
+    if W.scrollSides then
+        for _, sd in ipairs(W.scrollSides) do sd.xoff = (sd.xoff or 0) + 1 end
+    end
     W.playerInSpecialSector()
 end
 
@@ -4131,7 +4275,16 @@ function W.spawnSpecials(map)
     end
     local tl = {}
     for _, ld in ipairs(map.linedefs) do if (ld.special or 0) ~= 0 then tl[#tl + 1] = ld end end
-    map.triggerLines = tl
+    map.triggerLines = tl    -- Scrolling wall texture (line special 48): remember each such line's front
+    -- sidedef so the tic loop can advance its texture x-offset.
+    local scr = {}
+    for _, ld in ipairs(map.linedefs) do
+        if (ld.special or 0) == 48 and ld.front ~= NONE then
+            local sd = map.sidedefs[ld.front + 1]
+            if sd then scr[#scr + 1] = sd end
+        end
+    end
+    W.scrollSides = scr
     -- Sector sound-adjacency graph for P_NoiseAlert: neighbours through every
     -- two-sided line, flagged when the line is ML_SOUNDBLOCK (0x40).
     local adj = {}
@@ -4262,10 +4415,11 @@ function W.skillBit()
     if s <= 2 then return 1 elseif s == 3 then return 2 else return 4 end
 end
 
-function W.giveAmmo(at, clips)
+function W.giveAmmo(at, clips, dropped)
     if not at then return false end
     if W.ammo[at] >= W.maxammo[at] then return false end
     local add = clips * W.CLIPAMMO[at]
+    if dropped then add = floor(add / 2) end                -- dropped pickup: half ammo (P_GiveAmmo num=0 path)
     if W.skill == 1 or W.skill == 5 then add = add * 2 end   -- baby/nightmare: double ammo
     W.ammo[at] = min(W.ammo[at] + add, W.maxammo[at])
     return true
@@ -4284,12 +4438,13 @@ function W.giveThing(th)
         if p.pts <= W.armor then return false end
         W.armor = p.pts; W.armorType = p.atype; return true
     elseif k == "armorbonus" then
-        if W.armor >= p.max then return false end
+        -- vanilla SPR_BON2 always grabs the helmet (armorpoints++ capped 200) and
+        -- counts it, even at max, so it is never left on the floor.
         W.armor = min(W.armor + p.amt, p.max)
         if W.armorType == 0 then W.armorType = 1 end
         return true
     elseif k == "ammo" then
-        return W.giveAmmo(p.at, p.clips)
+        return W.giveAmmo(p.at, p.clips, th.dropped)
     elseif k == "backpack" then
         local took = false
         if not W.backpack then
@@ -4302,15 +4457,23 @@ function W.giveThing(th)
     elseif k == "weapon" then
         local gaveW = not W.weaponOwned[p.slot]
         if gaveW then W.weaponOwned[p.slot] = true; W.pendingWeapon = p.slot end
-        local gaveA = p.at and W.giveAmmo(p.at, 2) or false
+        local gaveA = p.at and W.giveAmmo(p.at, 2, th.dropped) or false
         return gaveW or gaveA
     elseif k == "key" then
         if W.keys[p.col] then return false end
         W.keys[p.col] = true; W.keyForm[p.col] = p.form; return true
     elseif k == "power" then
-        if (W.powers[p.pw] or 0) > 0 and p.pw ~= "berserk" then return false end
+        -- Timed powers (invuln/invis/infrared/radsuit) always reset to full
+        -- duration and consume the item, even when already held (P_GivePower).
+        if p.dur ~= -1 then
+            W.powers[p.pw] = p.dur
+            return true
+        end
+        -- allmap refuses when already owned; berserk is a one-shot heal + strength.
+        if p.pw == "allmap" and (W.powers[p.pw] or 0) > 0 then return false end
         if p.heal then W.health = max(W.health, p.heal) end
-        W.powers[p.pw] = (p.dur == -1) and 0x40000000 or p.dur
+        W.powers[p.pw] = 0x40000000
+        if p.pw == "berserk" and W.curWeapon ~= 1 then W.pendingWeapon = 1 end  -- auto-raise the fist
         return true
     end
     return false
@@ -4333,7 +4496,7 @@ function W.updatePickups()
                 local kk = th.pk.k
                 local sfx = (kk == "weapon") and "DSWPNUP"
                     or (kk == "power" or kk == "mega") and "DSGETPOW" or "DSITEMUP"
-                pcall(W.playSfx, sfx)
+                W.playSfx(sfx)
             end
         end
     end
@@ -4464,7 +4627,7 @@ function W.spawnProjectile(kind, x, y, z, ang, momz, owner)
     th.life = 20 * 35                                -- leak guard, tics (not vanilla)
     th.removed = false; th.dead = false; th.pk = nil; th._slot = idx
     th.info = nil; th.states = nil; th.tracer = nil
-    if p.seesfx then pcall(W.playSfx, p.seesfx) end
+    if p.seesfx then W.playSfx(p.seesfx) end
     W.thinkers[#W.thinkers + 1] = th
     return th
 end
@@ -4480,7 +4643,7 @@ function W.projExplode(th, hit)
     t0 = t0 - (W.pRandom() & 3); if t0 < 1 then t0 = 1 end
     th.tics = t0
     th.sprayPend = p.spray or false
-    if p.dsfx then pcall(W.playSfx, p.dsfx) end
+    if p.dsfx then W.playSfx(p.dsfx) end
     local dmg = (W.pRandom() % 8 + 1) * p.dmg
     if hit then W.damageMobj(hit, dmg, th, th.owner) end
     if (p.splash or 0) > 0 then W.radiusDamage(th.x, th.y, p.splash, p.splash, th, th.owner) end
@@ -4712,8 +4875,7 @@ end
 -- Straight-line distance from a monster to its target.
 function W.distToTarget(th)
     local tx, ty = W.tgtPos(th.target)
-    local dx, dy = tx - th.x, ty - th.y
-    return sqrt(dx * dx + dy * dy)
+    return aproxDist(tx - th.x, ty - th.y)
 end
 
 -- P_CheckSight, minus the BSP/REJECT acceleration: true iff the 3D sight line
@@ -4840,7 +5002,7 @@ function W.wakeMonster(th)
     if not th.states or not th.states.run then return end
     local mi = th.info
     if mi and mi.sight and th.stkey == "stnd" then
-        pcall(W.playSfx, W.sndPick(mi.sight, mi.sightN))
+        W.playSfx(W.sndPick(mi.sight, mi.sightN))
     end
     th.threshold = 0
     W.setMState(th, "run", 1)
@@ -5073,12 +5235,12 @@ function W.actChase(th)
         return
     end
     if mi.melee and W.checkMeleeRange(th) then
-        if mi.atksfx then pcall(W.playSfx, mi.atksfx) end
+        if mi.atksfx then W.playSfx(mi.atksfx) end
         -- species with a separate melee chain use matk; others share the atk chain
         W.setMState(th, (th.states and th.states.matk) and "matk" or "atk", 1)
         return
     end
-    if mi.missile and (W.skill == 5 or (th.movecount or 0) <= 0) and W.checkMissileRange(th) then
+    if mi.missile and (W.skill == 5 or (th.movecount or 0) == 0) and W.checkMissileRange(th) then
         W.setMState(th, "atk", 1)
         th.justattacked = true
         return
@@ -5088,7 +5250,7 @@ function W.actChase(th)
         W.newChaseDir(th)
     end
     if mi.act and W.pRandom() < 3 then                    -- occasional active grunt
-        pcall(W.playSfx, mi.act)
+        W.playSfx(mi.act)
     end
 end
 
@@ -5098,14 +5260,14 @@ function W.actPosAttack(th)
     local base = (th.angle or 0) * (pi / 180)
     local sz = W.monShootZ(th)
     local slope = W.aimLineAttack(th, th.x, th.y, sz, base, 2048)
-    pcall(W.playSfx, "DSPISTOL")
+    W.playSfx("DSPISTOL")
     local ang = base + (W.pRandom() - W.pRandom()) * (pi / 2048)
     W.lineAttack(th, th.x, th.y, sz, ang, 2048, slope, (W.pRandom() % 5 + 1) * 3)
 end
 
 function W.actSPosAttack(th)
     if not th.target then return end
-    pcall(W.playSfx, "DSSHOTGN")
+    W.playSfx("DSSHOTGN")
     W.faceTarget(th)
     local base = (th.angle or 0) * (pi / 180)
     local sz = W.monShootZ(th)
@@ -5120,7 +5282,7 @@ function W.actTroopAttack(th)
     if not th.target then return end
     W.faceTarget(th)
     if W.checkMeleeRange(th) then
-        pcall(W.playSfx, "DSCLAW")
+        W.playSfx("DSCLAW")
         W.damageMobj(th.target, (W.pRandom() % 8 + 1) * 3, th, th)
         return
     end
@@ -5148,7 +5310,7 @@ end
 function W.actBruisAttack(th)
     if not th.target then return end
     if W.checkMeleeRange(th) then
-        pcall(W.playSfx, "DSCLAW")
+        W.playSfx("DSCLAW")
         W.damageMobj(th.target, (W.pRandom() % 8 + 1) * 10, th, th)
         return
     end
@@ -5157,17 +5319,17 @@ end
 
 function W.actScream(th)
     local mi = th.info
-    if mi and mi.dsfx then pcall(W.playSfx, W.sndPick(mi.dsfx, mi.dsfxN)) end
-    if not mi and th.states == W.SSTATES.BAR1 then pcall(W.playSfx, "DSBAREXP") end
+    if mi and mi.dsfx then W.playSfx(W.sndPick(mi.dsfx, mi.dsfxN)) end
+    if not mi and th.states == W.SSTATES.BAR1 then W.playSfx("DSBAREXP") end
 end
 
 function W.actXScream(th)
-    pcall(W.playSfx, "DSSLOP")
+    W.playSfx("DSSLOP")
 end
 
 function W.actPain(th)
     local mi = th.info
-    if mi and mi.psfx then pcall(W.playSfx, mi.psfx) end
+    if mi and mi.psfx then W.playSfx(mi.psfx) end
 end
 
 function W.actFall(th)
@@ -5230,7 +5392,7 @@ end
 -- A_CPosAttack: one aimed hitscan per call with (P_Random-P_Random) spread.
 function W.actCPosAttack(th)
     if not th.target then return end
-    pcall(W.playSfx, "DSSHOTGN")
+    W.playSfx("DSSHOTGN")
     W.faceTarget(th)
     local base = (th.angle or 0) * (pi / 180)
     local sz = W.monShootZ(th)
@@ -5269,15 +5431,15 @@ function W.actCyberAttack(th)
 end
 
 -- walk-noise wrappers: sound, then the normal A_Chase decision ladder
-function W.actHoof(th) pcall(W.playSfx, "DSHOOF"); W.actChase(th) end
-function W.actMetal(th) pcall(W.playSfx, "DSMETAL"); W.actChase(th) end
-function W.actBabyMetal(th) pcall(W.playSfx, "DSBSPWLK"); W.actChase(th) end
+function W.actHoof(th) W.playSfx("DSHOOF"); W.actChase(th) end
+function W.actMetal(th) W.playSfx("DSMETAL"); W.actChase(th) end
+function W.actBabyMetal(th) W.playSfx("DSBSPWLK"); W.actChase(th) end
 
 -- A_SkullAttack: hurl the lost soul at its target (SKULLSPEED 20/tic).
 function W.actSkullAttack(th)
     if not th.target then return end
     th.skullfly = true
-    if th.info and th.info.atksfx then pcall(W.playSfx, th.info.atksfx) end
+    if th.info and th.info.atksfx then W.playSfx(th.info.atksfx) end
     W.faceTarget(th)
     local an = (th.angle or 0) * (pi / 180)
     th.momx = cos(an) * 20; th.momy = sin(an) * 20
@@ -5329,14 +5491,14 @@ end
 function W.actSkelWhoosh(th)
     if not th.target then return end
     W.faceTarget(th)
-    pcall(W.playSfx, "DSSKESWG")
+    W.playSfx("DSSKESWG")
 end
 
 function W.actSkelFist(th)
     if not th.target then return end
     W.faceTarget(th)
     if W.checkMeleeRange(th) then
-        pcall(W.playSfx, "DSSKEPCH")
+        W.playSfx("DSSKEPCH")
         W.damageMobj(th.target, (W.pRandom() % 10 + 1) * 6, th, th)
     end
 end
@@ -5358,7 +5520,7 @@ end
 -- Mancubus: three 2-missile volleys walking a FATSPREAD (11.25 deg) fan.
 function W.actFatRaise(th)
     W.faceTarget(th)
-    pcall(W.playSfx, "DSMANATK")
+    W.playSfx("DSMANATK")
 end
 
 function W.actFatAttack1(th)
@@ -5403,7 +5565,7 @@ function W.actVileChase(th)
                         local tmp = th.target
                         th.target = o; W.faceTarget(th); th.target = tmp
                         W.setMState(th, "heal", 1)
-                        pcall(W.playSfx, "DSSLOP")
+                        W.playSfx("DSSLOP")
                         o.dead = false
                         o.hp = (mi and mi.hp) or 100
                         o.target = nil
@@ -5417,7 +5579,7 @@ function W.actVileChase(th)
     W.actChase(th)
 end
 
-function W.actVileStart(th) pcall(W.playSfx, "DSVILATK") end
+function W.actVileStart(th) W.playSfx("DSVILATK") end
 
 -- A_VileTarget: spawn the flame on the victim. target->x is passed for BOTH
 -- coordinates on purpose; A_StartFire re-seats it in front the same tic.
@@ -5447,8 +5609,8 @@ function W.actFire(th)
     th.z = tz
 end
 
-function W.actStartFire(th) pcall(W.playSfx, "DSFLAMST"); W.actFire(th) end
-function W.actFireCrackle(th) pcall(W.playSfx, "DSFLAME"); W.actFire(th) end
+function W.actStartFire(th) W.playSfx("DSFLAMST"); W.actFire(th) end
+function W.actFireCrackle(th) W.playSfx("DSFLAME"); W.actFire(th) end
 
 -- A_VileAttack: 20 direct damage + the victim hurled upward + a 70/70 radius
 -- blast centered on the flame moved between the vile and the victim.
@@ -5456,12 +5618,13 @@ function W.actVileAttack(th)
     if not th.target then return end
     W.faceTarget(th)
     if not W.monsterSees(th, th.target) then return end
-    pcall(W.playSfx, "DSBAREXP")
+    W.playSfx("DSBAREXP")
     W.damageMobj(th.target, 20, th, th)
     if th.target == "player" then
         W.momz = 1000 / 100             -- vanilla: momz = 1000*FRACUNIT/mass
+    elseif type(th.target) == "table" then
+        th.target.momz = 1000 / ((th.target.info and th.target.info.mass) or 100)
     end
-    -- monster victims keep their feet (no vertical momentum here)
     local an = (th.angle or 0) * (pi / 180)
     local fire = th.tracer
     if not fire then return end
@@ -5485,14 +5648,14 @@ end
 
 -- Boss brain (MAP30). Cube spawner not simulated; the brain is shootable,
 -- screams in a sweep of rocket bursts, and its death ends the level.
-function W.actBrainPain(th) pcall(W.playSfx, "DSBOSPN") end
+function W.actBrainPain(th) W.playSfx("DSBOSPN") end
 
 function W.actBrainScream(th)
     for x = th.x - 196, th.x + 320, 8 do
         W.spawnFx("MISL", "BCD", { 8, 6, 4 }, x, th.y - 320,
             128 + W.pRandom() * 2, { bright = true })
     end
-    pcall(W.playSfx, "DSBOSDTH")
+    W.playSfx("DSBOSDTH")
 end
 
 function W.actBrainDie(th) W.exitLevel(false) end
@@ -5592,6 +5755,16 @@ function W.monsterThink(th)
             th.momx = 0; th.momy = 0
         end
     end
+    -- MF_FLOAT vertical homing (P_ZMovement): a floater with a target drifts toward
+    -- the target's mid-height at FLOATSPEED, so cacodemons / lost souls / pain
+    -- elementals rise and dive to the player's altitude instead of hugging the floor.
+    if th.info and th.info.float and th.target and not th.dead and not th.skullfly then
+        local tx, ty, tz = W.tgtPos(th.target)
+        local dist = aproxDist(th.x - tx, th.y - ty)
+        local delta = (tz + (th.info.h or 56) * 0.5) - (th.z or 0)
+        if delta < 0 and dist < -delta * 3 then th.z = (th.z or 0) - W.FLOATSPEED
+        elseif delta > 0 and dist < delta * 3 then th.z = (th.z or 0) + W.FLOATSPEED end
+    end
     if not th.info then return end          -- statue species: renderable, no AI
     if th.tics == -1 then return end
     th.tics = (th.tics or 1) - 1
@@ -5669,6 +5842,16 @@ function W.rayWallDist(x1, y1, dx, dy, range, shootZ, slope)
                             stops = (zc <= ob or zc >= ot)
                         else stops = true end
                     end
+                    if stops then
+                        -- Sky hack (PTR_ShootTraverse): a shot that strikes a wall whose
+                        -- front sector has an F_SKY1 ceiling, above that ceiling, vanishes
+                        -- with no puff instead of painting the sky.
+                        local sd0 = SD[ld.front + 1] or SD[ld.back + 1]
+                        local fsec0 = sd0 and SE[sd0.sector + 1]
+                        if fsec0 and fsec0.ceilTex == "F_SKY1" and (shootZ + slope * d) > fsec0.ceil then
+                            stops = false
+                        end
+                    end
                     if stops then best = d; bestLd = ld end
                 end
             end
@@ -5691,32 +5874,24 @@ function W.lineAttack(src, x1, y1, shootZ, ang, range, slope, dmg)
             and (th.flags & 0x0010) == 0 then
             local e = W.THING_SPR[th.dtype]
             if e and e.r then
-                local rx, ry = th.x - x1, th.y - y1
-                local along = rx * dx + ry * dy
-                if along > 0 and along < bestAlong then
-                    local perp = abs(rx * (-dy) + ry * dx)
-                    if perp <= e.r then
-                        local bz = shootZ + slope * along
-                        local mi = th.info or W.MINFO[e.spr]
-                        local oz, oh = th.z or 0, (mi and mi.h) or 56
-                        if bz >= oz and bz <= oz + oh then
-                            best = th; bestAlong = along
-                        end
+                local along = W.thingIntercept(x1, y1, dx, dy, th.x, th.y, e.r)
+                if along and along < bestAlong then
+                    local bz = shootZ + slope * along
+                    local mi = th.info or W.MINFO[e.spr]
+                    local oz, oh = th.z or 0, (mi and mi.h) or 56
+                    if bz >= oz and bz <= oz + oh then
+                        best = th; bestAlong = along
                     end
                 end
             end
         end
     end
     if src ~= "player" and not W.playerDead then
-        local rx, ry = W.viewX - x1, W.viewY - y1
-        local along = rx * dx + ry * dy
-        if along > 0 and along < bestAlong then
-            local perp = abs(rx * (-dy) + ry * dx)
-            if perp <= W.RADIUS then
-                local bz = shootZ + slope * along
-                if bz >= W.pz and bz <= W.pz + W.PHEIGHT then
-                    best = "player"; bestAlong = along
-                end
+        local along = W.thingIntercept(x1, y1, dx, dy, W.viewX, W.viewY, W.RADIUS)
+        if along and along < bestAlong then
+            local bz = shootZ + slope * along
+            if bz >= W.pz and bz <= W.pz + W.PHEIGHT then
+                best = "player"; bestAlong = along
             end
         end
     end
@@ -5742,6 +5917,31 @@ function W.lineAttack(src, x1, y1, shootZ, ang, range, slope, dmg)
     return best, bestAlong
 end
 
+-- PIT_AddThingIntercepts: vanilla thing-hit test for hitscan + autoaim. The ray
+-- (origin ox,oy; unit dir dx,dy) hits the thing when it crosses the thing's
+-- corner-to-corner box diagonal, picked to sit perpendicular-ish to the ray.
+-- That yields a half-width of r on cardinal shots rising to r*sqrt2 on 45-degree
+-- shots, matching the original's forgiving diagonal autoaim (a plain perp<=r
+-- cylinder is up to ~40% tighter). Returns the intercept distance along the ray
+-- (dir is unit, so this is a world distance) or nil on a miss / behind origin.
+function W.thingIntercept(ox, oy, dx, dy, tx, ty, r)
+    local ax, ay, bx, by
+    if dx * dy > 0 then
+        ax, ay, bx, by = tx - r, ty + r, tx + r, ty - r
+    else
+        ax, ay, bx, by = tx - r, ty - r, tx + r, ty + r
+    end
+    local ex, ey = bx - ax, by - ay
+    local det = ex * dy - dx * ey
+    if det == 0 then return nil end                 -- ray parallel to the diagonal
+    local rx, ry = ax - ox, ay - oy
+    local u = (dx * ry - dy * rx) / det             -- crossing point along the diagonal
+    if u < 0 or u > 1 then return nil end           -- ray passes outside the two corners
+    local s = (ex * ry - ey * rx) / det             -- distance along the ray to the cross
+    if s <= 0 then return nil end                   -- intercept is behind the origin
+    return s
+end
+
 -- P_AimLineAttack: autoaim slope toward the nearest shootable thing under the
 -- crosshair inside the +-100/160 vertical window; wall occlusion via the sloped
 -- sight walk. Returns (slope, target); slope 0 when nothing is aimed at.
@@ -5753,38 +5953,30 @@ function W.aimLineAttack(src, x1, y1, shootZ, ang, range)
             and (th.flags & 0x0010) == 0 then
             local e = W.THING_SPR[th.dtype]
             if e and e.r then
-                local rx, ry = th.x - x1, th.y - y1
-                local along = rx * dx + ry * dy
-                if along > 0 and along < bestAlong then
-                    local perp = abs(rx * (-dy) + ry * dx)
-                    if perp <= e.r then
-                        local mi = th.info or W.MINFO[e.spr]
-                        local oz, oh = th.z or 0, (mi and mi.h) or 56
-                        local ts = (oz + oh - shootZ) / along
-                        local bs = (oz - shootZ) / along
-                        if ts > 100 / 160 then ts = 100 / 160 end
-                        if bs < -100 / 160 then bs = -100 / 160 end
-                        if ts > bs and W.checkSight(x1, y1, shootZ, th.x, th.y, oz, oz + oh) then
-                            bestAlong = along; slope = (ts + bs) / 2; tgt = th
-                        end
+                local along = W.thingIntercept(x1, y1, dx, dy, th.x, th.y, e.r)
+                if along and along < bestAlong then
+                    local mi = th.info or W.MINFO[e.spr]
+                    local oz, oh = th.z or 0, (mi and mi.h) or 56
+                    local ts = (oz + oh - shootZ) / along
+                    local bs = (oz - shootZ) / along
+                    if ts > 100 / 160 then ts = 100 / 160 end
+                    if bs < -100 / 160 then bs = -100 / 160 end
+                    if ts > bs and W.checkSight(x1, y1, shootZ, th.x, th.y, oz, oz + oh) then
+                        bestAlong = along; slope = (ts + bs) / 2; tgt = th
                     end
                 end
             end
         end
     end
     if src ~= "player" and not W.playerDead then
-        local rx, ry = W.viewX - x1, W.viewY - y1
-        local along = rx * dx + ry * dy
-        if along > 0 and along < bestAlong then
-            local perp = abs(rx * (-dy) + ry * dx)
-            if perp <= W.RADIUS then
-                local ts = (W.pz + W.PHEIGHT - shootZ) / along
-                local bs = (W.pz - shootZ) / along
-                if ts > 100 / 160 then ts = 100 / 160 end
-                if bs < -100 / 160 then bs = -100 / 160 end
-                if ts > bs and W.checkSight(x1, y1, shootZ, W.viewX, W.viewY, W.pz, W.pz + W.PHEIGHT) then
-                    slope = (ts + bs) / 2; tgt = "player"
-                end
+        local along = W.thingIntercept(x1, y1, dx, dy, W.viewX, W.viewY, W.RADIUS)
+        if along and along < bestAlong then
+            local ts = (W.pz + W.PHEIGHT - shootZ) / along
+            local bs = (W.pz - shootZ) / along
+            if ts > 100 / 160 then ts = 100 / 160 end
+            if bs < -100 / 160 then bs = -100 / 160 end
+            if ts > bs and W.checkSight(x1, y1, shootZ, W.viewX, W.viewY, W.pz, W.pz + W.PHEIGHT) then
+                slope = (ts + bs) / 2; tgt = "player"
             end
         end
     end
@@ -5797,16 +5989,19 @@ function W.pShootZ() return W.pz + 36 end
 -- P_BulletSlope: aim dead ahead at 1024, then retry ~5.6 degrees right/left.
 function W.bulletSlope()
     local sz = W.pShootZ()
-    local s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle, 1024)
+    local ang = W.viewAngle
+    local s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, ang, 1024)
     if not t then
-        s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle + pi / 32, 1024)
+        ang = W.viewAngle + pi / 32
+        s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, ang, 1024)
         if not t then
-            s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, W.viewAngle - pi / 32, 1024)
-            if not t then s = 0 end
+            ang = W.viewAngle - pi / 32
+            s, t = W.aimLineAttack("player", W.viewX, W.viewY, sz, ang, 1024)
+            if not t then s = 0; ang = W.viewAngle end
         end
     end
-    W.bslope = s; W.linetarget = t
-    return s, t
+    W.bslope = s; W.linetarget = t; W.bang = ang
+    return s, t, ang
 end
 
 -- P_GunShot: one bullet at MISSILERANGE with the shared bullet slope.
@@ -5817,11 +6012,14 @@ function W.gunShot(accurate)
     W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 2048, W.bslope or 0, dmg)
 end
 
--- P_SpawnPlayerMissile: straight ahead from feet+32 with the 3-try autoaim.
+-- P_SpawnPlayerMissile: from feet+32 with the 3-try autoaim, fired along the
+-- autoaim-adjusted horizontal angle (falls back to the view angle when there is
+-- no target). spawnProjectile derives the facing angle and momx/momy from that
+-- angle; momz keeps the separate vertical aim slope.
 function W.spawnPlayerMissile(kind)
-    local slope, t = W.bulletSlope()
-    if not t then slope = 0 end
-    W.spawnProjectile(kind, W.viewX, W.viewY, W.pz + 32, W.viewAngle,
+    local slope, t, ang = W.bulletSlope()
+    if not t then slope = 0; ang = W.viewAngle end
+    W.spawnProjectile(kind, W.viewX, W.viewY, W.pz + 32, ang,
         slope * W.PROJ[kind].speed, "player")
 end
 
@@ -5832,8 +6030,18 @@ end
 function W.damageMobj(target, dmg, inflictor, source)
     if target == "player" then
         if W.playerDead then return end
-        if (W.powers.invuln or 0) ~= 0 and dmg < 1000 then return end
         if W.skill == 1 then dmg = floor(dmg / 2) end        -- sk_baby: half damage
+        -- Knockback runs BEFORE the invuln bail, so an invulnerable player is still
+        -- shoved (rocket jumps work under invulnerability, exactly as vanilla).
+        local inf = (type(inflictor) == "table") and inflictor
+            or ((type(source) == "table") and source or nil)
+        if inf then
+            local ang = atan(W.viewY - inf.y, W.viewX - inf.x)
+            local thrust = dmg * 12.5 / 100
+            W.momx = W.momx + cos(ang) * thrust
+            W.momy = W.momy + sin(ang) * thrust
+        end
+        if (W.powers.invuln or 0) ~= 0 and dmg < 1000 then return end
         local absorb = 0
         if W.armor > 0 and W.armorType > 0 then
             absorb = min(W.armor, floor(dmg * ((W.armorType == 1) and (1 / 3) or (1 / 2))))
@@ -5844,39 +6052,42 @@ function W.damageMobj(target, dmg, inflictor, source)
         W.health = W.health - d
         W.damageCount = min(100, (W.damageCount or 0) + d)
         W.attacker = source
-        pcall(W.playSfx, "DSPLPAIN")
-        local inf = (type(inflictor) == "table") and inflictor
-            or ((type(source) == "table") and source or nil)
-        if inf then                                          -- knockback (rocket jumps!)
-            local ang = atan(W.viewY - inf.y, W.viewX - inf.x)
-            local thrust = dmg * 12.5 / 100
-            W.momx = W.momx + cos(ang) * thrust
-            W.momy = W.momy + sin(ang) * thrust
-        end
+        W.playSfx("DSPLPAIN")
         if W.health <= 0 then
             W.health = 0; W.playerDead = true; W.deadTimer = now()
             W.dropWeapon()
-            pcall(W.playSfx, "DSPLDETH")
+            W.playSfx("DSPLDETH")
         end
         return
     end
     local th = target
     if type(th) ~= "table" or th.dead or th.removed then return end
     local mi = th.info
-    local inf = (inflictor == "player" or source == "player") and "player"
-        or ((type(inflictor) == "table") and inflictor
-            or ((type(source) == "table") and source or nil))
-    if inf then                                              -- damage thrust, mass-scaled
-        local ix, iy
-        if inf == "player" then ix, iy = W.viewX, W.viewY else ix, iy = inf.x, inf.y end
+    if th.skullfly then th.momx = 0; th.momy = 0; th.momz = 0 end  -- a charging skull halts on a hit
+    -- Thrust origin is the INFLICTOR only: a table inflictor (missile/barrel) drives
+    -- the shove so splash AND direct-projectile hits push from the blast spot, not
+    -- the shooter's eye. A nil inflictor (crush/telefrag) means no thrust, per vanilla.
+    local inf
+    if type(inflictor) == "table" then inf = inflictor
+    elseif inflictor == "player" then inf = "player" end
+    -- The chainsaw does not shove the victim out of melee reach.
+    if inf and not (source == "player" and W.curWeapon == 8) then  -- damage thrust, mass-scaled
+        local ix, iy, iz
+        if inf == "player" then ix, iy, iz = W.viewX, W.viewY, W.pz
+        else ix, iy, iz = inf.x, inf.y, (inf.z or 0) end
         local ang = atan(th.y - iy, th.x - ix)
         local thrust = dmg * 12.5 / ((mi and mi.mass) or 100)
+        -- Fall forward: a light hit that would kill, from well below, sometimes
+        -- flops the corpse backward over the inflictor (reverse angle, 4x shove).
+        if dmg < 40 and dmg > (th.hp or 0) and (th.z or 0) - iz > 64 and (W.pRandom() & 1) ~= 0 then
+            ang = ang + pi; thrust = thrust * 4
+        end
         th.momx = (th.momx or 0) + cos(ang) * thrust
         th.momy = (th.momy or 0) + sin(ang) * thrust
     end
     th.hp = (th.hp or 0) - dmg
     if th.hp <= 0 then W.killMobj(th, source); return end
-    if mi and W.pRandom() < (mi.pain or 0) then
+    if mi and W.pRandom() < (mi.pain or 0) and not th.skullfly then
         th.justhit = true                                    -- retaliate on the next chase
         W.setMState(th, "pain", 1)
     end
@@ -5901,12 +6112,38 @@ function W.killMobj(th, source)
     if th.states then
         if th.states.xdie and mi and th.hp < -mi.hp then W.setMState(th, "xdie", 1)
         else W.setMState(th, "die", 1) end
+        th.tics = th.tics - (W.pRandom() & 3)                -- shave 0..3 tics so a group of
+        if th.tics < 1 then th.tics = 1 end                  -- identical corpses desyncs
     else
         th.think = nil                                       -- statue species: freeze
     end
+    W.dropItem(th)                                           -- former humans leave loot
 end
 
 function W.hurtPlayer(dmg) W.damageMobj("player", dmg, nil, nil) end
+-- P_KillMobj "Drop stuff": former humans leave the weapon/ammo they carried.
+-- doomednum keys so the dropped thing reuses the map-pickup sprite + give path;
+-- zombieman/SS drop a clip, shotgunner a shotgun, chaingunner a chaingun.
+W.DROPITEM = { POSS = 2007, SSWV = 2007, SPOS = 2001, CPOS = 2002 }
+
+-- Spawn the dropped pickup at the corpse (ONFLOORZ), flagged dropped=true so the
+-- touch path knows to hand out only half the ammo. Reuses a free thing slot like
+-- the fx/projectile pool and joins the live pickup list so walking over it gives it.
+function W.dropItem(th)
+    local e = W.THING_SPR[th.dtype]
+    local dn = e and W.DROPITEM[e.spr]
+    if not dn or not W.pickupThings then return end
+    local idx = (#W.freeThingSlots > 0) and table.remove(W.freeThingSlots) or (#W.map.things + 1)
+    local d = W.map.things[idx]
+    if not d then d = {}; W.map.things[idx] = d end
+    d.dtype = dn; d.x = th.x; d.y = th.y; d.z = W.floorZFor(20, th.x, th.y)
+    d.flags = 0; d.angle = 0
+    d.think = nil; d.info = nil; d.states = nil; d.proj = nil
+    d.spr = nil; d.frame = nil; d.rot = nil; d.bright = false  -- clear stale reused-slot fields
+    d.removed = false; d.dead = false; d._slot = idx
+    d.pk = W.PICKUP[dn]; d.dropped = true
+    W.pickupThings[#W.pickupThings + 1] = d
+end
 
 -- P_RadiusAttack: falloff = radius - (max(|dx|,|dy|) - target radius), LOS-gated
 -- from the blast spot. spot (the exploding thing) is exempt; the SHOOTER is NOT
@@ -5994,7 +6231,7 @@ end
 function W.bringUpWeapon()
     local wnum = W.pendingWeapon or W.curWeapon
     W.curWeapon = wnum; W.pendingWeapon = nil
-    if wnum == 8 then pcall(W.playSfx, "DSSAWUP") end
+    if wnum == 8 then W.playSfx("DSSAWUP") end
     W.psp.sy = 128
     W.setPsprite(W.psp, W.WEAPONS[wnum].up)
 end
@@ -6006,7 +6243,7 @@ end
 -- Weapon action routines. layer = the psprite the state belongs to.
 W.PACT = {}
 W.PACT.ready = function(layer)
-    if W.curWeapon == 8 and layer.st == "SAW" then pcall(W.playSfx, "DSSAWIDL") end
+    if W.curWeapon == 8 and layer.st == "SAW" then W.playSfx("DSSAWIDL") end
     if W.pendingWeapon or W.playerDead or W.health <= 0 then
         W.setPsprite(layer, W.WEAPONS[W.curWeapon].down)
         return
@@ -6066,7 +6303,7 @@ W.PACT.punch = function()
     local hit = W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 64, tgt and slope or 0, dmg)
     W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 64)
     if hit then
-        pcall(W.playSfx, "DSPUNCH")
+        W.playSfx("DSPUNCH")
         local tx, ty = W.tgtPos(hit)
         W.viewAngle = atan(ty - W.viewY, tx - W.viewX)     -- face the victim
     end
@@ -6078,13 +6315,13 @@ W.PACT.saw = function()
     local slope, tgt = W.aimLineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 65)
     local hit = W.lineAttack("player", W.viewX, W.viewY, W.pShootZ(), ang, 65, tgt and slope or 0, dmg)
     W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 65)
-    if not hit then pcall(W.playSfx, "DSSAWFUL"); return end
-    pcall(W.playSfx, "DSSAWHIT")
+    if not hit then W.playSfx("DSSAWFUL"); return end
+    W.playSfx("DSSAWHIT")
     local tx, ty = W.tgtPos(hit)
     W.viewAngle = atan(ty - W.viewY, tx - W.viewX)
 end
 W.PACT.firepistol = function()
-    pcall(W.playSfx, "DSPISTOL")
+    W.playSfx("DSPISTOL")
     W.ammo.bul = W.ammo.bul - 1
     W.setPsprite(W.psf, W.WEAPONS[2].flash)
     W.bulletSlope()
@@ -6092,7 +6329,7 @@ W.PACT.firepistol = function()
     W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
 end
 W.PACT.fireshotgun = function()
-    pcall(W.playSfx, "DSSHOTGN")
+    W.playSfx("DSSHOTGN")
     W.ammo.shl = W.ammo.shl - 1
     W.setPsprite(W.psf, W.WEAPONS[3].flash)
     W.bulletSlope()
@@ -6100,7 +6337,7 @@ W.PACT.fireshotgun = function()
     W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
 end
 W.PACT.fireshotgun2 = function()
-    pcall(W.playSfx, "DSDSHTGN")
+    W.playSfx("DSDSHTGN")
     W.ammo.shl = W.ammo.shl - 2
     W.setPsprite(W.psf, W.WEAPONS[9].flash)
     W.bulletSlope()
@@ -6112,14 +6349,14 @@ W.PACT.fireshotgun2 = function()
     end
     W.shootSpecialLine(W.viewX, W.viewY, W.viewAngle, 2048)
 end
-W.PACT.opensg2 = function() pcall(W.playSfx, "DSDBOPN") end
-W.PACT.loadsg2 = function() pcall(W.playSfx, "DSDBLOAD") end
+W.PACT.opensg2 = function() W.playSfx("DSDBOPN") end
+W.PACT.loadsg2 = function() W.playSfx("DSDBLOAD") end
 W.PACT.closesg2 = function(layer)
-    pcall(W.playSfx, "DSDBCLS")
+    W.playSfx("DSDBCLS")
     W.PACT.refire(layer)
 end
 W.PACT.firecgun = function(layer)
-    pcall(W.playSfx, "DSPISTOL")
+    W.playSfx("DSPISTOL")
     if W.ammo.bul <= 0 then return end
     W.ammo.bul = W.ammo.bul - 1
     local w = W.WEAPONS[4]
@@ -6142,7 +6379,7 @@ W.PACT.firebfg = function()
     W.ammo.cel = W.ammo.cel - 40
     W.spawnPlayerMissile("BFG")
 end
-W.PACT.bfgsound = function() pcall(W.playSfx, "DSBFG") end
+W.PACT.bfgsound = function() W.playSfx("DSBFG") end
 
 -- P_MovePsprites: one tic of both layers.
 function W.movePsprites()
@@ -6192,6 +6429,7 @@ W.VK = {
     W = 0x57, A = 0x41, S = 0x53, DK = 0x44, Q = 0x51, E = 0x45,
     LEFT = 0x25, UP = 0x26, RIGHT = 0x27, DOWN = 0x28,
     SPACE = 0x20, CTRL = 0x11, SHIFT = 0x10, ENTER = 0x0D, ESCAPE = 0x1B,
+    LSHIFT = 0xA0, RSHIFT = 0xA1,   -- run key: the key reader reports the distinct L/R VKs, not 0x10
     M = 0x4D, BACKSPACE = 0x08, Y = 0x59, N = 0x4E,
     ONE = 0x31, TWO = 0x32, THREE = 0x33, FOUR = 0x34, FIVE = 0x35, SIX = 0x36, SEVEN = 0x37,
 }
@@ -6210,10 +6448,20 @@ function W.thrust(angle, move)
     W.momy = W.momy + (move / 32) * sin(angle)
 end
 
+-- Run key. Read GTA's own INPUT_SPRINT (control 21) through GET_DISABLED_CONTROL_NORMAL,
+-- the same path mouselook uses for INPUT_LOOK_LR: the overlay suppresses game controls
+-- (so the DISABLED variant is required to read anything), and Cherax's IsKeyDown reports
+-- the L/R shift VKs as stuck-held on some builds - which made the player always sprint.
+-- Reading the game's sprint input directly is reliable and fails safe to walk.
+function W.runHeld()
+    local ok, v = pcall(Natives.InvokeFloat, 0x11E65974A982637C, 0, 21)
+    return (ok and type(v) == "number" and v > 0.5) or false
+end
+
 -- P_MovePlayer: sample held movement keys as this tic's command; thrust applies
 -- only on the ground (no air control, momentum carries).
 function W.movePlayerCmd()
-    local run = kdown(W.VK.SHIFT)
+    local run = W.runHeld()
     local fm = 0
     if kdown(W.VK.W) or kdown(W.VK.UP) then fm = fm + 1 end
     if kdown(W.VK.S) or kdown(W.VK.DOWN) then fm = fm - 1 end
@@ -6273,7 +6521,7 @@ function W.playerZMovement()
         if W.momz < 0 then
             if W.momz < -8 then
                 W.dvh = W.momz / 8                    -- squat on hard landing
-                pcall(W.playSfx, "DSOOF")
+                W.playSfx("DSOOF")
             end
             W.momz = 0
         end
@@ -6404,7 +6652,7 @@ function W.update(dt, menuOpen)
                 W.turnHeld = (W.turnHeld or 0) + dt
                 local rate
                 if W.turnHeld < 6 * W.TIC then rate = W.TURNSLOW
-                elseif kdown(W.VK.SHIFT) then rate = W.TURNFAST
+                elseif W.runHeld() then rate = W.TURNFAST
                 else rate = W.TURNNORM end
                 W.viewAngle = W.viewAngle + turn * rate * dt
             else
@@ -6435,7 +6683,7 @@ function W.update(dt, menuOpen)
         if kpressed(W.VK.M) then W.mouseLook = not W.mouseLook; pcall(W.saveSettings) end
         if kpressed(W.VK.BACKSPACE) or kpressed(W.VK.ESCAPE) then    -- pause -> front-end main
             W.menu.fromPlay = true; W.menu.screen = "main"; W.menu.cursor = 1
-            W.gameState = "frontend"; pcall(W.playSfx, "DSSWTCHN")
+            W.gameState = "frontend"; W.playSfx("DSSWTCHN")
         end
     elseif W.gameState == "intermission" and not menuOpen then
         -- edge-detected (never held-repeat), and no generic VK_CONTROL, so a
@@ -6494,7 +6742,12 @@ function W.startMap(name)
     W.pendingMap = name
     local m = W.loadMap(name)
     if not m then W.gameState = "error"; return end
-    if W.spawnPlayer(m) then W.gameState = "play" end
+    -- guard spawnPlayer: a malformed PWAD map can throw here, and startMap runs
+    -- synchronously inside the tab's ImGui BeginChild/EndChild pair - an escaping
+    -- error would skip EndChild and unbalance the shared window stack.
+    local sok, spawned = pcall(W.spawnPlayer, m)
+    if not sok then W.gameState = "error"; W.status = "map load failed: " .. tostring(spawned); return end
+    if spawned then W.gameState = "play" end
     -- Defer music start to the present thread (onPresent services W.musPending):
     -- MCI open/stop must share one thread. startMap can run from the menu (map picker).
     if W.gameState == "play" and W.map then W.musPending = W.map.name end
@@ -6688,6 +6941,22 @@ function W.drawHUD(sw, sh)
         or ((W.powers.invuln or 0) > 0 and ((W.powers.invuln or 0) & 8) ~= 0) then
         rectf(0, 0, sw, W.viewH, 220, 220, 255, 26)        -- INVERSECOLORMAP stand-in
     end
+    -- berserk (pw_strength) red fade: vanilla ramps bzc = 12 - (power>>6), so
+    -- the wash is strongest right after the pack and fades as strength counts
+    -- up (~64 tics per step). The port holds berserk as a level-long flag, so
+    -- time the fade off the moment it is first held. Suppressed while a damage
+    -- flash is up, matching vanilla merging the two and showing the stronger.
+    if dc == 0 and (W.powers.berserk or 0) ~= 0 then
+        W.berserkTintAt = W.berserkTintAt or now()
+        local held = floor((now() - W.berserkTintAt) * 35)   -- tics held
+        local bzc = 12 - floor(held / 64)
+        if bzc > 0 then
+            local tier = min(floor((bzc + 7) / 8), 2)        -- (cnt+7)>>3, red pal
+            rectf(0, 0, sw, W.viewH, 255, 2, 3, tier * 28)
+        end
+    elseif (W.powers.berserk or 0) == 0 then
+        W.berserkTintAt = nil
+    end
     -- "use" prompt when facing a door / switch (not vanilla, kept for usability)
     local hint = W.useHint
     if hint then
@@ -6754,43 +7023,43 @@ function W.wiTicker()
         if accel and wi.spState ~= 10 then
             wi.cntKills = kMax; wi.cntItems = iMax; wi.cntSecret = sMax
             wi.cntTime = wm.time; wi.cntPar = wm.par or 0
-            pcall(W.playSfx, "DSBAREXP")
+            W.playSfx("DSBAREXP")
             wi.spState = 10
             accel = false
         end
         local s = wi.spState
         if s == 2 then
             wi.cntKills = ((wi.cntKills < 0) and 0 or wi.cntKills) + 2
-            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if (wi.bcnt & 3) == 0 then W.playSfx("DSPISTOL") end
             if wi.cntKills >= kMax then
-                wi.cntKills = kMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 3
+                wi.cntKills = kMax; W.playSfx("DSBAREXP"); wi.spState = 3
             end
         elseif s == 4 then
             wi.cntItems = ((wi.cntItems < 0) and 0 or wi.cntItems) + 2
-            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if (wi.bcnt & 3) == 0 then W.playSfx("DSPISTOL") end
             if wi.cntItems >= iMax then
-                wi.cntItems = iMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 5
+                wi.cntItems = iMax; W.playSfx("DSBAREXP"); wi.spState = 5
             end
         elseif s == 6 then
             wi.cntSecret = ((wi.cntSecret < 0) and 0 or wi.cntSecret) + 2
-            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if (wi.bcnt & 3) == 0 then W.playSfx("DSPISTOL") end
             if wi.cntSecret >= sMax then
-                wi.cntSecret = sMax; pcall(W.playSfx, "DSBAREXP"); wi.spState = 7
+                wi.cntSecret = sMax; W.playSfx("DSBAREXP"); wi.spState = 7
             end
         elseif s == 8 then
-            if (wi.bcnt & 3) == 0 then pcall(W.playSfx, "DSPISTOL") end
+            if (wi.bcnt & 3) == 0 then W.playSfx("DSPISTOL") end
             wi.cntTime = ((wi.cntTime < 0) and 0 or wi.cntTime) + 3
             if wi.cntTime >= wm.time then wi.cntTime = wm.time end
             wi.cntPar = ((wi.cntPar < 0) and 0 or wi.cntPar) + 3
             if wi.cntPar >= (wm.par or 0) then
                 wi.cntPar = wm.par or 0
                 if wi.cntTime >= wm.time then
-                    pcall(W.playSfx, "DSBAREXP"); wi.spState = 9
+                    W.playSfx("DSBAREXP"); wi.spState = 9
                 end
             end
         elseif s == 10 then
             if accel then
-                pcall(W.playSfx, "DSSGCOCK")
+                W.playSfx("DSSGCOCK")
                 if wm.epsd and W.gameMode ~= "commercial" then
                     wi.state = "next"; wi.showCnt = 4 * 35     -- SHOWNEXTLOCDELAY
                 else
@@ -6940,7 +7209,11 @@ function W.wiDraw(sw, sh)
         end
     elseif wi.state == "next" or wi.state == "nostate" then
         if wm.epsd and W.gameMode ~= "commercial" and W.WI_LNODES[wm.epsd] then
-            for i = 0, wm.lastIdx or 0 do W.wiDrawOnNode(i, "WISPLAT", S, xb) end
+            -- returning from the secret level (last == 8) splats only the
+            -- completed levels, not the secret-exit node: clamp to next - 1.
+            local last = wm.lastIdx or 0
+            if last == 8 then last = (wm.nextIdx or 1) - 1 end
+            for i = 0, last do W.wiDrawOnNode(i, "WISPLAT", S, xb) end
             if W.didsecret then W.wiDrawOnNode(8, "WISPLAT", S, xb) end
             if wm.nextIdx and (wi.bcnt & 31) < 20 then
                 W.wiDrawOnNode(wm.nextIdx, "WIURH0", S, xb)
@@ -7293,7 +7566,7 @@ function W.playMusic(mapName)
         played = W.mci('play ' .. W.musAlias)
     end
     if W.stopDiag and Logger and Logger.LogInfo then
-        pcall(Logger.LogInfo, ("[DOOMWAD] playMusic(%s): lump=%s secs=%s bound=%s played=%s"):format(
+        Logger.LogInfo(("[DOOMWAD] playMusic(%s): lump=%s secs=%s bound=%s played=%s"):format(
             tostring(mapName), tostring(name), tostring(secs), tostring(W.musBoundMs), tostring(played)))
     end
     if not played then W.mci('close ' .. W.musAlias); return end
@@ -7331,7 +7604,7 @@ function W.stopMusic(tag)
         ok2, r2 = pcall(Utils.MciSendString, "close " .. a)
     end
     if W.stopDiag and Logger and Logger.LogInfo then
-        pcall(Logger.LogInfo, ("[DOOMWAD] stopMusic(%s): stop(ok=%s r=%s) close(ok=%s r=%s)"):format(
+        Logger.LogInfo(("[DOOMWAD] stopMusic(%s): stop(ok=%s r=%s) close(ok=%s r=%s)"):format(
             tostring(tag), tostring(ok1), tostring(r1), tostring(ok2), tostring(r2)))
     end
     W.musPlaying = false
@@ -7474,28 +7747,7 @@ function W.patchRGBA(name)
     local li = W.lumpIndex and W.lumpIndex[name]
     local data = W.lumpBytes(li and li[1]); if not data or #data < 8 then return nil end
     local w, h, cols = W.patchColumns(data); if not w then return nil end
-    local total = w * h; local idx, alpha = {}, {}
-    for k = 0, total - 1 do alpha[k] = 0 end
-    for px = 0, w - 1 do
-        local posts = cols[px]
-        if posts then
-            for _, post in ipairs(posts) do
-                local pix, tp = post.pix, post.top
-                for i = 1, #pix do
-                    local sy = tp + (i - 1)
-                    if sy >= 0 and sy < h then local kk = sy * w + px; idx[kk] = pix:byte(i); alpha[kk] = 255 end
-                end
-            end
-        end
-    end
-    local out, pal = {}, W.pal
-    for k = 0, total - 1 do
-        if alpha[k] == 255 then
-            local c = pal[idx[k]] or { 0, 0, 0 }
-            out[k + 1] = string.char(c[1], c[2], c[3], 255)
-        else out[k + 1] = "\0\0\0\0" end
-    end
-    return table.concat(out), w, h
+    return W.bakeMaskedRGBA(w, h, cols)
 end
 
 -- Async GPU upload of a menu patch (cache key "MU:").
@@ -7507,19 +7759,19 @@ function W.menuTex(name)
     if c == nil then
         if (W.bakeUsed or 0) >= (W.BAKE_BUDGET or 4) then return nil end
         W.bakeUsed = (W.bakeUsed or 0) + 1
-        local fn = key:gsub("[^%w_%-]", function(ch) return string.format("$%02X", ch:byte()) end) .. ".png"
+        local fn = key:gsub("[^%w_%-]", function(ch) return string.format("$%02X", ch:byte()) end) .. ".v3.png"  -- v3: edge-dilated + nearest pre-scaled
         local path = W.cacheDir .. "/" .. fn
         local exists = false
         local dok, de = pcall(FileMgr.DoesFileExist, path); if dok then exists = de end
         if not exists then
             local rgba, w, h = W.patchRGBA(name)
             if not rgba then W.texCache[key] = { state = "fail" }; return nil end
+            rgba, w, h = W.upscaleNearest(rgba, w, h)        -- crisp edges under Cherax's bilinear sampler
             local pok, png = pcall(W.encodePNG, rgba, w, h)
             if not pok or not png then W.texCache[key] = { state = "fail" }; return nil end
             if not W.writeBytes(path, png) then W.texCache[key] = { state = "fail" }; return nil end
         end
-        local id
-        local lok, lid = pcall(Texture.LoadTexture, path); if lok then id = lid end
+        local id = Texture.LoadTexture(path)
         if not id then W.texCache[key] = { state = "fail", path = path }; return nil end
         W.texCache[key] = { id = id, state = "pending", path = path }
         return nil
@@ -7682,15 +7934,13 @@ end
 -- Large centered text. Uses SetWindowFontScale (CalcTextSize is read at the same
 -- scale so centering stays correct); degrades to a width estimate if unavailable.
 function W.bigText(text, cx, cy, scale, r, g, b, a)
-    pcall(ImGui.SetWindowFontScale, scale)
+    ImGui.SetWindowFontScale(scale)
     local tw, th = #text * 7 * scale, 13 * scale
-    local cok, a1, a2 = pcall(ImGui.CalcTextSize, text)
-    if cok then
-        if type(a1) == "number" then tw = a1; if type(a2) == "number" then th = a2 end
-        elseif type(a1) == "table" then tw = a1.x or tw; th = a1.y or th end
-    end
+    local a1, a2 = ImGui.CalcTextSize(text)
+    if type(a1) == "number" then tw = a1; if type(a2) == "number" then th = a2 end
+    elseif type(a1) == "table" then tw = a1.x or tw; th = a1.y or th end
     ImGui.AddText(floor(cx - tw / 2), floor(cy - th / 2), text, r, g, b, a)
-    pcall(ImGui.SetWindowFontScale, 1.0)
+    ImGui.SetWindowFontScale(1.0)
 end
 
 -- hu_font (STCFNxxx) glyph lump name for a character byte, or nil for space and
@@ -7755,8 +8005,8 @@ function W.drawMsgLines(text, cx, y0, lh, r, g, b, a)
             if fw > 0 then W.drawFontLine(line, floor(cx - fw / 2), floor(y), S, a) end
         else
             local w = #line * 7                       -- default-font width estimate
-            local cok, a1 = pcall(ImGui.CalcTextSize, line)
-            if cok then if type(a1) == "number" then w = a1 elseif type(a1) == "table" then w = a1.x or w end end
+            local a1 = ImGui.CalcTextSize(line)
+            if type(a1) == "number" then w = a1 elseif type(a1) == "table" then w = a1.x or w end
             ImGui.AddText(floor(cx - w / 2), floor(y), line, r, g, b, a)
         end
         y = y + lh
@@ -7797,7 +8047,7 @@ function W.launchGame(skill)
     W.menu.fromPlay = false; W.menu.nmConfirm = false
     W.attractOn = false                             -- real map takes over; reload attract next visit
     W.newGame()
-    pcall(W.playSfx, "DSPISTOL")
+    W.playSfx("DSPISTOL")
     W.startWipe("TITLEPIC")                          -- melt the title away over the first game frame
     W.startMap(W.firstMap())
 end
@@ -7806,17 +8056,17 @@ function W.menuSelect()
     local m = W.menu
     if m.screen == "main" then
         local act = W.MENU_MAIN[m.cursor].act
-        if act == "newgame" then m.screen = "skill"; m.cursor = 3; pcall(W.playSfx, "DSPISTOL")
-        elseif act == "options" then m.screen = "options"; m.cursor = 1; pcall(W.playSfx, "DSPISTOL")
-        elseif act == "readthis" then m.screen = "readthis"; pcall(W.playSfx, "DSPISTOL")
+        if act == "newgame" then m.screen = "skill"; m.cursor = 3; W.playSfx("DSPISTOL")
+        elseif act == "options" then m.screen = "options"; m.cursor = 1; W.playSfx("DSPISTOL")
+        elseif act == "readthis" then m.screen = "readthis"; W.playSfx("DSPISTOL")
         elseif act == "quit" then
             m.screen = "quit"
             W.quitMsgIdx = (W.quitMsgIdx or 0) % #W.QUITMSGS + 1   -- rotate the taunt (endmsg[])
-            pcall(W.playSfx, "DSSWTCHN")
+            W.playSfx("DSSWTCHN")
         end
     elseif m.screen == "skill" then
         local it = W.SKILL_ITEMS[m.cursor]
-        if it.skill == 5 then m.nmConfirm = true; pcall(W.playSfx, "DSSWTCHN") else W.launchGame(it.skill) end
+        if it.skill == 5 then m.nmConfirm = true; W.playSfx("DSSWTCHN") else W.launchGame(it.skill) end
     end
 end
 
@@ -7825,9 +8075,9 @@ function W.menuBack()
     if m.screen == "main" then
         if m.fromPlay and W.map then W.gameState = "play"
         else m.screen = "title"; m.fromPlay = false; W.attractOn = false end
-        pcall(W.playSfx, "DSSWTCHX")
+        W.playSfx("DSSWTCHX")
     else
-        m.screen = "main"; m.cursor = 1; pcall(W.playSfx, "DSSWTCHN")
+        m.screen = "main"; m.cursor = 1; W.playSfx("DSSWTCHN")
     end
 end
 
@@ -7839,19 +8089,19 @@ function W.reapplyMusicVol()
 end
 
 function W.optionAdjust(it, dir)
-    if it.opt == "mouselook" then W.mouseLook = not W.mouseLook; pcall(W.playSfx, "DSPISTOL")
+    if it.opt == "mouselook" then W.mouseLook = not W.mouseLook; W.playSfx("DSPISTOL")
     elseif it.opt == "music" then
         W.musicOn = not W.musicOn
         if not W.musicOn then pcall(W.requestStop, "opt") elseif W.gameState == "play" and W.map then W.musPending = W.map.name end
-        pcall(W.playSfx, "DSPISTOL")
+        W.playSfx("DSPISTOL")
     elseif it.opt == "musicvol" then
         W.musicVol = clamp((W.musicVol or 15) + dir, 0, 15)
-        W.reapplyMusicVol(); pcall(W.playSfx, "DSPISTOL")
+        W.reapplyMusicVol(); W.playSfx("DSPISTOL")
     elseif it.opt == "sfxvol" then
         W.sfxVol = clamp((W.sfxVol or 15) + dir, 0, 15)
-        pcall(W.playSfx, "DSPISTOL")             -- audible preview at the new level
+        W.playSfx("DSPISTOL")             -- audible preview at the new level
     elseif it.opt == "looksens" then
-        W.LOOKSENS = clamp((W.LOOKSENS or 0.1) + dir * 0.02, 0.02, 0.5); pcall(W.playSfx, "DSSTNMOV")
+        W.LOOKSENS = clamp((W.LOOKSENS or 0.1) + dir * 0.02, 0.02, 0.5); W.playSfx("DSSTNMOV")
     end
     pcall(W.saveSettings)                        -- auto-save on every change
 end
@@ -7860,7 +8110,7 @@ function W.updateFrontend(dt)
     local m = W.menu
     local scr = m.screen
     if scr == "title" then
-        if kpressed(W.VK.ENTER) or kpressed(W.VK.SPACE) then m.screen = "main"; m.cursor = 1; pcall(W.playSfx, "DSPISTOL") end
+        if kpressed(W.VK.ENTER) or kpressed(W.VK.SPACE) then m.screen = "main"; m.cursor = 1; W.playSfx("DSPISTOL") end
         return
     end
     if scr == "quit" then
@@ -7871,24 +8121,24 @@ function W.updateFrontend(dt)
             else
                 W.playOn = false; W.active = false
                 m.screen = "title"; m.fromPlay = false; W.attractOn = false
-                pcall(W.requestStop, "quit"); pcall(W.playSfx, "DSSWTCHX")
+                pcall(W.requestStop, "quit"); W.playSfx("DSSWTCHX")
             end
-        elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; pcall(W.playSfx, "DSSWTCHX") end
+        elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; W.playSfx("DSSWTCHX") end
         return
     end
     if scr == "readthis" then
-        if kpressed(W.VK.ENTER) or kpressed(W.VK.SPACE) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; pcall(W.playSfx, "DSSWTCHX") end
+        if kpressed(W.VK.ENTER) or kpressed(W.VK.SPACE) or kpressed(W.VK.ESCAPE) or kpressed(W.VK.BACKSPACE) then m.screen = "main"; W.playSfx("DSSWTCHX") end
         return
     end
     if scr == "skill" and m.nmConfirm then
         if kpressed(W.VK.Y) then W.launchGame(5)
-        elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) then m.nmConfirm = false; pcall(W.playSfx, "DSSWTCHX") end
+        elseif kpressed(W.VK.N) or kpressed(W.VK.ESCAPE) then m.nmConfirm = false; W.playSfx("DSSWTCHX") end
         return
     end
     local list = (scr == "main" and W.MENU_MAIN) or (scr == "skill" and W.SKILL_ITEMS) or (scr == "options" and W.OPT_ITEMS)
     if not list then return end
-    if kpressed(W.VK.DOWN) then m.cursor = (m.cursor % #list) + 1; pcall(W.playSfx, "DSPSTOP") end
-    if kpressed(W.VK.UP) then m.cursor = ((m.cursor - 2) % #list) + 1; pcall(W.playSfx, "DSPSTOP") end
+    if kpressed(W.VK.DOWN) then m.cursor = (m.cursor % #list) + 1; W.playSfx("DSPSTOP") end
+    if kpressed(W.VK.UP) then m.cursor = ((m.cursor - 2) % #list) + 1; W.playSfx("DSPSTOP") end
     if scr == "options" then
         if kpressed(W.VK.LEFT) then W.optionAdjust(list[m.cursor], -1)
         elseif kpressed(W.VK.RIGHT) or kpressed(W.VK.ENTER) then W.optionAdjust(list[m.cursor], 1) end
@@ -8023,15 +8273,15 @@ function W.renderBody(sw, sh)
     elseif gs == "intermission" then
         W.wiDraw(sw, sh)
     elseif gs == "menu" then
-        ImGui.AddText(12, 12, "WAD loaded. Pick a map in the DOOM WAD tab. " .. tostring(W.status),
+        ImGui.AddText(12, 12, "WAD loaded. Pick a map in the DOOM tab. " .. tostring(W.status),
             200, 200, 205, 255)
     elseif gs == "loading" then
         ImGui.AddText(12, 12, "Loading " .. tostring(W.pendingMap or "") .. "...", 235, 220, 120, 255)
     elseif gs == "error" then
         ImGui.AddText(12, 12, "ERROR: " .. tostring(W.status), 235, 80, 70, 255)
-        ImGui.AddText(12, 30, "Pick another wad or map in the DOOM WAD tab. ESC closes DOOM.", 200, 200, 205, 255)
+        ImGui.AddText(12, 30, "Pick another wad or map in the DOOM tab. ESC closes DOOM.", 200, 200, 205, 255)
     else
-        ImGui.AddText(12, 12, "No WAD loaded. Open the DOOM WAD tab and use Download DOOM1.WAD,", 200, 200, 205, 255)
+        ImGui.AddText(12, 12, "No WAD loaded. Open the DOOM tab and use Download DOOM1.WAD,", 200, 200, 205, 255)
         ImGui.AddText(12, 30, "or drop a .wad in Cherax/Lua/DoomWad and press Scan. ESC closes DOOM.", 200, 200, 205, 255)
     end
 
@@ -8343,7 +8593,7 @@ function W.init()
     W.SPRITE_PLACEHOLDER = true -- faint kind-colored rect while a sprite bakes
     W.DS_MAXSEGS = 2048        -- max silhouette-occluder segs recorded per frame
     -- Phase-6 enemy AI (p_enemy.c) constants.
-    W.SIGHT_RANGE = 8192       -- perf guard only; vanilla sight is unbounded
+    W.SIGHT_RANGE = 131072     -- effectively unbounded (past any map diagonal); vanilla sight has no range cap
     -- combat / weapon input state (inventory itself lives in W.newGame)
     W.psp = { st = nil, tics = -1, sx = 1, sy = 32 }
     W.psf = { st = nil, tics = -1 }
@@ -8358,7 +8608,7 @@ function W.init()
     W.viewX = 0; W.viewY = 0; W.viewZ = W.EYE; W.viewAngle = 0
     W.active = false
     W.playOn = false          -- standalone launch flag (Play Doom button / Quit Game)
-    W.mouseLook = false
+    W.mouseLook = true
     -- audio / music state (Section M). Looping is duration-driven off now()
     -- (MCI cannot report position); vol 0..15 (DOOM's range) baked into the
     -- cached MIDI/WAV. Defaults overridden by W.loadSettings on first activation.
@@ -8429,7 +8679,7 @@ function W.onPresent()
         -- transition (musPlaying or active still set) so we do not spam forever.
         if W.musPlaying or W.active then
             if W.stopDiag and Logger and Logger.LogInfo then
-                pcall(Logger.LogInfo, "[DOOMWAD] onPresent: feature disabled -> requestStop")
+                Logger.LogInfo("[DOOMWAD] onPresent: feature disabled -> requestStop")
             end
             W.requestStop("disable")
         end
@@ -8438,7 +8688,7 @@ function W.onPresent()
     end
     -- Host mode: pull the shareware IWAD into Lua/DoomWad on first run, drawing a
     -- progress overlay until it is on disk, then fall through to autoLoad. A
-    -- failure falls through too; the nowad screen and DOOM WAD tab still let the
+    -- failure falls through too; the nowad screen and DOOM tab still let the
     -- user supply a wad by hand.
     if BLAD_MODE and not W.dlDone and not W.dlFailed then
         local st = W.ensureWadDownload()
@@ -8505,7 +8755,7 @@ function W.onPresent()
         W.texDiagIn = 600
         if ((W.texRetries or 0) > 0 or (W.texDeadHits or 0) > 0)
             and Logger and Logger.LogInfo then
-            pcall(Logger.LogInfo, ("[DOOMWAD] tex self-heal: %d retries, %d dead-handle hits, %d revives")
+            Logger.LogInfo(("[DOOMWAD] tex self-heal: %d retries, %d dead-handle hits, %d revives")
                 :format(W.texRetries or 0, W.texDeadHits or 0, W.texRevives or 0))
         end
     end
@@ -8513,8 +8763,8 @@ end
 
 -- one clickable row: prefer Selectable, fall back to Button, else static text
 function W.uiRow(label)
-    if ImGui.Selectable then local ok, r = pcall(ImGui.Selectable, label); return ok and r end
-    if ImGui.Button then local ok, r = pcall(ImGui.Button, label); return ok and r end
+    if ImGui.Selectable then return ImGui.Selectable(label) end
+    if ImGui.Button then return ImGui.Button(label) end
     if ImGui.Text then ImGui.Text(label) end
     return false
 end
@@ -8527,20 +8777,19 @@ end
 function W.uiRowSel(label, sel)
     if not ImGui.Selectable then return W.uiRow(label) end
     if sel then
-        local ok, cx, cy = pcall(ImGui.GetCursorScreenPos)
-        if ok and cx then
+        local cx, cy = ImGui.GetCursorScreenPos()
+        if cx then
             local w = 120
-            local aok, aw = pcall(ImGui.GetContentRegionAvail)
-            if aok and aw then w = aw end
+            local aw = ImGui.GetContentRegionAvail()
+            if aw then w = aw end
             local fh = 17
-            local fok, fs = pcall(ImGui.GetFontSize)
-            if fok and fs then fh = floor(fs + 4) end
+            local fs = ImGui.GetFontSize()
+            if fs then fh = floor(fs + 4) end
             ImGui.AddRectFilled(cx - 2, cy - 1, cx + w, cy + fh, 255, 255, 255, 28, 2)
             ImGui.AddRectFilled(cx - 2, cy - 1, cx + 1, cy + fh, 165, 120, 255, 220)
         end
     end
-    local ok, r = pcall(ImGui.Selectable, label)
-    return ok and r
+    return ImGui.Selectable(label)
 end
 
 function W.uiBasename(p)
@@ -8582,8 +8831,8 @@ end
 -- AddText centered on a screen-space x (draw-list text, not layout text)
 function W.uiTextCenteredAt(cx, y, text, r, g, b, a)
     local tw = 0
-    local ok, w = pcall(ImGui.CalcTextSize, text)
-    if ok and w then tw = w end
+    local w = ImGui.CalcTextSize(text)
+    if w then tw = w end
     ImGui.AddText(floor(cx - tw * 0.5), floor(y), text, r, g, b, a)
 end
 
@@ -8677,15 +8926,15 @@ function W.uiFloppyZone()
 
     local wxp, wyp, wwd, wht = 0, 0, 400, 300
     do
-        local ok, a1, a2 = pcall(ImGui.GetWindowPos); if ok and a1 then wxp, wyp = a1, a2 end
-        local ok2, b1, b2 = pcall(ImGui.GetWindowSize); if ok2 and b1 then wwd, wht = b1, b2 end
+        local a1, a2 = ImGui.GetWindowPos(); if a1 then wxp, wyp = a1, a2 end
+        local b1, b2 = ImGui.GetWindowSize(); if b1 then wwd, wht = b1, b2 end
     end
     local csy = wyp
-    do local ok, _, c2 = pcall(ImGui.GetCursorScreenPos); if ok and c2 then csy = c2 end end
+    do local _, c2 = ImGui.GetCursorScreenPos(); if c2 then csy = c2 end end
 
     local fw = floor(clamp(wwd * 0.34, 132, 212))
     local fh = floor(fw * 1.04)
-    pcall(ImGui.Dummy, 1, fh + 20)
+    ImGui.Dummy(1, fh + 20)
 
     local restY = csy + 10
     local slotY = wyp + wht                 -- bottom edge of the Cherax window
@@ -8731,25 +8980,24 @@ function W.uiPlayButton(availW)
     local running = W.playOn and true or false
     local label = running and "Stop Doom" or "Play Doom"
 
-    local okp, wpx = pcall(ImGui.GetWindowPos)
-    local okc, cx0 = pcall(ImGui.GetCursorScreenPos)
-    if not (okp and wpx and okc and cx0 and ImGui.InvisibleButton) then
+    local wpx = ImGui.GetWindowPos()
+    local cx0 = ImGui.GetCursorScreenPos()
+    if not (wpx and cx0 and ImGui.InvisibleButton) then
         -- bare fallback: a stock button with the right label
         if ImGui.Button then
-            local ok, r = pcall(ImGui.Button, label .. "##DoomPlay", bw, bh)
-            if ok and r then W.playOn = not running end
+            if ImGui.Button(label .. "##DoomPlay", bw, bh) then W.playOn = not running end
         end
         return
     end
-    pcall(ImGui.SetCursorPosX, (cx0 - wpx) + max(0, floor((availW - bw) * 0.5)))
-    local bok, bx, by = pcall(ImGui.GetCursorScreenPos)
-    local ok, clicked = pcall(ImGui.InvisibleButton, "##DoomPlay", bw, bh)
-    if not (ok and bok and bx) then return end
+    ImGui.SetCursorPosX((cx0 - wpx) + max(0, floor((availW - bw) * 0.5)))
+    local bx, by = ImGui.GetCursorScreenPos()
+    local clicked = ImGui.InvisibleButton("##DoomPlay", bw, bh)
+    if not bx then return end
     local hov = false
-    do local hok, hv = pcall(ImGui.IsItemHovered); if hok then hov = hv and true or false end end
+    do local hv = ImGui.IsItemHovered(); hov = hv and true or false end
     local x1, y1 = bx + bw, by + bh
     local fh = 15
-    do local fok, fs = pcall(ImGui.GetFontSize); if fok and fs then fh = fs end end
+    do local fs = ImGui.GetFontSize(); if fs then fh = fs end end
     local tcy = by + floor((bh - fh) * 0.5)
 
     if running then
@@ -8757,7 +9005,7 @@ function W.uiPlayButton(availW)
         ImGui.AddRectFilled(bx, by, x1, y1, 96 + lift, 24 + floor(lift * 0.3), 24, 255, 5)
         ImGui.AddRect(bx, by, x1, y1, 235, 84, 74, 255, 5, 0, 2)
         W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, 255, 216, 210, 255)
-        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Close DOOM and return to GTA") end
+        if hov and ImGui.SetTooltip then ImGui.SetTooltip("Close DOOM and return to GTA") end
     elseif W.wad then
         -- ready to play: border cycles the rainbow and the plate breathes
         local t = now()
@@ -8771,13 +9019,13 @@ function W.uiPlayButton(availW)
         local lg = ci(g + (255 - g) * 0.55)
         local lb = ci(b + (255 - b) * 0.55)
         W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, lr, lg, lb, 255)
-        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Ready: click, then close the Cherax menu") end
+        if hov and ImGui.SetTooltip then ImGui.SetTooltip("Ready: click, then close the Cherax menu") end
     else
         local lift = hov and 14 or 0
         ImGui.AddRectFilled(bx, by, x1, y1, 40 + lift, 40 + lift, 46 + lift, 255, 5)
         ImGui.AddRect(bx, by, x1, y1, 90, 90, 100, 255, 5, 0, 1)
         W.uiTextCenteredAt((bx + x1) * 0.5, tcy, label, 150, 150, 158, 255)
-        if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "No wad loaded: pick one below (or download DOOM1.WAD)") end
+        if hov and ImGui.SetTooltip then ImGui.SetTooltip("No wad loaded: pick one below (or download DOOM1.WAD)") end
     end
     if clicked then W.playOn = not running end
 end
@@ -8832,15 +9080,20 @@ function W.uiMapRows(curMap)
     end
 end
 
+W.VERSION = "1.0.0"
 function W.renderTab()
     if not ImGui.Text then return end
+    -- One boundary guard for the whole tab body (mirrors W.render): a mid-frame
+    -- error is caught here so it cannot escape the menu callback, and the shared
+    -- ImGui window stack recovers on the next frame.
+    local tabOk, tabErr = pcall(function()
     -- DOOM's own renderer resets the per-frame texture bake budget while it
     -- runs; when the game is closed the tab resets it so cover art still bakes.
     if not W.active then W.bakeUsed = 0 end
     if W.wad and not W.cacheDir then pcall(W.ensureCacheDir) end
 
     local availW = 400
-    do local ok, aw = pcall(ImGui.GetContentRegionAvail); if ok and aw then availW = aw end end
+    do local aw = ImGui.GetContentRegionAvail(); if aw then availW = aw end end
 
     -- populate the wad list the first time the tab is drawn; the refresh
     -- button is only needed to pick up files added after that
@@ -8863,42 +9116,40 @@ function W.renderTab()
     local canSplit = (ImGui.BeginChild and ImGui.EndChild and ImGui.SameLine) and true or false
     if canSplit then
         local colW = floor((availW - 10) * 0.5)
-        local okp, wpx = pcall(ImGui.GetWindowPos)
-        local okc, hx, hy = pcall(ImGui.GetCursorScreenPos)
-        if okc and hx then
+        local wpx = ImGui.GetWindowPos()
+        local hx, hy = ImGui.GetCursorScreenPos()
+        if hx then
             W.uiTextCenteredAt(hx + colW * 0.5, hy + 3, "WAD: " .. W.uiBasename(W.wadPath or "(none)"), 235, 231, 245, 255)
             W.uiTextCenteredAt(hx + colW + 10 + colW * 0.5, hy + 3, "Map: " .. tostring(curMap or "(none)"), 235, 231, 245, 255)
             -- rescan button at the right edge of the WAD column header: an
             -- invisible hit box with a hand-drawn refresh icon over it
             local didBtn = false
-            if ImGui.InvisibleButton and okp and wpx then
-                pcall(ImGui.SetCursorPosX, (hx - wpx) + colW - 24)
-                local bok, bx, by = pcall(ImGui.GetCursorScreenPos)
-                local ok, r = pcall(ImGui.InvisibleButton, "##DoomRescan", 20, 18)
-                didBtn = ok
-                if ok then
-                    local hov = false
-                    local hok, hv = pcall(ImGui.IsItemHovered)
-                    if hok then hov = hv and true or false end
-                    if bok and bx then W.uiDrawRefreshIcon(bx + 10, by + 9, 6.5, hov) end
-                    if hov and ImGui.SetTooltip then pcall(ImGui.SetTooltip, "Rescan wad folders") end
-                    if r then W.scanWads() end
-                end
-            elseif ImGui.Button and okp and wpx then
-                pcall(ImGui.SetCursorPosX, (hx - wpx) + colW - 44)
-                local ok, r = pcall(ImGui.Button, "Scan##DoomRescan", 44, 0)
-                didBtn = ok
-                if ok and r then W.scanWads() end
+            if ImGui.InvisibleButton and wpx then
+                ImGui.SetCursorPosX((hx - wpx) + colW - 24)
+                local bx, by = ImGui.GetCursorScreenPos()
+                local r = ImGui.InvisibleButton("##DoomRescan", 20, 18)
+                didBtn = true
+                local hov = false
+                local hv = ImGui.IsItemHovered()
+                hov = hv and true or false
+                if bx then W.uiDrawRefreshIcon(bx + 10, by + 9, 6.5, hov) end
+                if hov and ImGui.SetTooltip then ImGui.SetTooltip("Rescan wad folders") end
+                if r then W.scanWads() end
+            elseif ImGui.Button and wpx then
+                ImGui.SetCursorPosX((hx - wpx) + colW - 44)
+                local r = ImGui.Button("Scan##DoomRescan", 44, 0)
+                didBtn = true
+                if r then W.scanWads() end
             end
-            if not didBtn then pcall(ImGui.Dummy, 1, 18) end
+            if not didBtn then ImGui.Dummy(1, 18) end
         end
-        pcall(ImGui.BeginChild, "##DoomWads", colW, 150, true, 0)
+        ImGui.BeginChild("##DoomWads", colW, 150, true, 0)
         W.uiWadRows()
-        pcall(ImGui.EndChild)
-        pcall(ImGui.SameLine)
-        pcall(ImGui.BeginChild, "##DoomMaps", colW, 150, true, 0)
+        ImGui.EndChild()
+        ImGui.SameLine()
+        ImGui.BeginChild("##DoomMaps", colW, 150, true, 0)
         W.uiMapRows(curMap)
-        pcall(ImGui.EndChild)
+        ImGui.EndChild()
     else
         ImGui.Text("WAD: " .. tostring(W.wadPath or "(none)"))
         if W.uiRow("Rescan wad folders") then W.scanWads() end
@@ -8924,7 +9175,7 @@ function W.renderTab()
             if not v then W.requestStop("music-cb")
             elseif W.gameState == "play" and W.map then W.musPending = W.map.name end
         end
-        if ImGui.SameLine then pcall(ImGui.SameLine) end
+        if ImGui.SameLine then ImGui.SameLine() end
     end
     -- (MIDI volume is not adjustable: the Windows MCI sequencer device has
     --  no volume command, so use your system volume mixer for the game.)
@@ -8932,8 +9183,8 @@ function W.renderTab()
 
     local showCtl = true
     if ImGui.CollapsingHeader then
-        local ok, open = pcall(ImGui.CollapsingHeader, "Controls")
-        showCtl = (ok and open) and true or false
+        local open = ImGui.CollapsingHeader("Controls")
+        showCtl = open and true or false
     end
     if showCtl then
         ImGui.Text("Move: W/S or Up/Down      Strafe: A/D")
@@ -8943,6 +9194,23 @@ function W.renderTab()
     end
 
     W.uiFloppyZone()
+
+    -- Version label - bottom right (matches bladscript's dim vX.Y.Z tag)
+    if ImGui.TextDisabled and ImGui.CalcTextSize and ImGui.SetCursorPosX and ImGui.GetCursorPosX then
+        local versionText = "v" .. W.VERSION
+        local textWidth = ImGui.CalcTextSize(versionText)
+        local availWidth, availHeight = ImGui.GetContentRegionAvail()
+        availWidth = availWidth or 0
+        -- drop the cursor to the bottom of the tab before right-justifying
+        if availHeight and ImGui.SetCursorPosY and ImGui.GetCursorPosY and ImGui.GetTextLineHeight then
+            local drop = availHeight - ImGui.GetTextLineHeight() - 2
+            if drop > 0 then ImGui.SetCursorPosY(ImGui.GetCursorPosY() + drop) end
+        end
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + availWidth - textWidth)
+        ImGui.TextDisabled(versionText)
+    end
+    end)
+    if not tabOk then Logger.LogError("[DOOMWAD] render tab: " .. tostring(tabErr)) end
 end
 
 W.init()
@@ -8999,15 +9267,15 @@ if EventMgr and EventMgr.RegisterHandler then
             pcall(FeatureMgr.RemoveFeature, SHUTDOWN_HASH)
         end
         if W.stopDiag and Logger and Logger.LogInfo then
-            pcall(Logger.LogInfo, "[DOOMWAD] ON_UNLOAD: stop delegated to teardown present frames")
+            Logger.LogInfo("[DOOMWAD] ON_UNLOAD: stop delegated to teardown present frames")
         end
     end)
 end
 
 if (not BLAD_MODE) and ClickGUI and ClickGUI.AddTab then
-    pcall(ClickGUI.AddTab, "DOOM WAD", W.renderTab)
+    pcall(ClickGUI.AddTab, "DOOM", W.renderTab)
 end
 
 if Logger and Logger.LogInfo then
-    pcall(Logger.LogInfo, "[DOOMWAD] loaded (phase 3: textured BSP walls + on-disk PNG cache).")
+    Logger.LogInfo("[DOOMWAD] loaded (textured BSP, sprites, enemy AI, weapons, planes/sky, music, intermission).")
 end
